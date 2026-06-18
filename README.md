@@ -12,6 +12,21 @@ It is conservative by default:
 
 ## Usage
 
+Install from source with Cargo:
+
+```sh
+cargo install worktree-gc
+```
+
+After a version has been published to crates.io and its matching `vX.Y.Z`
+GitHub release has completed, `cargo-binstall` can install the prebuilt binary:
+
+```sh
+cargo binstall worktree-gc
+```
+
+Run from a local checkout:
+
 ```sh
 cargo run -- triage --repo /path/to/repo
 cargo run -- cleanup --repo /path/to/repo
@@ -42,3 +57,17 @@ Or start from an empty generated-directory policy:
 ```sh
 cargo run -- triage --repo /path/to/repo --no-default-generated --delete-generated coverage
 ```
+
+## Releases
+
+Release builds are produced by GitHub Actions when a tag matching the package
+version is pushed:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds Linux, macOS, and Windows archives using
+`cargo-binstall`'s default GitHub release layout, with asset names like
+`worktree-gc-x86_64-unknown-linux-gnu-v0.1.0.tgz`.
