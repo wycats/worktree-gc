@@ -1,0 +1,1442 @@
+use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
+use serde::Serialize;
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+use walkdir::WalkDir;
+
+pub const DEFAULT_STALE_DAYS: u64 = 30;
+pub const DEFAULT_GENERATED_DAYS: u64 = 7;
+pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", ".turbo", "target"];
+pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
+
+#[derive(Debug, Clone)]
+pub struct TriageOptions {
+    pub stale_days: u64,
+    pub generated_days: u64,
+    pub generated_config: GeneratedDirConfig,
+    pub now: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct CleanupOptions {
+    pub execute: bool,
+    pub stale_days: u64,
+    pub generated_days: u64,
+    pub generated_config: GeneratedDirConfig,
+    pub now: SystemTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TriageReport {
+    pub repo_root: PathBuf,
+    pub current_worktree: PathBuf,
+    pub git_common_dir: PathBuf,
+    pub stale_days: u64,
+    pub generated_days: u64,
+    pub generated_delete_names: Vec<String>,
+    pub generated_report_only_names: Vec<String>,
+    pub worktrees: Vec<WorktreeInfo>,
+    pub worktree_decisions: Vec<WorktreeDecision>,
+    pub generated_dirs: Vec<GeneratedDirInfo>,
+}
+
+pub type AuditReport = TriageReport;
+
+#[derive(Debug, Serialize)]
+pub struct CleanupRun {
+    pub manifest_path: PathBuf,
+    pub manifest: CleanupManifest,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CleanupManifest {
+    pub mode: CleanupMode,
+    pub generated_at: String,
+    pub repo_root: PathBuf,
+    pub current_worktree: PathBuf,
+    pub git_common_dir: PathBuf,
+    pub stale_days: u64,
+    pub generated_days: u64,
+    pub generated_delete_names: Vec<String>,
+    pub generated_report_only_names: Vec<String>,
+    pub prune_output: String,
+    pub worktrees: Vec<WorktreeDecision>,
+    pub generated_dirs: Vec<GeneratedDirDecision>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupMode {
+    DryRun,
+    Execute,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub prunable: Option<String>,
+    pub exists: bool,
+    pub is_current: bool,
+    pub dirty_count: Option<usize>,
+    pub upstream: Option<String>,
+    pub ahead: Option<u64>,
+    pub behind: Option<u64>,
+    pub last_commit_unix: Option<i64>,
+    pub last_commit: Option<String>,
+    pub activity_unix: Option<i64>,
+    pub activity_age_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedDirInfo {
+    pub path: PathBuf,
+    pub worktree_path: PathBuf,
+    pub name: String,
+    pub ignored: bool,
+    pub has_tracked_files: bool,
+    pub mtime_unix: Option<i64>,
+    pub mtime: Option<String>,
+    pub action: GeneratedDirAction,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedDirAction {
+    Delete,
+    ReportOnly,
+    Skip,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeDecision {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub action: WorktreeAction,
+    pub reason: String,
+    pub dirty_count: Option<usize>,
+    pub last_commit: Option<String>,
+    pub activity_age_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeAction {
+    Remove,
+    Keep,
+    PruneMetadata,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedDirDecision {
+    pub path: PathBuf,
+    pub worktree_path: PathBuf,
+    pub action: GeneratedDirAction,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedDirConfig {
+    pub delete_names: Vec<String>,
+    pub report_only_names: Vec<String>,
+}
+
+impl Default for GeneratedDirConfig {
+    fn default() -> Self {
+        Self::from_names(true, Vec::new(), Vec::new())
+    }
+}
+
+impl GeneratedDirConfig {
+    pub fn from_names(
+        include_defaults: bool,
+        delete_names: Vec<String>,
+        report_only_names: Vec<String>,
+    ) -> Self {
+        let mut delete = Vec::new();
+        let mut report_only = Vec::new();
+
+        if include_defaults {
+            delete.extend(
+                DEFAULT_GENERATED_DELETE_NAMES
+                    .iter()
+                    .map(|name| name.to_string()),
+            );
+            report_only.extend(
+                DEFAULT_GENERATED_REPORT_NAMES
+                    .iter()
+                    .map(|name| name.to_string()),
+            );
+        }
+
+        delete.extend(delete_names);
+        report_only.extend(report_only_names);
+
+        Self {
+            delete_names: normalize_names(delete),
+            report_only_names: normalize_names(report_only),
+        }
+    }
+
+    fn candidate_action(&self, name: &str) -> Option<GeneratedCandidateAction> {
+        if self
+            .report_only_names
+            .iter()
+            .any(|candidate| candidate == name)
+        {
+            Some(GeneratedCandidateAction::ReportOnly)
+        } else if self.delete_names.iter().any(|candidate| candidate == name) {
+            Some(GeneratedCandidateAction::Delete)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RepoContext {
+    current_worktree: PathBuf,
+    git_common_dir: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct RawWorktree {
+    path: PathBuf,
+    head: Option<String>,
+    branch: Option<String>,
+    detached: bool,
+    prunable: Option<String>,
+}
+
+#[derive(Debug)]
+struct GeneratedCandidate {
+    path: PathBuf,
+    relative: PathBuf,
+    name: String,
+    action: GeneratedCandidateAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratedCandidateAction {
+    Delete,
+    ReportOnly,
+}
+
+pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
+    let context = repo_context(repo)?;
+    let worktrees = inspect_worktrees(&context, options.now)?;
+    let worktree_decisions = plan_worktree_cleanup(&worktrees, options.stale_days, options.now);
+    let generated_dirs = scan_generated_dirs(
+        &worktrees,
+        options.generated_days,
+        options.now,
+        &options.generated_config,
+    )?;
+
+    Ok(TriageReport {
+        repo_root: context.current_worktree.clone(),
+        current_worktree: context.current_worktree,
+        git_common_dir: context.git_common_dir,
+        stale_days: options.stale_days,
+        generated_days: options.generated_days,
+        generated_delete_names: options.generated_config.delete_names,
+        generated_report_only_names: options.generated_config.report_only_names,
+        worktrees,
+        worktree_decisions,
+        generated_dirs,
+    })
+}
+
+pub fn audit(repo: Option<&Path>, generated_days: u64, now: SystemTime) -> Result<AuditReport> {
+    triage(
+        repo,
+        TriageOptions {
+            stale_days: DEFAULT_STALE_DAYS,
+            generated_days,
+            generated_config: GeneratedDirConfig::default(),
+            now,
+        },
+    )
+}
+
+pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
+    let context = repo_context(repo)?;
+    let worktrees = inspect_worktrees(&context, options.now)?;
+    let generated_dirs = scan_generated_dirs(
+        &worktrees,
+        options.generated_days,
+        options.now,
+        &options.generated_config,
+    )?;
+    let prune_output = run_worktree_prune(&context.current_worktree, false)?;
+
+    let worktree_decisions = plan_worktree_cleanup(&worktrees, options.stale_days, options.now);
+    let generated_decisions = generated_dirs
+        .iter()
+        .map(|dir| GeneratedDirDecision {
+            path: dir.path.clone(),
+            worktree_path: dir.worktree_path.clone(),
+            action: dir.action.clone(),
+            reason: dir.reason.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let manifest = CleanupManifest {
+        mode: if options.execute {
+            CleanupMode::Execute
+        } else {
+            CleanupMode::DryRun
+        },
+        generated_at: format_system_time(options.now),
+        repo_root: context.current_worktree.clone(),
+        current_worktree: context.current_worktree.clone(),
+        git_common_dir: context.git_common_dir.clone(),
+        stale_days: options.stale_days,
+        generated_days: options.generated_days,
+        generated_delete_names: options.generated_config.delete_names,
+        generated_report_only_names: options.generated_config.report_only_names,
+        prune_output,
+        worktrees: worktree_decisions,
+        generated_dirs: generated_decisions,
+    };
+
+    let manifest_path = write_manifest(&context.git_common_dir, &manifest)?;
+
+    if options.execute {
+        run_worktree_prune(&context.current_worktree, true)?;
+        execute_cleanup(&manifest)?;
+    }
+
+    Ok(CleanupRun {
+        manifest_path,
+        manifest,
+    })
+}
+
+pub fn print_triage(report: &TriageReport) {
+    let live = report
+        .worktrees
+        .iter()
+        .filter(|w| w.prunable.is_none())
+        .count();
+    let prunable = report
+        .worktrees
+        .iter()
+        .filter(|w| w.prunable.is_some())
+        .count();
+    let dirty = report
+        .worktrees
+        .iter()
+        .filter(|w| w.dirty_count.unwrap_or_default() > 0)
+        .count();
+    let removable = report
+        .worktree_decisions
+        .iter()
+        .filter(|d| d.action == WorktreeAction::Remove)
+        .count();
+    let generated_delete = report
+        .generated_dirs
+        .iter()
+        .filter(|d| d.action == GeneratedDirAction::Delete)
+        .count();
+    let dist_report = report
+        .generated_dirs
+        .iter()
+        .filter(|d| d.action == GeneratedDirAction::ReportOnly)
+        .count();
+
+    println!("repo: {}", report.repo_root.display());
+    println!(
+        "worktrees: {} live, {} prunable metadata, {} dirty, {} stale clean removal candidates",
+        live, prunable, dirty, removable
+    );
+    println!(
+        "generated dirs: {} delete candidates, {} report-only",
+        generated_delete, dist_report
+    );
+
+    print_prunable(&report.worktrees);
+    print_worktree_removals(&report.worktree_decisions);
+    print_dirty(&report.worktrees);
+    print_generated(&report.generated_dirs);
+}
+
+pub fn print_audit(report: &AuditReport) {
+    print_triage(report);
+}
+
+pub fn print_cleanup(run: &CleanupRun) {
+    let remove = run
+        .manifest
+        .worktrees
+        .iter()
+        .filter(|d| d.action == WorktreeAction::Remove)
+        .count();
+    let prune = run
+        .manifest
+        .worktrees
+        .iter()
+        .filter(|d| d.action == WorktreeAction::PruneMetadata)
+        .count();
+    let generated_delete = run
+        .manifest
+        .generated_dirs
+        .iter()
+        .filter(|d| d.action == GeneratedDirAction::Delete)
+        .count();
+
+    match run.manifest.mode {
+        CleanupMode::DryRun => println!("mode: dry-run"),
+        CleanupMode::Execute => println!("mode: execute"),
+    }
+    println!("manifest: {}", run.manifest_path.display());
+    println!("prunable metadata records: {}", prune);
+    println!("stale clean worktrees to remove: {}", remove);
+    println!("generated dirs to delete: {}", generated_delete);
+
+    if !run.manifest.prune_output.trim().is_empty() {
+        println!();
+        println!("git worktree prune:");
+        print!("{}", run.manifest.prune_output);
+    }
+
+    let removals = run
+        .manifest
+        .worktrees
+        .iter()
+        .filter(|d| d.action == WorktreeAction::Remove)
+        .collect::<Vec<_>>();
+    if !removals.is_empty() {
+        println!();
+        println!("worktree removals:");
+        for decision in removals {
+            println!(
+                "- {} ({})",
+                decision.path.display(),
+                decision.branch.as_deref().unwrap_or("detached")
+            );
+        }
+    }
+}
+
+fn repo_context(repo: Option<&Path>) -> Result<RepoContext> {
+    let cwd = repo.unwrap_or_else(|| Path::new("."));
+    let current_worktree = git_output(cwd, ["rev-parse", "--show-toplevel"])?
+        .trim()
+        .to_string();
+    let current_worktree =
+        fs::canonicalize(current_worktree).context("failed to canonicalize current worktree")?;
+
+    let git_common_dir = git_output(&current_worktree, ["rev-parse", "--git-common-dir"])?
+        .trim()
+        .to_string();
+    let git_common_dir = resolve_relative(&current_worktree, Path::new(&git_common_dir));
+
+    Ok(RepoContext {
+        current_worktree,
+        git_common_dir,
+    })
+}
+
+fn inspect_worktrees(context: &RepoContext, now: SystemTime) -> Result<Vec<WorktreeInfo>> {
+    let raw = parse_worktree_list(&git_output(
+        &context.current_worktree,
+        ["worktree", "list", "--porcelain"],
+    )?);
+    let current_canonical = fs::canonicalize(&context.current_worktree)?;
+
+    raw.into_par_iter()
+        .map(|entry| inspect_worktree(entry, &current_canonical, now))
+        .collect()
+}
+
+fn inspect_worktree(
+    entry: RawWorktree,
+    current_canonical: &Path,
+    now: SystemTime,
+) -> Result<WorktreeInfo> {
+    let exists = entry.path.exists();
+    let canonical = if exists {
+        fs::canonicalize(&entry.path).ok()
+    } else {
+        None
+    };
+    let is_current = canonical.as_deref() == Some(current_canonical);
+
+    if entry.prunable.is_some() || !exists {
+        return Ok(WorktreeInfo {
+            path: entry.path,
+            head: entry.head,
+            branch: entry.branch,
+            detached: entry.detached,
+            prunable: entry.prunable,
+            exists,
+            is_current,
+            dirty_count: None,
+            upstream: None,
+            ahead: None,
+            behind: None,
+            last_commit_unix: None,
+            last_commit: None,
+            activity_unix: None,
+            activity_age_days: None,
+        });
+    }
+
+    let status = dirty_status(&entry.path)?;
+    let upstream = git_output_allow_failure(&entry.path, ["rev-parse", "--abbrev-ref", "@{u}"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (behind, ahead) = upstream
+        .as_deref()
+        .and_then(|upstream| ahead_behind(&entry.path, upstream).ok())
+        .unwrap_or((None, None));
+    let last_commit_unix = git_output(&entry.path, ["log", "-1", "--format=%ct"])
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let activity_unix = max_time(last_commit_unix, status.newest_dirty_mtime_unix);
+
+    Ok(WorktreeInfo {
+        path: entry.path,
+        head: entry.head,
+        branch: entry.branch,
+        detached: entry.detached,
+        prunable: None,
+        exists,
+        is_current,
+        dirty_count: Some(status.dirty_count),
+        upstream,
+        ahead,
+        behind,
+        last_commit_unix,
+        last_commit: last_commit_unix.map(format_unix_time),
+        activity_unix,
+        activity_age_days: activity_unix.and_then(|unix| age_days(now, unix)),
+    })
+}
+
+fn parse_worktree_list(output: &str) -> Vec<RawWorktree> {
+    let mut entries = Vec::new();
+    let mut current: Option<RawWorktree> = None;
+
+    for line in output.lines() {
+        if line.is_empty() {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(RawWorktree {
+                path: PathBuf::from(path),
+                ..RawWorktree::default()
+            });
+            continue;
+        }
+
+        let Some(entry) = current.as_mut() else {
+            continue;
+        };
+
+        if let Some(head) = line.strip_prefix("HEAD ") {
+            entry.head = Some(head.to_string());
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            entry.branch = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_string(),
+            );
+        } else if line == "detached" {
+            entry.detached = true;
+        } else if let Some(reason) = line.strip_prefix("prunable ") {
+            entry.prunable = Some(reason.to_string());
+        }
+    }
+
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+
+    entries
+}
+
+fn dirty_status(path: &Path) -> Result<DirtyStatus> {
+    let output = git_bytes(path, ["status", "--porcelain=v1", "-z"])?;
+    let mut dirty_count = 0;
+    let mut newest_dirty_mtime_unix = None;
+    let mut parts = output.split(|byte| *byte == 0);
+
+    while let Some(entry) = parts.next() {
+        if entry.is_empty() || entry.len() < 4 {
+            continue;
+        }
+
+        dirty_count += 1;
+        let status = &entry[0..2];
+        let relative = String::from_utf8_lossy(&entry[3..]).to_string();
+        let dirty_path = path.join(relative);
+        if let Ok(metadata) = fs::symlink_metadata(dirty_path) {
+            if let Ok(modified) = metadata.modified() {
+                newest_dirty_mtime_unix =
+                    max_time(newest_dirty_mtime_unix, system_time_to_unix(modified));
+            }
+        }
+
+        if status[0] == b'R' || status[0] == b'C' {
+            let _ = parts.next();
+        }
+    }
+
+    Ok(DirtyStatus {
+        dirty_count,
+        newest_dirty_mtime_unix,
+    })
+}
+
+#[derive(Debug)]
+struct DirtyStatus {
+    dirty_count: usize,
+    newest_dirty_mtime_unix: Option<i64>,
+}
+
+fn ahead_behind(path: &Path, upstream: &str) -> Result<(Option<u64>, Option<u64>)> {
+    let range = format!("{upstream}...HEAD");
+    let output = git_output(path, ["rev-list", "--left-right", "--count", &range])?;
+    let mut parts = output.split_whitespace();
+    let behind = parts.next().and_then(|s| s.parse::<u64>().ok());
+    let ahead = parts.next().and_then(|s| s.parse::<u64>().ok());
+
+    Ok((behind, ahead))
+}
+
+fn scan_generated_dirs(
+    worktrees: &[WorktreeInfo],
+    generated_days: u64,
+    now: SystemTime,
+    config: &GeneratedDirConfig,
+) -> Result<Vec<GeneratedDirInfo>> {
+    let dirs = worktrees
+        .par_iter()
+        .map(|worktree| scan_generated_dirs_for_worktree(worktree, generated_days, now, config))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(dirs)
+}
+
+fn scan_generated_dirs_for_worktree(
+    worktree: &WorktreeInfo,
+    generated_days: u64,
+    now: SystemTime,
+    config: &GeneratedDirConfig,
+) -> Result<Vec<GeneratedDirInfo>> {
+    let mut dirs = Vec::new();
+
+    if worktree.prunable.is_some() || !worktree.exists {
+        return Ok(dirs);
+    }
+
+    let worktree_recent = worktree.is_current
+        || worktree
+            .activity_age_days
+            .is_some_and(|days| days < generated_days);
+    let candidates = generated_candidates(worktree, config)?;
+    let ignored_paths = git_ignored_paths(&worktree.path, &candidates)?;
+    let tracked_paths = git_tracked_paths(&worktree.path, &candidates)?;
+
+    for candidate in candidates {
+        let relative_key = path_key(&candidate.relative);
+        let ignored = ignored_paths.contains(&relative_key);
+        let has_tracked_files = tracked_paths
+            .iter()
+            .any(|tracked| path_is_under(tracked, &relative_key));
+        let mtime_unix = fs::symlink_metadata(&candidate.path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_to_unix);
+        let dir_recent = mtime_unix
+            .and_then(|unix| age_days(now, unix))
+            .is_some_and(|days| days < generated_days);
+
+        let (action, reason) = if candidate.action == GeneratedCandidateAction::ReportOnly {
+            (
+                GeneratedDirAction::ReportOnly,
+                format!("{} is configured as report-only", candidate.name),
+            )
+        } else if worktree_recent || dir_recent {
+            (
+                GeneratedDirAction::Skip,
+                format!(
+                    "worktree or generated directory activity is newer than {generated_days} days"
+                ),
+            )
+        } else if has_tracked_files {
+            (
+                GeneratedDirAction::Skip,
+                "directory contains tracked files".to_string(),
+            )
+        } else if ignored {
+            (
+                GeneratedDirAction::Delete,
+                "ignored generated directory".to_string(),
+            )
+        } else {
+            (
+                GeneratedDirAction::Delete,
+                "untracked generated directory".to_string(),
+            )
+        };
+
+        dirs.push(GeneratedDirInfo {
+            path: candidate.path,
+            worktree_path: worktree.path.clone(),
+            name: candidate.name,
+            ignored,
+            has_tracked_files,
+            mtime_unix,
+            mtime: mtime_unix.map(format_unix_time),
+            action,
+            reason,
+        });
+    }
+
+    Ok(dirs)
+}
+
+fn generated_candidates(
+    worktree: &WorktreeInfo,
+    config: &GeneratedDirConfig,
+) -> Result<Vec<GeneratedCandidate>> {
+    let mut candidates = Vec::new();
+    let mut walker = WalkDir::new(&worktree.path).follow_links(false).into_iter();
+
+    while let Some(entry) = walker.next() {
+        let entry = entry?;
+        if !entry.file_type().is_dir() || entry.depth() == 0 {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" {
+            walker.skip_current_dir();
+            continue;
+        }
+
+        let Some(action) = config.candidate_action(&name) else {
+            continue;
+        };
+
+        walker.skip_current_dir();
+        let path = entry.path().to_path_buf();
+        let relative = path
+            .strip_prefix(&worktree.path)
+            .context("generated path was outside worktree")?
+            .to_path_buf();
+        candidates.push(GeneratedCandidate {
+            path,
+            relative,
+            name,
+            action,
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn plan_worktree_cleanup(
+    worktrees: &[WorktreeInfo],
+    stale_days: u64,
+    now: SystemTime,
+) -> Vec<WorktreeDecision> {
+    worktrees
+        .iter()
+        .map(|worktree| {
+            let (action, reason) = if worktree.prunable.is_some() || !worktree.exists {
+                (
+                    WorktreeAction::PruneMetadata,
+                    worktree
+                        .prunable
+                        .clone()
+                        .unwrap_or_else(|| "worktree path does not exist".to_string()),
+                )
+            } else if worktree.is_current {
+                (
+                    WorktreeAction::Keep,
+                    "current worktree is never removed".to_string(),
+                )
+            } else if worktree.dirty_count.unwrap_or_default() > 0 {
+                (
+                    WorktreeAction::Keep,
+                    "dirty worktree is reserved for a second pass".to_string(),
+                )
+            } else if worktree.detached || worktree.branch.is_none() {
+                (
+                    WorktreeAction::Keep,
+                    "detached worktree is kept to preserve commit reachability".to_string(),
+                )
+            } else if worktree
+                .last_commit_unix
+                .and_then(|unix| age_days(now, unix))
+                .is_some_and(|days| days >= stale_days)
+            {
+                (
+                    WorktreeAction::Remove,
+                    format!("clean worktree last committed at least {stale_days} days ago"),
+                )
+            } else {
+                (
+                    WorktreeAction::Keep,
+                    format!("not older than {stale_days} days"),
+                )
+            };
+
+            WorktreeDecision {
+                path: worktree.path.clone(),
+                branch: worktree.branch.clone(),
+                action,
+                reason,
+                dirty_count: worktree.dirty_count,
+                last_commit: worktree.last_commit.clone(),
+                activity_age_days: worktree.activity_age_days,
+            }
+        })
+        .collect()
+}
+
+fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
+    let worktree_removals = manifest
+        .worktrees
+        .iter()
+        .filter(|decision| decision.action == WorktreeAction::Remove)
+        .collect::<Vec<_>>();
+    let generated_deletions = manifest
+        .generated_dirs
+        .iter()
+        .filter(|decision| decision.action == GeneratedDirAction::Delete)
+        .collect::<Vec<_>>();
+
+    eprintln!(
+        "executing cleanup: {} worktrees, {} generated dirs",
+        worktree_removals.len(),
+        generated_deletions.len()
+    );
+
+    for (index, decision) in worktree_removals.iter().enumerate() {
+        eprintln!(
+            "[worktree {}/{}] removing {}",
+            index + 1,
+            worktree_removals.len(),
+            decision.path.display()
+        );
+        flush_stderr();
+        if decision.action != WorktreeAction::Remove {
+            continue;
+        }
+
+        git_status_command(
+            &manifest.current_worktree,
+            [
+                "worktree".as_ref(),
+                "remove".as_ref(),
+                decision.path.as_os_str(),
+            ],
+        )
+        .with_context(|| format!("failed to remove {}", decision.path.display()))?;
+    }
+
+    for (index, decision) in generated_deletions.iter().enumerate() {
+        if index == 0 || index % 25 == 0 {
+            eprintln!(
+                "[generated {}/{}] deleting {}",
+                index + 1,
+                generated_deletions.len(),
+                decision.path.display()
+            );
+            flush_stderr();
+        }
+
+        if decision.action != GeneratedDirAction::Delete {
+            continue;
+        }
+
+        if decision.path.exists() {
+            fs::remove_dir_all(&decision.path)
+                .with_context(|| format!("failed to remove {}", decision.path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn flush_stderr() {
+    let _ = io::stderr().flush();
+}
+
+fn write_manifest(git_common_dir: &Path, manifest: &CleanupManifest) -> Result<PathBuf> {
+    let manifest_dir = git_common_dir.join("worktree-gc");
+    fs::create_dir_all(&manifest_dir).context("failed to create manifest directory")?;
+
+    let mode = match manifest.mode {
+        CleanupMode::DryRun => "dry-run",
+        CleanupMode::Execute => "execute",
+    };
+    let filename = format!(
+        "{}-{mode}.json",
+        manifest.generated_at.replace([':', '.'], "-")
+    );
+    let path = manifest_dir.join(filename);
+    let json = serde_json::to_vec_pretty(manifest)?;
+    fs::write(&path, json).context("failed to write cleanup manifest")?;
+
+    Ok(path)
+}
+
+fn run_worktree_prune(repo: &Path, execute: bool) -> Result<String> {
+    let args: &[&str] = if execute {
+        &["worktree", "prune", "--verbose"]
+    } else {
+        &["worktree", "prune", "--dry-run", "--verbose"]
+    };
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("failed to run git worktree prune in {}", repo.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "git worktree prune failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(combined)
+}
+
+fn print_prunable(worktrees: &[WorktreeInfo]) {
+    let prunable = worktrees
+        .iter()
+        .filter(|w| w.prunable.is_some())
+        .collect::<Vec<_>>();
+    if prunable.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("prunable metadata:");
+    for worktree in prunable {
+        println!(
+            "- {} ({})",
+            worktree.path.display(),
+            worktree.prunable.as_deref().unwrap_or("prunable")
+        );
+    }
+}
+
+fn print_worktree_removals(decisions: &[WorktreeDecision]) {
+    let removals = decisions
+        .iter()
+        .filter(|d| d.action == WorktreeAction::Remove)
+        .take(25)
+        .collect::<Vec<_>>();
+    if removals.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("stale clean worktree removal candidates (first 25):");
+    for decision in removals {
+        println!(
+            "- {} {} ({})",
+            decision.branch.as_deref().unwrap_or("detached"),
+            decision.path.display(),
+            decision.reason
+        );
+    }
+}
+
+fn print_dirty(worktrees: &[WorktreeInfo]) {
+    let dirty = worktrees
+        .iter()
+        .filter(|w| w.dirty_count.unwrap_or_default() > 0)
+        .collect::<Vec<_>>();
+    if dirty.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("dirty worktrees kept:");
+    for worktree in dirty {
+        println!(
+            "- dirty={} {} {}",
+            worktree.dirty_count.unwrap_or_default(),
+            worktree.branch.as_deref().unwrap_or("detached"),
+            worktree.path.display()
+        );
+    }
+}
+
+fn print_generated(generated_dirs: &[GeneratedDirInfo]) {
+    let delete = generated_dirs
+        .iter()
+        .filter(|d| d.action == GeneratedDirAction::Delete)
+        .take(25)
+        .collect::<Vec<_>>();
+    if delete.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("generated delete candidates (first 25):");
+    for dir in delete {
+        println!("- {} ({})", dir.path.display(), dir.reason);
+    }
+}
+
+fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run git in {}", cwd.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "git failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn git_output_allow_failure<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
+    git_output(cwd, args).ok()
+}
+
+fn git_bytes<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run git in {}", cwd.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "git failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(output.stdout)
+}
+
+fn git_status_command<const N: usize>(cwd: &Path, args: [&OsStr; N]) -> Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .with_context(|| format!("failed to run git in {}", cwd.display()))?;
+
+    if !status.success() {
+        bail!("git command failed in {}", cwd.display());
+    }
+
+    Ok(())
+}
+
+fn git_ignored_paths(
+    worktree: &Path,
+    candidates: &[GeneratedCandidate],
+) -> Result<HashSet<String>> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut child = Command::new("git")
+        .args(["check-ignore", "-z", "--stdin"])
+        .current_dir(worktree)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run git check-ignore in {}", worktree.display()))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to open git check-ignore stdin")?;
+        for candidate in candidates {
+            stdin.write_all(path_key(&candidate.relative).as_bytes())?;
+            stdin.write_all(&[0])?;
+        }
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        bail!(
+            "git check-ignore failed in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(split_nul_strings(&output.stdout).into_iter().collect())
+}
+
+fn git_tracked_paths(
+    worktree: &Path,
+    candidates: &[GeneratedCandidate],
+) -> Result<HashSet<String>> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut command = Command::new("git");
+    command
+        .arg("ls-files")
+        .arg("-z")
+        .arg("--")
+        .current_dir(worktree);
+    for candidate in candidates {
+        command.arg(&candidate.relative);
+    }
+
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run git ls-files in {}", worktree.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "git ls-files failed in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(split_nul_strings(&output.stdout).into_iter().collect())
+}
+
+fn split_nul_strings(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).to_string())
+        .collect()
+}
+
+fn normalize_names(names: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for name in names {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        if seen.insert(name.clone()) {
+            normalized.push(name);
+        }
+    }
+
+    normalized
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn path_is_under(path: &str, directory: &str) -> bool {
+    path == directory
+        || path
+            .strip_prefix(directory)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn resolve_relative(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn max_time(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn age_days(now: SystemTime, unix: i64) -> Option<u64> {
+    let then = UNIX_EPOCH.checked_add(Duration::from_secs(unix.try_into().ok()?))?;
+    now.duration_since(then)
+        .ok()
+        .map(|duration| duration.as_secs() / 86_400)
+}
+
+fn format_unix_time(unix: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|dt| dt.format(&Rfc3339).ok())
+        .unwrap_or_else(|| unix.to_string())
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    system_time_to_unix(time)
+        .map(format_unix_time)
+        .unwrap_or_else(|| "unknown-time".to_string())
+}
+
+fn system_time_to_unix(time: SystemTime) -> Option<i64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| duration.as_secs().try_into().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn now() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    fn init_repo() -> Result<(TempDir, PathBuf)> {
+        let temp = TempDir::new()?;
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo)?;
+        git_output(&repo, ["init"])?;
+        git_output(&repo, ["config", "user.email", "test@example.com"])?;
+        git_output(&repo, ["config", "user.name", "Test User"])?;
+        fs::write(
+            repo.join(".gitignore"),
+            "node_modules\n.next\n.turbo\ntarget\n",
+        )?;
+        fs::write(repo.join("README.md"), "hello\n")?;
+        git_output(&repo, ["add", "."])?;
+        commit_with_date(&repo, "initial", "2025-01-01T00:00:00Z")?;
+        Ok((temp, repo))
+    }
+
+    fn commit_with_date(repo: &Path, message: &str, date: &str) -> Result<()> {
+        let output = Command::new("git")
+            .args(["commit", "-m", message])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .current_dir(repo)
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "commit failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn add_worktree(repo: &Path, path: &Path, branch: &str) -> Result<()> {
+        git_output(
+            repo,
+            [
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().context("non-utf8 path")?,
+                "HEAD",
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_does_not_mutate() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("stale");
+        add_worktree(&repo, &worktree, "stale-branch")?;
+
+        let options = CleanupOptions {
+            execute: false,
+            stale_days: 30,
+            generated_days: 7,
+            generated_config: GeneratedDirConfig::default(),
+            now: now(),
+        };
+        let run = cleanup(Some(&repo), options)?;
+        let expected_worktree = fs::canonicalize(&worktree)?;
+
+        assert!(worktree.exists());
+        assert!(run
+            .manifest
+            .worktrees
+            .iter()
+            .any(|d| d.path == expected_worktree && d.action == WorktreeAction::Remove));
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_worktrees_are_preserved() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("dirty");
+        add_worktree(&repo, &worktree, "dirty-branch")?;
+        fs::write(worktree.join("README.md"), "changed\n")?;
+        let expected_worktree = fs::canonicalize(&worktree)?;
+
+        let report = audit(Some(&repo), 7, now())?;
+        let decisions = plan_worktree_cleanup(&report.worktrees, 30, now());
+        let decision = decisions
+            .iter()
+            .find(|decision| decision.path == expected_worktree)
+            .context("missing dirty worktree decision")?;
+
+        assert_eq!(decision.action, WorktreeAction::Keep);
+        assert!(decision.reason.contains("dirty"));
+        Ok(())
+    }
+
+    #[test]
+    fn branch_ref_survives_worktree_removal() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("remove-me");
+        add_worktree(&repo, &worktree, "remove-me-branch")?;
+
+        let options = CleanupOptions {
+            execute: true,
+            stale_days: 30,
+            generated_days: 7,
+            generated_config: GeneratedDirConfig::default(),
+            now: now(),
+        };
+        cleanup(Some(&repo), options)?;
+
+        assert!(!worktree.exists());
+        let refs = git_output(&repo, ["show-ref", "--heads", "remove-me-branch"])?;
+        assert!(refs.contains("refs/heads/remove-me-branch"));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_dirs_are_removed_only_when_untracked() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("generated");
+        add_worktree(&repo, &worktree, "generated-branch")?;
+        fs::create_dir_all(worktree.join("node_modules/pkg"))?;
+        fs::write(
+            worktree.join("node_modules/pkg/index.js"),
+            "module.exports = 1\n",
+        )?;
+
+        fs::create_dir_all(worktree.join("tracked-target"))?;
+        fs::write(worktree.join("tracked-target/file.txt"), "tracked\n")?;
+        git_output(&worktree, ["add", "tracked-target/file.txt"])?;
+        commit_with_date(&worktree, "tracked target", "2025-01-02T00:00:00Z")?;
+        fs::create_dir_all(worktree.join("target"))?;
+        fs::write(worktree.join("target/cache"), "cache\n")?;
+
+        let options = CleanupOptions {
+            execute: true,
+            stale_days: 10_000,
+            generated_days: 7,
+            generated_config: GeneratedDirConfig::default(),
+            now: now(),
+        };
+        cleanup(Some(&repo), options)?;
+
+        assert!(!worktree.join("node_modules").exists());
+        assert!(!worktree.join("target").exists());
+        assert!(worktree.join("tracked-target/file.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn dist_is_report_only() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("dist-report");
+        add_worktree(&repo, &worktree, "dist-report-branch")?;
+        fs::create_dir_all(worktree.join("dist"))?;
+        fs::write(worktree.join("dist/bundle.js"), "console.log(1)\n")?;
+        let expected_dist = fs::canonicalize(worktree.join("dist"))?;
+
+        let report = audit(Some(&repo), 7, now())?;
+        let dist = report
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected_dist)
+            .context("missing dist entry")?;
+
+        assert_eq!(dist.action, GeneratedDirAction::ReportOnly);
+        Ok(())
+    }
+
+    #[test]
+    fn custom_generated_names_are_supported() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("custom-generated");
+        add_worktree(&repo, &worktree, "custom-generated-branch")?;
+        fs::create_dir_all(worktree.join("coverage"))?;
+        fs::write(worktree.join("coverage/index.html"), "coverage\n")?;
+        fs::create_dir_all(worktree.join("logs"))?;
+        fs::write(worktree.join("logs/run.log"), "log\n")?;
+        let expected_coverage = fs::canonicalize(worktree.join("coverage"))?;
+        let expected_logs = fs::canonicalize(worktree.join("logs"))?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_config: GeneratedDirConfig::from_names(
+                    false,
+                    vec!["coverage".to_string()],
+                    vec!["logs".to_string()],
+                ),
+                now: now(),
+            },
+        )?;
+
+        let coverage = report
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected_coverage)
+            .context("missing coverage entry")?;
+        let logs = report
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected_logs)
+            .context("missing logs entry")?;
+
+        assert_eq!(coverage.action, GeneratedDirAction::Delete);
+        assert_eq!(logs.action, GeneratedDirAction::ReportOnly);
+        Ok(())
+    }
+}
