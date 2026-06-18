@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -55,7 +56,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json, sys; print(next(package for package in json.load(sys.stdin)["packages"] if package["name"] == "worktree-gc")["version"])')"
+          cargo_version="$(cargo metadata --locked --no-deps --format-version 1 | python -c 'import json, sys; print(next(package for package in json.load(sys.stdin)["packages"] if package["name"] == "worktree-gc")["version"])')"
           tag_version="${GITHUB_REF_NAME#v}"
           if [[ "$cargo_version" != "$tag_version" ]]; then
             echo "Cargo.toml version $cargo_version does not match tag $GITHUB_REF_NAME" >&2
