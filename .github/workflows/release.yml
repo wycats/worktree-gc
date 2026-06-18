@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, such as v0.1.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -26,7 +31,7 @@ jobs:
             archive_ext: tgz
             binary_ext: ""
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
             archive_ext: tgz
             binary_ext: ""
           - target: aarch64-apple-darwin
@@ -41,6 +46,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -57,9 +64,10 @@ jobs:
         shell: bash
         run: |
           cargo_version="$(cargo metadata --locked --no-deps --format-version 1 | python -c 'import json, sys; print(next(package for package in json.load(sys.stdin)["packages"] if package["name"] == "worktree-gc")["version"])')"
-          tag_version="${GITHUB_REF_NAME#v}"
+          release_ref="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          tag_version="${release_ref#v}"
           if [[ "$cargo_version" != "$tag_version" ]]; then
-            echo "Cargo.toml version $cargo_version does not match tag $GITHUB_REF_NAME" >&2
+            echo "Cargo.toml version $cargo_version does not match tag $release_ref" >&2
             exit 1
           fi
           echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
