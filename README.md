@@ -15,7 +15,7 @@ It is conservative by default:
 Install from source with Cargo:
 
 ```sh
-cargo install worktree-gc
+cargo install --locked worktree-gc
 ```
 
 After a version has been published to crates.io and its matching `vX.Y.Z`

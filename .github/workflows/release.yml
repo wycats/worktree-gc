@@ -21,7 +21,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             archive_ext: tgz
             binary_ext: ""
           - target: x86_64-apple-darwin
@@ -29,11 +29,11 @@ jobs:
             archive_ext: tgz
             binary_ext: ""
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-14
             archive_ext: tgz
             binary_ext: ""
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2022
             archive_ext: zip
             binary_ext: ".exe"
 
@@ -46,11 +46,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Verify tag matches Cargo version
         id: version
         shell: bash
         run: |
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json, sys; print(next(package for package in json.load(sys.stdin)["packages"] if package["name"] == "worktree-gc")["version"])')"
           tag_version="${GITHUB_REF_NAME#v}"
           if [[ "$cargo_version" != "$tag_version" ]]; then
             echo "Cargo.toml version $cargo_version does not match tag $GITHUB_REF_NAME" >&2
@@ -70,7 +75,7 @@ jobs:
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.binary_ext }}" "$staging/"
           if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
-            PACKAGE="$package" BINARY="${BIN_NAME}${{ matrix.binary_ext }}" python3 - <<'PY'
+            PACKAGE="$package" BINARY="${BIN_NAME}${{ matrix.binary_ext }}" python - <<'PY'
           import os
           import zipfile
 

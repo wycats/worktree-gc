@@ -32,15 +32,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Read package versions
         id: version
         run: |
-          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json, sys; print(next(package for package in json.load(sys.stdin)["packages"] if package["name"] == "worktree-gc")["version"])')"
           previous_version=""
 
           if [[ "${{ github.event_name }}" == "push" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
             if git cat-file -e "${{ github.event.before }}:Cargo.toml" 2>/dev/null; then
-              previous_version="$(git show "${{ github.event.before }}:Cargo.toml" | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["package"]["version"])')"
+              previous_version="$(git show "${{ github.event.before }}:Cargo.toml" | python -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["package"]["version"])')"
             fi
           fi
 
