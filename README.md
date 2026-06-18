@@ -60,13 +60,28 @@ cargo run -- triage --repo /path/to/repo --no-default-generated --delete-generat
 
 ## Releases
 
-Release builds are produced by GitHub Actions when a tag matching the package
-version is pushed:
+The first crate version must be published manually. After that, configure
+crates.io Trusted Publishing for this repository:
+
+- repository owner: `wycats`
+- repository name: `worktree-gc`
+- workflow filename: `publish.yml`
+- environment: `release`
+
+Once trusted publishing is configured, bumping `package.version` on `main`
+publishes that version to crates.io automatically. The publish workflow skips
+Cargo metadata-only changes when the version is unchanged, and also skips a
+version that is already present on crates.io.
+
+After a successful publish, the workflow creates and pushes the matching Git
+tag, such as:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+v0.1.0
 ```
+
+That tag triggers the release workflow, which builds Linux, macOS, and Windows
+archives for GitHub Releases.
 
 The release workflow builds Linux, macOS, and Windows archives using
 `cargo-binstall`'s default GitHub release layout, with asset names like
