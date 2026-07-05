@@ -140,7 +140,11 @@ fn parse_sweep_strategy(raw: &str) -> Result<SweepStrategy, String> {
         .ok_or_else(|| format!("expected TOOL:DAYS in '{raw}'"))?;
     let tool = match tool.trim() {
         "cargo-sweep" => SweepTool::CargoSweep,
-        other => return Err(format!("unknown sweep tool '{other}' (supported: cargo-sweep)")),
+        other => {
+            return Err(format!(
+                "unknown sweep tool '{other}' (supported: cargo-sweep)"
+            ))
+        }
     };
     let days = days
         .trim()

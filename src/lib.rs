@@ -1130,11 +1130,16 @@ fn run_sweep(decision: &GeneratedDirDecision) {
     };
     match tool {
         SweepTool::CargoSweep => {
+            // Run from the directory containing the matched target dir, not
+            // the worktree root: the scan can match nested `target/` dirs
+            // (workspace members, vendored crates), and cargo-sweep sweeps
+            // the target dir of the project it runs in.
+            let project_dir = decision.path.parent().unwrap_or(&decision.worktree_path);
             let result = Command::new("cargo")
                 .arg("sweep")
                 .arg("--time")
                 .arg(days.to_string())
-                .current_dir(&decision.worktree_path)
+                .current_dir(project_dir)
                 .stdin(Stdio::null())
                 .output();
             match result {
@@ -1643,7 +1648,10 @@ mod tests {
         let expected = fs::canonicalize(worktree.join("target"))?;
 
         // Recent activity: without a sweep strategy this would be a skip.
-        set_mtime(&worktree.join("target/debug/binary"), unix_days_before_now(1))?;
+        set_mtime(
+            &worktree.join("target/debug/binary"),
+            unix_days_before_now(1),
+        )?;
 
         let strategy = SweepStrategy {
             name: "target".to_string(),
@@ -1680,7 +1688,10 @@ mod tests {
         assert_eq!(dir.sweep_days, Some(3));
 
         // Stale dirs with a sweep strategy still prefer wholesale deletion.
-        set_mtime(&worktree.join("target/debug/binary"), unix_days_before_now(400))?;
+        set_mtime(
+            &worktree.join("target/debug/binary"),
+            unix_days_before_now(400),
+        )?;
         set_mtime(&worktree.join("target/debug"), unix_days_before_now(400))?;
         set_mtime(&worktree.join("target"), unix_days_before_now(400))?;
 

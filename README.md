@@ -49,7 +49,7 @@ activity, use `--generated-activity-only` with a shorter generated window:
 cargo run -- cleanup --repo /path/to/repo --generated-days 3 --generated-activity-only --execute
 ```
 
-Activity detection samples mtimes up to two levels deep inside each generated
+Activity detection samples mtimes up to three levels deep inside each generated
 directory, not just the directory itself. A build cache whose top-level mtime
 is old but whose nested entries (`.next/cache/...`) are churning is treated as
 active and kept.
