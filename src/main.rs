@@ -33,6 +33,12 @@ enum Command {
         )]
         generated_activity_only: bool,
 
+        #[arg(
+            long,
+            help = "Skip generated dirs that a running process has open files in (uses lsof)"
+        )]
+        check_in_use: bool,
+
         #[command(flatten)]
         generated: GeneratedArgs,
     },
@@ -51,6 +57,12 @@ enum Command {
             help = "Clean generated dirs using only their own activity, ignoring worktree-level recency"
         )]
         generated_activity_only: bool,
+
+        #[arg(
+            long,
+            help = "Skip generated dirs that a running process has open files in (uses lsof)"
+        )]
+        check_in_use: bool,
 
         #[command(flatten)]
         generated: GeneratedArgs,
@@ -76,10 +88,34 @@ struct GeneratedArgs {
     report_generated: Vec<String>,
 
     #[arg(
+        long = "generated-window",
+        value_name = "NAME=DAYS",
+        value_delimiter = ',',
+        value_parser = parse_window_override,
+        help = "Per-name staleness window override (e.g. .next=2); repeat or comma-separate"
+    )]
+    generated_window: Vec<(String, u64)>,
+
+    #[arg(
         long,
         help = "Start with no default generated directory names before applying custom names"
     )]
     no_default_generated: bool,
+}
+
+fn parse_window_override(raw: &str) -> Result<(String, u64), String> {
+    let (name, days) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=DAYS, got '{raw}'"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("expected NAME=DAYS, got '{raw}'"));
+    }
+    let days = days
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid day count in '{raw}'"))?;
+    Ok((name.to_string(), days))
 }
 
 impl GeneratedArgs {
@@ -88,6 +124,7 @@ impl GeneratedArgs {
             !self.no_default_generated,
             self.delete_generated.clone(),
             self.report_generated.clone(),
+            self.generated_window.clone(),
         )
     }
 }
@@ -101,6 +138,7 @@ fn main() -> Result<()> {
             stale_days,
             generated_days,
             generated_activity_only,
+            check_in_use,
             generated,
         } => {
             let report = triage(
@@ -109,6 +147,7 @@ fn main() -> Result<()> {
                     stale_days,
                     generated_days,
                     generated_activity_only,
+                    check_in_use,
                     generated_config: generated.config(),
                     now,
                 },
@@ -120,6 +159,7 @@ fn main() -> Result<()> {
             stale_days,
             generated_days,
             generated_activity_only,
+            check_in_use,
             generated,
         } => {
             let options = CleanupOptions {
@@ -127,6 +167,7 @@ fn main() -> Result<()> {
                 stale_days,
                 generated_days,
                 generated_activity_only,
+                check_in_use,
                 generated_config: generated.config(),
                 now,
             };

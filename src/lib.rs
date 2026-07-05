@@ -17,11 +17,22 @@ pub const DEFAULT_GENERATED_DAYS: u64 = 7;
 pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", ".turbo", "target"];
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 
+// Build caches are cheap to regenerate compared to dependency installs, so
+// they default to a tighter window than --generated-days.
+pub const DEFAULT_BUILD_CACHE_DAYS: u64 = 3;
+pub const DEFAULT_BUILD_CACHE_NAMES: &[&str] = &[".next", ".turbo", "target"];
+
+// A generated directory's own mtime only reflects direct-child changes, so
+// activity is sampled to this depth to catch churn in nested subtrees
+// (e.g. .next/server/app during an active dev session).
+const GENERATED_MTIME_SAMPLE_DEPTH: usize = 3;
+
 #[derive(Debug, Clone)]
 pub struct TriageOptions {
     pub stale_days: u64,
     pub generated_days: u64,
     pub generated_activity_only: bool,
+    pub check_in_use: bool,
     pub generated_config: GeneratedDirConfig,
     pub now: SystemTime,
 }
@@ -32,6 +43,7 @@ pub struct CleanupOptions {
     pub stale_days: u64,
     pub generated_days: u64,
     pub generated_activity_only: bool,
+    pub check_in_use: bool,
     pub generated_config: GeneratedDirConfig,
     pub now: SystemTime,
 }
@@ -44,6 +56,7 @@ pub struct TriageReport {
     pub stale_days: u64,
     pub generated_days: u64,
     pub generated_activity_only: bool,
+    pub check_in_use: bool,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
     pub worktrees: Vec<WorktreeInfo>,
@@ -69,6 +82,7 @@ pub struct CleanupManifest {
     pub stale_days: u64,
     pub generated_days: u64,
     pub generated_activity_only: bool,
+    pub check_in_use: bool,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
     pub prune_output: String,
@@ -111,6 +125,8 @@ pub struct GeneratedDirInfo {
     pub has_tracked_files: bool,
     pub mtime_unix: Option<i64>,
     pub mtime: Option<String>,
+    pub effective_days: u64,
+    pub in_use: bool,
     pub action: GeneratedDirAction,
     pub reason: String,
 }
@@ -146,6 +162,10 @@ pub enum WorktreeAction {
 pub struct GeneratedDirDecision {
     pub path: PathBuf,
     pub worktree_path: PathBuf,
+    pub name: String,
+    pub mtime: Option<String>,
+    pub effective_days: u64,
+    pub in_use: bool,
     pub action: GeneratedDirAction,
     pub reason: String,
 }
@@ -154,11 +174,18 @@ pub struct GeneratedDirDecision {
 pub struct GeneratedDirConfig {
     pub delete_names: Vec<String>,
     pub report_only_names: Vec<String>,
+    pub window_overrides: Vec<GeneratedWindowOverride>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedWindowOverride {
+    pub name: String,
+    pub days: u64,
 }
 
 impl Default for GeneratedDirConfig {
     fn default() -> Self {
-        Self::from_names(true, Vec::new(), Vec::new())
+        Self::from_names(true, Vec::new(), Vec::new(), Vec::new())
     }
 }
 
@@ -167,9 +194,11 @@ impl GeneratedDirConfig {
         include_defaults: bool,
         delete_names: Vec<String>,
         report_only_names: Vec<String>,
+        window_overrides: Vec<(String, u64)>,
     ) -> Self {
         let mut delete = Vec::new();
         let mut report_only = Vec::new();
+        let mut windows = Vec::new();
 
         if include_defaults {
             delete.extend(
@@ -182,15 +211,39 @@ impl GeneratedDirConfig {
                     .iter()
                     .map(|name| name.to_string()),
             );
+            windows.extend(
+                DEFAULT_BUILD_CACHE_NAMES
+                    .iter()
+                    .map(|name| GeneratedWindowOverride {
+                        name: name.to_string(),
+                        days: DEFAULT_BUILD_CACHE_DAYS,
+                    }),
+            );
         }
 
         delete.extend(delete_names);
         report_only.extend(report_only_names);
+        windows.extend(
+            window_overrides
+                .into_iter()
+                .map(|(name, days)| GeneratedWindowOverride { name, days }),
+        );
 
         Self {
             delete_names: normalize_names(delete),
             report_only_names: normalize_names(report_only),
+            window_overrides: windows,
         }
+    }
+
+    // Later entries win so custom overrides shadow the build-cache defaults.
+    pub fn effective_days(&self, name: &str, generated_days: u64) -> u64 {
+        self.window_overrides
+            .iter()
+            .rev()
+            .find(|override_| override_.name == name)
+            .map(|override_| override_.days)
+            .unwrap_or(generated_days)
     }
 
     fn candidate_action(&self, name: &str) -> Option<GeneratedCandidateAction> {
@@ -245,6 +298,7 @@ pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageRepor
         &worktrees,
         options.generated_days,
         options.generated_activity_only,
+        options.check_in_use,
         options.now,
         &options.generated_config,
     )?;
@@ -256,6 +310,7 @@ pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageRepor
         stale_days: options.stale_days,
         generated_days: options.generated_days,
         generated_activity_only: options.generated_activity_only,
+        check_in_use: options.check_in_use,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
         worktrees,
@@ -271,6 +326,7 @@ pub fn audit(repo: Option<&Path>, generated_days: u64, now: SystemTime) -> Resul
             stale_days: DEFAULT_STALE_DAYS,
             generated_days,
             generated_activity_only: false,
+            check_in_use: false,
             generated_config: GeneratedDirConfig::default(),
             now,
         },
@@ -284,6 +340,7 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
         &worktrees,
         options.generated_days,
         options.generated_activity_only,
+        options.check_in_use,
         options.now,
         &options.generated_config,
     )?;
@@ -295,6 +352,10 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
         .map(|dir| GeneratedDirDecision {
             path: dir.path.clone(),
             worktree_path: dir.worktree_path.clone(),
+            name: dir.name.clone(),
+            mtime: dir.mtime.clone(),
+            effective_days: dir.effective_days,
+            in_use: dir.in_use,
             action: dir.action.clone(),
             reason: dir.reason.clone(),
         })
@@ -313,6 +374,7 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
         stale_days: options.stale_days,
         generated_days: options.generated_days,
         generated_activity_only: options.generated_activity_only,
+        check_in_use: options.check_in_use,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
         prune_output,
@@ -638,6 +700,7 @@ fn scan_generated_dirs(
     worktrees: &[WorktreeInfo],
     generated_days: u64,
     generated_activity_only: bool,
+    check_in_use: bool,
     now: SystemTime,
     config: &GeneratedDirConfig,
 ) -> Result<Vec<GeneratedDirInfo>> {
@@ -648,6 +711,7 @@ fn scan_generated_dirs(
                 worktree,
                 generated_days,
                 generated_activity_only,
+                check_in_use,
                 now,
                 config,
             )
@@ -664,6 +728,7 @@ fn scan_generated_dirs_for_worktree(
     worktree: &WorktreeInfo,
     generated_days: u64,
     generated_activity_only: bool,
+    check_in_use: bool,
     now: SystemTime,
     config: &GeneratedDirConfig,
 ) -> Result<Vec<GeneratedDirInfo>> {
@@ -673,42 +738,53 @@ fn scan_generated_dirs_for_worktree(
         return Ok(dirs);
     }
 
-    let worktree_recent = !generated_activity_only
-        && (worktree.is_current
-            || worktree
-                .activity_age_days
-                .is_some_and(|days| days < generated_days));
     let candidates = generated_candidates(worktree, config)?;
     let ignored_paths = git_ignored_paths(&worktree.path, &candidates)?;
     let tracked_paths = git_tracked_paths(&worktree.path, &candidates)?;
 
     for candidate in candidates {
+        let effective_days = config.effective_days(&candidate.name, generated_days);
+        let worktree_recent = !generated_activity_only
+            && (worktree.is_current
+                || worktree
+                    .activity_age_days
+                    .is_some_and(|days| days < effective_days));
         let relative_key = path_key(&candidate.relative);
         let ignored = ignored_paths.contains(&relative_key);
         let has_tracked_files = tracked_paths
             .iter()
             .any(|tracked| path_is_under(tracked, &relative_key));
-        let mtime_unix = fs::symlink_metadata(&candidate.path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(system_time_to_unix);
+        let mtime_unix = sampled_mtime_unix(&candidate.path, GENERATED_MTIME_SAMPLE_DEPTH);
         let dir_recent = mtime_unix
             .and_then(|unix| age_days(now, unix))
-            .is_some_and(|days| days < generated_days);
+            .is_some_and(|days| days < effective_days);
+
+        // Only pay for the open-handle probe when the directory would
+        // otherwise be deleted.
+        let deletable_so_far = candidate.action == GeneratedCandidateAction::Delete
+            && !worktree_recent
+            && !dir_recent
+            && !has_tracked_files;
+        let in_use = check_in_use && deletable_so_far && dir_has_open_handles(&candidate.path);
 
         let (action, reason) = if candidate.action == GeneratedCandidateAction::ReportOnly {
             (
                 GeneratedDirAction::ReportOnly,
                 format!("{} is configured as report-only", candidate.name),
             )
+        } else if in_use {
+            (
+                GeneratedDirAction::Skip,
+                "a running process has open files in this directory".to_string(),
+            )
         } else if worktree_recent || dir_recent {
             (
                 GeneratedDirAction::Skip,
                 if generated_activity_only {
-                    format!("generated directory activity is newer than {generated_days} days")
+                    format!("generated directory activity is newer than {effective_days} days")
                 } else {
                     format!(
-                        "worktree or generated directory activity is newer than {generated_days} days"
+                        "worktree or generated directory activity is newer than {effective_days} days"
                     )
                 },
             )
@@ -737,12 +813,72 @@ fn scan_generated_dirs_for_worktree(
             has_tracked_files,
             mtime_unix,
             mtime: mtime_unix.map(format_unix_time),
+            effective_days,
+            in_use,
             action,
             reason,
         });
     }
 
     Ok(dirs)
+}
+
+// Newest mtime among the directory itself and its descendants up to
+// `depth` levels below it. A directory's own mtime only changes when a
+// direct child is added or removed, so an actively-written build cache
+// (e.g. .next/server/app during a dev session) can look stale from the
+// top-level stat alone.
+fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
+    let mut newest = None;
+
+    for entry in WalkDir::new(path)
+        .follow_links(false)
+        .max_depth(depth)
+        .into_iter()
+        .flatten()
+    {
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_to_unix);
+        newest = max_time(newest, modified);
+    }
+
+    newest
+}
+
+// Best-effort open-handle probe. `lsof +D` walks the whole tree, which is
+// too slow for multi-gigabyte caches, so this probes the directory and its
+// immediate children (`+d`). That catches the common live-dev-server shapes
+// (a held lockfile, trace file, or cache subdirectory handle) without the
+// full walk. Errors and unsupported platforms degrade to "not in use" —
+// deep mtime sampling remains the primary guard; this is a second line of
+// defense for long-idle processes that hold handles without writing.
+#[cfg(unix)]
+fn dir_has_open_handles(path: &Path) -> bool {
+    let Some(path_str) = path.to_str() else {
+        return false;
+    };
+
+    let output = Command::new("lsof")
+        .args(["-Fn", "+d", path_str])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+
+    match output {
+        Ok(output) => output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.first() == Some(&b'n')),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn dir_has_open_handles(_path: &Path) -> bool {
+    false
 }
 
 fn generated_candidates(
@@ -1222,9 +1358,12 @@ fn max_time(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 
 fn age_days(now: SystemTime, unix: i64) -> Option<u64> {
     let then = UNIX_EPOCH.checked_add(Duration::from_secs(unix.try_into().ok()?))?;
-    now.duration_since(then)
-        .ok()
-        .map(|duration| duration.as_secs() / 86_400)
+    // A file written while the scan is running (or under clock skew) can
+    // carry an mtime newer than the captured `now`. That is the most
+    // recent activity possible, not an error: treat it as age zero rather
+    // than letting duration_since fail and the entry read as "no activity".
+    let duration = now.duration_since(then).unwrap_or(Duration::ZERO);
+    Some(duration.as_secs() / 86_400)
 }
 
 fn format_unix_time(unix: i64) -> String {
@@ -1303,6 +1442,190 @@ mod tests {
         Ok(())
     }
 
+    fn set_mtime(path: &Path, unix: i64) -> Result<()> {
+        let time = UNIX_EPOCH + Duration::from_secs(u64::try_from(unix)?);
+        let file = fs::File::options().read(true).open(path)?;
+        file.set_modified(time)?;
+        Ok(())
+    }
+
+    fn unix_days_before_now(days: u64) -> i64 {
+        system_time_to_unix(now()).expect("test now fits in unix time") - (days * 86_400) as i64
+    }
+
+    #[test]
+    fn effective_days_prefers_later_overrides() {
+        let config = GeneratedDirConfig::from_names(
+            true,
+            Vec::new(),
+            Vec::new(),
+            vec![(".next".to_string(), 10)],
+        );
+
+        // Custom override shadows the build-cache default for .next.
+        assert_eq!(config.effective_days(".next", 7), 10);
+        // Build-cache defaults still apply to the other cache names.
+        assert_eq!(config.effective_days(".turbo", 7), DEFAULT_BUILD_CACHE_DAYS);
+        assert_eq!(config.effective_days("target", 7), DEFAULT_BUILD_CACHE_DAYS);
+        // Installs fall through to the generic window.
+        assert_eq!(config.effective_days("node_modules", 7), 7);
+    }
+
+    #[test]
+    fn deep_activity_in_generated_dir_prevents_deletion() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("deep-activity");
+        add_worktree(&repo, &worktree, "deep-activity-branch")?;
+        fs::create_dir_all(worktree.join("node_modules/pkg"))?;
+        fs::write(
+            worktree.join("node_modules/pkg/index.js"),
+            "module.exports = 1\n",
+        )?;
+        let expected = fs::canonicalize(worktree.join("node_modules"))?;
+
+        // The directory itself looks ancient, but a nested file (below the
+        // top-level stat) was written recently — as during a live build.
+        set_mtime(&worktree.join("node_modules"), unix_days_before_now(400))?;
+        set_mtime(
+            &worktree.join("node_modules/pkg/index.js"),
+            unix_days_before_now(1),
+        )?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::from_names(
+                    false,
+                    vec!["node_modules".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                now: now(),
+            },
+        )?;
+
+        let dir = report
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected)
+            .context("missing node_modules entry")?;
+
+        assert_eq!(dir.action, GeneratedDirAction::Skip);
+        Ok(())
+    }
+
+    #[test]
+    fn build_caches_use_tighter_default_window() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("class-windows");
+        add_worktree(&repo, &worktree, "class-windows-branch")?;
+        fs::create_dir_all(worktree.join(".next/cache"))?;
+        fs::write(worktree.join(".next/cache/entry"), "cache\n")?;
+        fs::create_dir_all(worktree.join("node_modules/pkg"))?;
+        fs::write(
+            worktree.join("node_modules/pkg/index.js"),
+            "module.exports = 1\n",
+        )?;
+        let expected_next = fs::canonicalize(worktree.join(".next"))?;
+        let expected_node_modules = fs::canonicalize(worktree.join("node_modules"))?;
+
+        // Both trees were last touched 5 days ago: outside the 3-day
+        // build-cache window, inside the 7-day install window.
+        let five_days_ago = unix_days_before_now(5);
+        for relative in [
+            ".next/cache/entry",
+            ".next/cache",
+            ".next",
+            "node_modules/pkg/index.js",
+            "node_modules/pkg",
+            "node_modules",
+        ] {
+            set_mtime(&worktree.join(relative), five_days_ago)?;
+        }
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        let next = report
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected_next)
+            .context("missing .next entry")?;
+        let node_modules = report
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected_node_modules)
+            .context("missing node_modules entry")?;
+
+        assert_eq!(next.action, GeneratedDirAction::Delete);
+        assert_eq!(next.effective_days, DEFAULT_BUILD_CACHE_DAYS);
+        assert_eq!(node_modules.action, GeneratedDirAction::Skip);
+        assert_eq!(node_modules.effective_days, 7);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_handles_prevent_deletion() -> Result<()> {
+        if Command::new("lsof")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: lsof unavailable");
+            return Ok(());
+        }
+
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("in-use");
+        add_worktree(&repo, &worktree, "in-use-branch")?;
+        fs::create_dir_all(worktree.join("node_modules"))?;
+        fs::write(worktree.join("node_modules/.lock"), "held\n")?;
+        let expected = fs::canonicalize(worktree.join("node_modules"))?;
+
+        // Simulate a package manager holding its lockfile: real mtimes are
+        // far older than the fixed test clock, so without the handle probe
+        // this directory would be deleted.
+        let _held = fs::File::open(worktree.join("node_modules/.lock"))?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        let dir = report
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected)
+            .context("missing node_modules entry")?;
+
+        assert_eq!(dir.action, GeneratedDirAction::Skip);
+        assert!(dir.in_use);
+        Ok(())
+    }
+
     #[test]
     fn dry_run_does_not_mutate() -> Result<()> {
         let (_temp, repo) = init_repo()?;
@@ -1314,6 +1637,7 @@ mod tests {
             stale_days: 30,
             generated_days: 7,
             generated_activity_only: false,
+            check_in_use: false,
             generated_config: GeneratedDirConfig::default(),
             now: now(),
         };
@@ -1360,6 +1684,7 @@ mod tests {
             stale_days: 30,
             generated_days: 7,
             generated_activity_only: false,
+            check_in_use: false,
             generated_config: GeneratedDirConfig::default(),
             now: now(),
         };
@@ -1394,6 +1719,7 @@ mod tests {
             stale_days: 10_000,
             generated_days: 7,
             generated_activity_only: false,
+            check_in_use: false,
             generated_config: GeneratedDirConfig::default(),
             now: now(),
         };
@@ -1421,6 +1747,7 @@ mod tests {
                 stale_days: 10_000,
                 generated_days: 3,
                 generated_activity_only: false,
+                check_in_use: false,
                 generated_config: GeneratedDirConfig::default(),
                 now: now(),
             },
@@ -1451,6 +1778,7 @@ mod tests {
             stale_days: 10_000,
             generated_days: 3,
             generated_activity_only: true,
+            check_in_use: false,
             generated_config: GeneratedDirConfig::default(),
             now: now(),
         };
@@ -1498,10 +1826,12 @@ mod tests {
                 stale_days: 10_000,
                 generated_days: 7,
                 generated_activity_only: false,
+                check_in_use: false,
                 generated_config: GeneratedDirConfig::from_names(
                     false,
                     vec!["coverage".to_string()],
                     vec!["logs".to_string()],
+                    Vec::new(),
                 ),
                 now: now(),
             },

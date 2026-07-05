@@ -49,6 +49,29 @@ activity, use `--generated-activity-only` with a shorter generated window:
 cargo run -- cleanup --repo /path/to/repo --generated-days 3 --generated-activity-only --execute
 ```
 
+Activity detection samples mtimes up to two levels deep inside each generated
+directory, not just the directory itself. A build cache whose top-level mtime
+is old but whose nested entries (`.next/cache/...`) are churning is treated as
+active and kept.
+
+Build caches are cheaper to rebuild than installs, so `.next`, `.turbo`, and
+`target` default to a tighter 3-day window while other names use
+`--generated-days`. Override any name's window explicitly with
+`--generated-window NAME=DAYS`:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --generated-window .next=1 --generated-window node_modules=14
+```
+
+To also skip directories that a running process holds open (a live dev server
+or package manager), add `--check-in-use`. The probe uses `lsof` on the
+directory and its immediate children; on platforms without `lsof` it silently
+degrades to mtime-only judgment:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-use --execute
+```
+
 Generated directory defaults are:
 
 - delete candidates: `node_modules`, `.next`, `.turbo`, `target`
