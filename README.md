@@ -72,6 +72,22 @@ degrades to mtime-only judgment:
 cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-use --execute
 ```
 
+Active directories are normally skipped entirely, but some (Rust `target`
+dirs especially) accumulate stale incremental artifacts internally while
+staying "active" forever. A sweep strategy prunes those in place instead of
+skipping, delegating to a fingerprint-aware external tool that is safe to run
+against a live build:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-sweep:3 --execute
+```
+
+This runs `cargo sweep --time 3` inside the containing worktree when `target`
+is too active to delete. Stale `target` dirs are still deleted wholesale.
+Requires `cargo-sweep` on `PATH` (`cargo install cargo-sweep`); if the sweep
+cannot run, an error is reported for that directory and the rest of the
+cleanup proceeds. `cargo-sweep` is the only supported tool today.
+
 Generated directory defaults are:
 
 - delete candidates: `node_modules`, `.next`, `.turbo`, `target`

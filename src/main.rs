@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
     cleanup, print_cleanup, print_triage, triage, CleanupOptions, GeneratedDirConfig,
-    TriageOptions, DEFAULT_GENERATED_DAYS, DEFAULT_STALE_DAYS,
+    SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS, DEFAULT_STALE_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -97,6 +97,15 @@ struct GeneratedArgs {
     generated_window: Vec<(String, u64)>,
 
     #[arg(
+        long = "sweep",
+        value_name = "NAME=TOOL:DAYS",
+        value_delimiter = ',',
+        value_parser = parse_sweep_strategy,
+        help = "In-place pruning for active dirs (e.g. target=cargo-sweep:3); repeat or comma-separate"
+    )]
+    sweep: Vec<SweepStrategy>,
+
+    #[arg(
         long,
         help = "Start with no default generated directory names before applying custom names"
     )]
@@ -118,6 +127,32 @@ fn parse_window_override(raw: &str) -> Result<(String, u64), String> {
     Ok((name.to_string(), days))
 }
 
+fn parse_sweep_strategy(raw: &str) -> Result<SweepStrategy, String> {
+    let (name, spec) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=TOOL:DAYS, got '{raw}'"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("expected NAME=TOOL:DAYS, got '{raw}'"));
+    }
+    let (tool, days) = spec
+        .split_once(':')
+        .ok_or_else(|| format!("expected TOOL:DAYS in '{raw}'"))?;
+    let tool = match tool.trim() {
+        "cargo-sweep" => SweepTool::CargoSweep,
+        other => return Err(format!("unknown sweep tool '{other}' (supported: cargo-sweep)")),
+    };
+    let days = days
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid day count in '{raw}'"))?;
+    Ok(SweepStrategy {
+        name: name.to_string(),
+        tool,
+        days,
+    })
+}
+
 impl GeneratedArgs {
     fn config(&self) -> GeneratedDirConfig {
         GeneratedDirConfig::from_names(
@@ -125,6 +160,7 @@ impl GeneratedArgs {
             self.delete_generated.clone(),
             self.report_generated.clone(),
             self.generated_window.clone(),
+            self.sweep.clone(),
         )
     }
 }
