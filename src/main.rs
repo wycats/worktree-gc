@@ -146,6 +146,14 @@ fn parse_sweep_strategy(raw: &str) -> Result<SweepStrategy, String> {
             ))
         }
     };
+    // cargo-sweep only knows how to prune Cargo target dirs. Accepting other
+    // names (e.g. .next=cargo-sweep:3) would mark them as sweep candidates
+    // while the sweep itself pruned an unrelated target dir or failed.
+    if tool == SweepTool::CargoSweep && name != "target" {
+        return Err(format!(
+            "cargo-sweep only supports 'target' dirs, got '{name}'"
+        ));
+    }
     let days = days
         .trim()
         .parse::<u64>()

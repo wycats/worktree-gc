@@ -23,9 +23,13 @@ pub const DEFAULT_BUILD_CACHE_DAYS: u64 = 3;
 pub const DEFAULT_BUILD_CACHE_NAMES: &[&str] = &[".next", ".turbo", "target"];
 
 // A generated directory's own mtime only reflects direct-child changes, so
-// activity is sampled to this depth to catch churn in nested subtrees
-// (e.g. .next/server/app during an active dev session).
-const GENERATED_MTIME_SAMPLE_DEPTH: usize = 3;
+// activity is sampled to this depth to catch churn in nested subtrees.
+// Depth 6 is grounded in observed live traffic: an active Next.js dev
+// session rewrites files like .next/cache/webpack/client-development/N.pack
+// (depth 4-5 below the candidate), and rewriting an existing file updates
+// no ancestor directory mtime at all. Sampling shallower than the real
+// write depth makes a live cache look idle.
+const GENERATED_MTIME_SAMPLE_DEPTH: usize = 6;
 
 #[derive(Debug, Clone)]
 pub struct TriageOptions {
@@ -1130,16 +1134,18 @@ fn run_sweep(decision: &GeneratedDirDecision) {
     };
     match tool {
         SweepTool::CargoSweep => {
-            // Run from the directory containing the matched target dir, not
-            // the worktree root: the scan can match nested `target/` dirs
-            // (workspace members, vendored crates), and cargo-sweep sweeps
-            // the target dir of the project it runs in.
+            // Pass the project directory containing the matched target dir
+            // explicitly: the scan can match nested `target/` dirs
+            // (workspace members, vendored crates), and without a path
+            // cargo-sweep defaults to the project it happens to run in,
+            // which could silently sweep the wrong target.
             let project_dir = decision.path.parent().unwrap_or(&decision.worktree_path);
             let result = Command::new("cargo")
                 .arg("sweep")
                 .arg("--time")
                 .arg(days.to_string())
-                .current_dir(project_dir)
+                .arg(project_dir)
+                .current_dir(&decision.worktree_path)
                 .stdin(Stdio::null())
                 .output();
             match result {
@@ -1595,18 +1601,39 @@ mod tests {
         let (_temp, repo) = init_repo()?;
         let worktree = repo.with_file_name("deep-activity");
         add_worktree(&repo, &worktree, "deep-activity-branch")?;
-        fs::create_dir_all(worktree.join("node_modules/pkg"))?;
+        fs::create_dir_all(worktree.join("node_modules/pkg/dist/chunks/deep"))?;
         fs::write(
-            worktree.join("node_modules/pkg/index.js"),
+            worktree.join("node_modules/pkg/dist/chunks/deep/index.js"),
             "module.exports = 1\n",
         )?;
         let expected = fs::canonicalize(worktree.join("node_modules"))?;
 
-        // The directory itself looks ancient, but a nested file (below the
-        // top-level stat) was written recently — as during a live build.
+        // The directory itself looks ancient, but a deeply nested file
+        // (five levels below the candidate, like webpack's
+        // .next/cache/webpack/client-development/N.pack rewrites) was
+        // written recently — as during a live build. Rewriting an existing
+        // file updates no ancestor mtimes, so only deep sampling sees it.
+        // Age every ancestor explicitly to prove the deep file alone keeps
+        // the directory alive.
         set_mtime(&worktree.join("node_modules"), unix_days_before_now(400))?;
         set_mtime(
-            &worktree.join("node_modules/pkg/index.js"),
+            &worktree.join("node_modules/pkg"),
+            unix_days_before_now(400),
+        )?;
+        set_mtime(
+            &worktree.join("node_modules/pkg/dist"),
+            unix_days_before_now(400),
+        )?;
+        set_mtime(
+            &worktree.join("node_modules/pkg/dist/chunks"),
+            unix_days_before_now(400),
+        )?;
+        set_mtime(
+            &worktree.join("node_modules/pkg/dist/chunks/deep"),
+            unix_days_before_now(400),
+        )?;
+        set_mtime(
+            &worktree.join("node_modules/pkg/dist/chunks/deep/index.js"),
             unix_days_before_now(1),
         )?;
 
