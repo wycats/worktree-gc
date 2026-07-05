@@ -21,6 +21,7 @@ pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub struct TriageOptions {
     pub stale_days: u64,
     pub generated_days: u64,
+    pub generated_activity_only: bool,
     pub generated_config: GeneratedDirConfig,
     pub now: SystemTime,
 }
@@ -30,6 +31,7 @@ pub struct CleanupOptions {
     pub execute: bool,
     pub stale_days: u64,
     pub generated_days: u64,
+    pub generated_activity_only: bool,
     pub generated_config: GeneratedDirConfig,
     pub now: SystemTime,
 }
@@ -41,6 +43,7 @@ pub struct TriageReport {
     pub git_common_dir: PathBuf,
     pub stale_days: u64,
     pub generated_days: u64,
+    pub generated_activity_only: bool,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
     pub worktrees: Vec<WorktreeInfo>,
@@ -65,6 +68,7 @@ pub struct CleanupManifest {
     pub git_common_dir: PathBuf,
     pub stale_days: u64,
     pub generated_days: u64,
+    pub generated_activity_only: bool,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
     pub prune_output: String,
@@ -240,6 +244,7 @@ pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageRepor
     let generated_dirs = scan_generated_dirs(
         &worktrees,
         options.generated_days,
+        options.generated_activity_only,
         options.now,
         &options.generated_config,
     )?;
@@ -250,6 +255,7 @@ pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageRepor
         git_common_dir: context.git_common_dir,
         stale_days: options.stale_days,
         generated_days: options.generated_days,
+        generated_activity_only: options.generated_activity_only,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
         worktrees,
@@ -264,6 +270,7 @@ pub fn audit(repo: Option<&Path>, generated_days: u64, now: SystemTime) -> Resul
         TriageOptions {
             stale_days: DEFAULT_STALE_DAYS,
             generated_days,
+            generated_activity_only: false,
             generated_config: GeneratedDirConfig::default(),
             now,
         },
@@ -276,6 +283,7 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
     let generated_dirs = scan_generated_dirs(
         &worktrees,
         options.generated_days,
+        options.generated_activity_only,
         options.now,
         &options.generated_config,
     )?;
@@ -304,6 +312,7 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
         git_common_dir: context.git_common_dir.clone(),
         stale_days: options.stale_days,
         generated_days: options.generated_days,
+        generated_activity_only: options.generated_activity_only,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
         prune_output,
@@ -628,12 +637,21 @@ fn ahead_behind(path: &Path, upstream: &str) -> Result<(Option<u64>, Option<u64>
 fn scan_generated_dirs(
     worktrees: &[WorktreeInfo],
     generated_days: u64,
+    generated_activity_only: bool,
     now: SystemTime,
     config: &GeneratedDirConfig,
 ) -> Result<Vec<GeneratedDirInfo>> {
     let dirs = worktrees
         .par_iter()
-        .map(|worktree| scan_generated_dirs_for_worktree(worktree, generated_days, now, config))
+        .map(|worktree| {
+            scan_generated_dirs_for_worktree(
+                worktree,
+                generated_days,
+                generated_activity_only,
+                now,
+                config,
+            )
+        })
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
@@ -645,6 +663,7 @@ fn scan_generated_dirs(
 fn scan_generated_dirs_for_worktree(
     worktree: &WorktreeInfo,
     generated_days: u64,
+    generated_activity_only: bool,
     now: SystemTime,
     config: &GeneratedDirConfig,
 ) -> Result<Vec<GeneratedDirInfo>> {
@@ -654,10 +673,11 @@ fn scan_generated_dirs_for_worktree(
         return Ok(dirs);
     }
 
-    let worktree_recent = worktree.is_current
-        || worktree
-            .activity_age_days
-            .is_some_and(|days| days < generated_days);
+    let worktree_recent = !generated_activity_only
+        && (worktree.is_current
+            || worktree
+                .activity_age_days
+                .is_some_and(|days| days < generated_days));
     let candidates = generated_candidates(worktree, config)?;
     let ignored_paths = git_ignored_paths(&worktree.path, &candidates)?;
     let tracked_paths = git_tracked_paths(&worktree.path, &candidates)?;
@@ -684,9 +704,13 @@ fn scan_generated_dirs_for_worktree(
         } else if worktree_recent || dir_recent {
             (
                 GeneratedDirAction::Skip,
-                format!(
-                    "worktree or generated directory activity is newer than {generated_days} days"
-                ),
+                if generated_activity_only {
+                    format!("generated directory activity is newer than {generated_days} days")
+                } else {
+                    format!(
+                        "worktree or generated directory activity is newer than {generated_days} days"
+                    )
+                },
             )
         } else if has_tracked_files {
             (
@@ -1289,6 +1313,7 @@ mod tests {
             execute: false,
             stale_days: 30,
             generated_days: 7,
+            generated_activity_only: false,
             generated_config: GeneratedDirConfig::default(),
             now: now(),
         };
@@ -1334,6 +1359,7 @@ mod tests {
             execute: true,
             stale_days: 30,
             generated_days: 7,
+            generated_activity_only: false,
             generated_config: GeneratedDirConfig::default(),
             now: now(),
         };
@@ -1367,6 +1393,7 @@ mod tests {
             execute: true,
             stale_days: 10_000,
             generated_days: 7,
+            generated_activity_only: false,
             generated_config: GeneratedDirConfig::default(),
             now: now(),
         };
@@ -1375,6 +1402,61 @@ mod tests {
         assert!(!worktree.join("node_modules").exists());
         assert!(!worktree.join("target").exists());
         assert!(worktree.join("tracked-target/file.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn current_worktree_generated_dirs_are_preserved_by_default() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("node_modules/pkg"))?;
+        fs::write(
+            repo.join("node_modules/pkg/index.js"),
+            "module.exports = 1\n",
+        )?;
+        let expected_node_modules = fs::canonicalize(repo.join("node_modules"))?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 3,
+                generated_activity_only: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        let node_modules = report
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected_node_modules)
+            .context("missing node_modules entry")?;
+
+        assert_eq!(node_modules.action, GeneratedDirAction::Skip);
+        assert!(node_modules.reason.contains("worktree"));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_activity_only_allows_current_worktree_generated_cleanup() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("node_modules/pkg"))?;
+        fs::write(
+            repo.join("node_modules/pkg/index.js"),
+            "module.exports = 1\n",
+        )?;
+
+        let options = CleanupOptions {
+            execute: true,
+            stale_days: 10_000,
+            generated_days: 3,
+            generated_activity_only: true,
+            generated_config: GeneratedDirConfig::default(),
+            now: now(),
+        };
+        cleanup(Some(&repo), options)?;
+
+        assert!(!repo.join("node_modules").exists());
         Ok(())
     }
 
@@ -1415,6 +1497,7 @@ mod tests {
             TriageOptions {
                 stale_days: 10_000,
                 generated_days: 7,
+                generated_activity_only: false,
                 generated_config: GeneratedDirConfig::from_names(
                     false,
                     vec!["coverage".to_string()],

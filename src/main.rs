@@ -27,6 +27,12 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_GENERATED_DAYS)]
         generated_days: u64,
 
+        #[arg(
+            long,
+            help = "Clean generated dirs using only their own activity, ignoring worktree-level recency"
+        )]
+        generated_activity_only: bool,
+
         #[command(flatten)]
         generated: GeneratedArgs,
     },
@@ -39,6 +45,12 @@ enum Command {
 
         #[arg(long, default_value_t = DEFAULT_GENERATED_DAYS)]
         generated_days: u64,
+
+        #[arg(
+            long,
+            help = "Clean generated dirs using only their own activity, ignoring worktree-level recency"
+        )]
+        generated_activity_only: bool,
 
         #[command(flatten)]
         generated: GeneratedArgs,
@@ -88,6 +100,7 @@ fn main() -> Result<()> {
         Command::Triage {
             stale_days,
             generated_days,
+            generated_activity_only,
             generated,
         } => {
             let report = triage(
@@ -95,6 +108,7 @@ fn main() -> Result<()> {
                 TriageOptions {
                     stale_days,
                     generated_days,
+                    generated_activity_only,
                     generated_config: generated.config(),
                     now,
                 },
@@ -105,12 +119,14 @@ fn main() -> Result<()> {
             execute,
             stale_days,
             generated_days,
+            generated_activity_only,
             generated,
         } => {
             let options = CleanupOptions {
                 execute,
                 stale_days,
                 generated_days,
+                generated_activity_only,
                 generated_config: generated.config(),
                 now,
             };

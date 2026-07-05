@@ -41,6 +41,14 @@ By default, stale clean worktrees are removal candidates after 30 days, and gene
 cargo run -- triage --repo /path/to/repo --stale-days 45 --generated-days 14
 ```
 
+Generated directory cleanup also considers recent worktree activity. When disk
+is tight and you want rebuildable generated directories judged only by their own
+activity, use `--generated-activity-only` with a shorter generated window:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --generated-days 3 --generated-activity-only --execute
+```
+
 Generated directory defaults are:
 
 - delete candidates: `node_modules`, `.next`, `.turbo`, `target`
