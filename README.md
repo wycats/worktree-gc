@@ -41,6 +41,53 @@ By default, stale clean worktrees are removal candidates after 30 days, and gene
 cargo run -- triage --repo /path/to/repo --stale-days 45 --generated-days 14
 ```
 
+Generated directory cleanup also considers recent worktree activity. When disk
+is tight and you want rebuildable generated directories judged only by their own
+activity, use `--generated-activity-only` with a shorter generated window:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --generated-days 3 --generated-activity-only --execute
+```
+
+Activity detection samples mtimes up to six levels deep inside each generated
+directory, not just the directory itself. A build cache whose top-level mtime
+is old but whose nested entries (`.next/cache/...`) are churning is treated as
+active and kept.
+
+Build caches are cheaper to rebuild than installs, so `.next`, `.turbo`, and
+`target` default to a tighter 3-day window while other names use
+`--generated-days`. Override any name's window explicitly with
+`--generated-window NAME=DAYS`:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --generated-window .next=1 --generated-window node_modules=14
+```
+
+To also skip directories that a running process holds open (a live dev server
+or package manager), add `--check-in-use`. The probe uses `lsof` on the
+directory and its immediate children; on platforms without `lsof` it silently
+degrades to mtime-only judgment:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-use --execute
+```
+
+Active directories are normally skipped entirely, but some (Rust `target`
+dirs especially) accumulate stale incremental artifacts internally while
+staying "active" forever. A sweep strategy prunes those in place instead of
+skipping, delegating to a fingerprint-aware external tool that is safe to run
+against a live build:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-sweep:3 --execute
+```
+
+This runs `cargo sweep --time 3` inside the containing worktree when `target`
+is too active to delete. Stale `target` dirs are still deleted wholesale.
+Requires `cargo-sweep` on `PATH` (`cargo install cargo-sweep`); if the sweep
+cannot run, an error is reported for that directory and the rest of the
+cleanup proceeds. `cargo-sweep` is the only supported tool today.
+
 Generated directory defaults are:
 
 - delete candidates: `node_modules`, `.next`, `.turbo`, `target`
