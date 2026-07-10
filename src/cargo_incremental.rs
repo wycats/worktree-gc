@@ -75,6 +75,8 @@ pub(crate) fn plan_incremental_sweep(
         )
         .manifest_path(&manifest_path)
         .no_deps();
+    // A metadata failure is a planning failure, not an unsupported layout: we
+    // cannot prove target ownership while Cargo considers the manifest invalid.
     let metadata = command.exec().with_context(|| {
         format!(
             "cargo metadata failed for incremental sweep at {}",
@@ -313,6 +315,9 @@ pub(crate) fn execute_incremental_sweep(
             continue;
         }
         let lock = wait_for_profile_lock(&lock_path)?;
+        if !validate_planned_incremental_dir(&incremental_dir)? {
+            continue;
+        }
         let trash_root = incremental_dir.join(TRASH_DIR_NAME);
         let run_trash = trash_root.join(run_id);
         let mut quarantined = Vec::new();
@@ -583,6 +588,27 @@ fn remove_quarantine_entry(path: &Path) -> Result<()> {
         fs::remove_file(path)
     }
     .with_context(|| format!("failed to remove quarantine entry {}", path.display()))
+}
+
+fn validate_planned_incremental_dir(path: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "refusing to sweep replaced incremental directory {}",
+            path.display()
+        );
+    }
+    if fs::canonicalize(path)? != path {
+        bail!(
+            "refusing to sweep incremental directory whose resolved path changed: {}",
+            path.display()
+        );
+    }
+    Ok(true)
 }
 
 fn wait_for_profile_lock(lock_path: &Path) -> Result<File> {
@@ -909,6 +935,36 @@ mod tests {
             .context("missing symlink candidate")?;
         assert_eq!(candidate.action, SweepCandidateAction::Skip);
         assert!(candidate.reason.contains("symlink"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_rejects_an_incremental_directory_replaced_by_a_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo, target) = cargo_project()?;
+        let profile = profile(&target, "debug")?;
+        let old = SystemTime::now() - Duration::from_secs(20 * 86_400);
+        let root = incremental_root(&profile, "fixture-old", old)?;
+        let plan = plan_incremental_sweep(&target, &repo, 14, SystemTime::now())?;
+
+        let incremental = profile.join("incremental");
+        let moved_incremental = profile.join("incremental-before-swap");
+        fs::rename(&incremental, &moved_incremental)?;
+        let outside = temp.path().join("outside-incremental");
+        fs::create_dir_all(outside.join("fixture-old"))?;
+        symlink(&outside, &incremental)?;
+
+        let error = execute_incremental_sweep(&plan.candidates, 14, "symlink-swap-test")
+            .expect_err("a replaced incremental directory must stop execution");
+        assert!(error
+            .to_string()
+            .contains("refusing to sweep replaced incremental directory"));
+        assert!(outside.join("fixture-old").exists());
+        assert!(moved_incremental
+            .join(root.file_name().context("incremental root has no name")?)
+            .exists());
         Ok(())
     }
 

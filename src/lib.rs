@@ -481,6 +481,15 @@ pub fn audit(repo: Option<&Path>, generated_days: u64, now: SystemTime) -> Resul
 }
 
 pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
+    let execute = options.execute;
+    let run = plan_cleanup(repo, options)?;
+    if execute {
+        execute_cleanup_manifest(&run.manifest)?;
+    }
+    Ok(run)
+}
+
+fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
     let generated_dirs = scan_generated_dirs(
@@ -533,11 +542,6 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
 
     let manifest_path = write_manifest(&context.git_common_dir, &manifest)?;
 
-    if options.execute {
-        run_worktree_prune(&context.current_worktree, true)?;
-        execute_cleanup(&manifest)?;
-    }
-
     Ok(CleanupRun {
         manifest_path,
         manifest,
@@ -569,7 +573,7 @@ pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootC
     };
     let repositories = repositories
         .iter()
-        .map(|repo| cleanup(Some(repo), options.clone()))
+        .map(|repo| plan_cleanup(Some(repo), options.clone()))
         .collect::<Result<Vec<_>>>()?;
     let manifest = RootCleanupManifest {
         manifest_version: MANIFEST_VERSION,
@@ -580,10 +584,21 @@ pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootC
     };
     let manifest_path = write_root_manifest(&manifest)?;
 
+    if options.execute {
+        for repository in &manifest.repositories {
+            execute_cleanup_manifest(&repository.manifest)?;
+        }
+    }
+
     Ok(RootCleanupRun {
         manifest_path,
         manifest,
     })
+}
+
+fn execute_cleanup_manifest(manifest: &CleanupManifest) -> Result<()> {
+    run_worktree_prune(&manifest.current_worktree, true)?;
+    execute_cleanup(manifest)
 }
 
 pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -2269,8 +2284,10 @@ mod tests {
         let session = root.join("s-session-hash");
         fs::create_dir_all(&session)?;
         fs::write(profile.join(".cargo-lock"), "")?;
-        fs::write(session.join("dep-graph.bin"), "old")?;
+        let dep_graph = session.join("dep-graph.bin");
+        fs::write(&dep_graph, "old")?;
         let old = unix_days_before_now(20);
+        set_mtime(&dep_graph, old)?;
         set_mtime(&session, old)?;
         set_mtime(&root, old)?;
 
