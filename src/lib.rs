@@ -2,7 +2,7 @@ mod cargo_incremental;
 
 use anyhow::{bail, Context, Result};
 use cargo_incremental::{
-    execute_incremental_sweep, plan_incremental_sweep, with_cargo_profile_locks,
+    cargo_project_dir, execute_incremental_sweep, plan_incremental_sweep, with_cargo_profile_locks,
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -255,6 +255,7 @@ pub struct SweepDecision {
     pub tool: SweepTool,
     pub limit: SweepLimit,
     pub delegated: bool,
+    pub project_dir: Option<PathBuf>,
     pub reason: String,
     pub candidates: Vec<SweepCandidateDecision>,
 }
@@ -418,6 +419,7 @@ struct RawWorktree {
     path: PathBuf,
     head: Option<String>,
     branch: Option<String>,
+    bare: bool,
     detached: bool,
     prunable: Option<String>,
 }
@@ -659,7 +661,8 @@ pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
             ["worktree", "list", "--porcelain"],
         )?);
         let primary = worktrees
-            .first()
+            .iter()
+            .find(|worktree| !worktree.bare)
             .map(|worktree| worktree.path.as_path())
             .unwrap_or(candidate.as_path());
         let primary = fs::canonicalize(primary)
@@ -901,6 +904,7 @@ fn inspect_worktrees(context: &RepoContext, now: SystemTime) -> Result<Vec<Workt
     let current_canonical = fs::canonicalize(&context.current_worktree)?;
 
     raw.into_par_iter()
+        .filter(|entry| !entry.bare)
         .map(|entry| inspect_worktree(entry, &current_canonical, now))
         .collect()
 }
@@ -1008,6 +1012,8 @@ fn parse_worktree_list(output: &str) -> Vec<RawWorktree> {
             );
         } else if line == "detached" {
             entry.detached = true;
+        } else if line == "bare" {
+            entry.bare = true;
         } else if let Some(reason) = line.strip_prefix("prunable ") {
             entry.prunable = Some(reason.to_string());
         }
@@ -1306,6 +1312,7 @@ fn plan_sweep_decisions(
                     tool: SweepTool::RustcIncremental,
                     limit: strategy.limit.clone(),
                     delegated: false,
+                    project_dir: cargo_project_dir(target_dir, worktree),
                     reason: plan.reason,
                     candidates: plan.candidates,
                 })
@@ -1314,6 +1321,7 @@ fn plan_sweep_decisions(
                 tool: SweepTool::CargoSweep,
                 limit: strategy.limit.clone(),
                 delegated: true,
+                project_dir: cargo_project_dir(target_dir, worktree),
                 reason: match strategy.limit {
                     SweepLimit::AgeDays { days } => {
                         format!("delegate fingerprint-associated outputs older than {days} days")
@@ -1592,7 +1600,10 @@ fn run_sweeps(decision: &GeneratedDirDecision, run_id: &str) -> Result<()> {
                 // (workspace members, vendored crates), and without a path
                 // cargo-sweep defaults to the project it happens to run in,
                 // which could silently sweep the wrong target.
-                let project_dir = decision.path.parent().unwrap_or(&decision.worktree_path);
+                let project_dir = sweep
+                    .project_dir
+                    .as_deref()
+                    .unwrap_or(&decision.worktree_path);
                 let result =
                     with_cargo_profile_locks(&decision.path, &decision.worktree_path, || {
                         let mut command = Command::new("cargo");
@@ -2277,6 +2288,51 @@ mod tests {
     }
 
     #[test]
+    fn repository_discovery_uses_a_worktree_for_bare_common_repositories() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let bare = temp.path().join("repo.git");
+        let linked = temp.path().join("bare-worktree");
+        let clone = Command::new("git")
+            .arg("clone")
+            .arg("--bare")
+            .arg(&repo)
+            .arg(&bare)
+            .output()?;
+        if !clone.status.success() {
+            bail!(
+                "bare clone failed: {}",
+                String::from_utf8_lossy(&clone.stderr).trim()
+            );
+        }
+        git_output(
+            &bare,
+            [
+                "worktree",
+                "add",
+                linked.to_str().context("non-utf8 worktree path")?,
+            ],
+        )?;
+
+        let repositories = discover_repositories(std::slice::from_ref(&linked))?;
+        assert_eq!(repositories, vec![fs::canonicalize(&linked)?]);
+
+        let report = triage(
+            Some(&linked),
+            TriageOptions {
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+        assert_eq!(report.worktrees.len(), 1);
+        assert!(report.worktrees[0].is_current);
+        Ok(())
+    }
+
+    #[test]
     fn default_incremental_sweep_activates_and_manifest_is_v2() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         fs::create_dir_all(repo.join("src"))?;
@@ -2533,6 +2589,64 @@ mod tests {
             .context("missing target entry")?;
 
         assert_eq!(dir.action, GeneratedDirAction::Delete);
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_sweep_uses_the_manifest_owner_for_nested_target_directories() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        fs::create_dir_all(repo.join(".cargo"))?;
+        fs::write(
+            repo.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"build/target\"\n",
+        )?;
+        fs::create_dir_all(repo.join("build/target/debug"))?;
+        fs::write(repo.join("build/target/debug/binary"), "bits\n")?;
+        set_mtime(
+            &repo.join("build/target/debug/binary"),
+            unix_days_before_now(1),
+        )?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::from_names(
+                    false,
+                    vec!["target".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                    vec![SweepStrategy {
+                        name: "target".to_string(),
+                        tool: SweepTool::CargoSweep,
+                        limit: SweepLimit::AgeDays { days: 3 },
+                    }],
+                ),
+                now: now(),
+            },
+        )?;
+
+        let target = fs::canonicalize(repo.join("build/target"))?;
+        let decision = report
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == target)
+            .context("missing nested target decision")?;
+        let sweep = decision
+            .sweeps
+            .iter()
+            .find(|sweep| sweep.tool == SweepTool::CargoSweep)
+            .context("missing cargo-sweep decision")?;
+        assert_eq!(sweep.project_dir, Some(fs::canonicalize(repo)?));
         Ok(())
     }
 

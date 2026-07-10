@@ -162,12 +162,18 @@ pub(crate) fn plan_incremental_sweep(
             continue;
         }
 
-        let incremental_dir = fs::canonicalize(entry.path()).with_context(|| {
-            format!(
-                "failed to canonicalize incremental directory {}",
-                entry.path().display()
-            )
-        })?;
+        let incremental_dir = match fs::canonicalize(entry.path()) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to canonicalize incremental directory {}",
+                        entry.path().display()
+                    )
+                });
+            }
+        };
         if !incremental_dir.starts_with(&build_dir)
             || !seen_incremental_dirs.insert(incremental_dir.clone())
         {
@@ -194,12 +200,10 @@ pub(crate) fn plan_incremental_sweep(
             continue;
         }
 
-        for child in fs::read_dir(&incremental_dir).with_context(|| {
-            format!(
-                "failed to read incremental directory {}",
-                incremental_dir.display()
-            )
-        })? {
+        let Some(children) = read_dir_if_present(&incremental_dir)? else {
+            continue;
+        };
+        for child in children {
             let child = child?;
             let path = child.path();
             let Some(metadata) = symlink_metadata_if_present(&path)? else {
@@ -688,6 +692,12 @@ fn nearest_manifest(target_dir: &Path, worktree: &Path) -> Option<PathBuf> {
     None
 }
 
+pub(crate) fn cargo_project_dir(target_dir: &Path, worktree: &Path) -> Option<PathBuf> {
+    nearest_manifest(target_dir, worktree)?
+        .parent()
+        .map(Path::to_path_buf)
+}
+
 fn canonicalize_if_present(path: &Path) -> Option<PathBuf> {
     if path.exists() {
         fs::canonicalize(path).ok()
@@ -769,6 +779,15 @@ fn symlink_metadata_if_present(path: &Path) -> Result<Option<fs::Metadata>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error)
             .with_context(|| format!("failed to inspect incremental entry {}", path.display())),
+    }
+}
+
+fn read_dir_if_present(path: &Path) -> Result<Option<fs::ReadDir>> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to read incremental directory {}", path.display())),
     }
 }
 
@@ -881,6 +900,15 @@ mod tests {
         let vanished = temp.path().join("vanished-root");
 
         assert!(symlink_metadata_if_present(&vanished)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn vanished_incremental_profile_is_transient() -> Result<()> {
+        let temp = TempDir::new()?;
+        let vanished = temp.path().join("vanished-profile/incremental");
+
+        assert!(read_dir_if_present(&vanished)?.is_none());
         Ok(())
     }
 
