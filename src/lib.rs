@@ -1765,7 +1765,7 @@ fn print_sweep_candidates<'a>(dirs: impl IntoIterator<Item = (&'a Path, &'a [Swe
         .sum::<u64>();
     println!();
     println!(
-        "generated sweep artifacts: {} roots, {} logical",
+        "generated sweep artifacts: {} entries, {} logical",
         candidates.len(),
         format_bytes(bytes)
     );

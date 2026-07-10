@@ -588,8 +588,6 @@ fn wait_for_profile_lock(lock_path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(false)
         .open(lock_path)
         .with_context(|| format!("failed to open Cargo profile lock {}", lock_path.display()))?;
     let started = Instant::now();
@@ -677,8 +675,8 @@ fn skipped_candidate(
 }
 
 fn newest_session_activity(path: &Path) -> Result<Option<i64>> {
-    let mut newest = modified_unix(&fs::symlink_metadata(path)?);
-    for entry in fs::read_dir(path)? {
+    let mut newest = None;
+    for entry in WalkDir::new(path).follow_links(false) {
         let entry = entry?;
         newest = max_time(newest, modified_unix(&fs::symlink_metadata(entry.path())?));
     }
@@ -775,7 +773,9 @@ mod tests {
         let root = profile.join("incremental").join(name);
         let session = root.join("s-session-hash");
         fs::create_dir_all(&session)?;
-        fs::write(session.join("dep-graph.bin"), vec![0u8; 1024])?;
+        let dep_graph = session.join("dep-graph.bin");
+        fs::write(&dep_graph, vec![0u8; 1024])?;
+        set_modified(&dep_graph, modified)?;
         set_modified(&session, modified)?;
         set_modified(&root, modified)?;
         Ok(root)
@@ -928,6 +928,47 @@ mod tests {
 
         handle.join().expect("sweep thread panicked")?;
         assert!(root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn file_activity_inside_an_existing_session_keeps_the_root() -> Result<()> {
+        let (_temp, repo, target) = cargo_project()?;
+        let profile = profile(&target, "debug")?;
+        let old = SystemTime::now() - Duration::from_secs(20 * 86_400);
+        let root = incremental_root(&profile, "fixture-old", old)?;
+        set_modified(
+            &root.join("s-session-hash/dep-graph.bin"),
+            SystemTime::now(),
+        )?;
+
+        let plan = plan_incremental_sweep(&target, &repo, 14, SystemTime::now())?;
+        let canonical_root = fs::canonicalize(&root)?;
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == canonical_root)
+            .context("missing incremental root")?;
+        assert_eq!(candidate.action, SweepCandidateAction::Keep);
+        Ok(())
+    }
+
+    #[test]
+    fn execution_refuses_to_recreate_a_missing_profile_lock() -> Result<()> {
+        let (_temp, repo, target) = cargo_project()?;
+        let profile = profile(&target, "debug")?;
+        let old = SystemTime::now() - Duration::from_secs(20 * 86_400);
+        let root = incremental_root(&profile, "fixture-old", old)?;
+        let plan = plan_incremental_sweep(&target, &repo, 14, SystemTime::now())?;
+        fs::remove_file(profile.join(".cargo-lock"))?;
+
+        let error = execute_incremental_sweep(&plan.candidates, 14, "missing-lock-test")
+            .expect_err("a missing Cargo lock must stop execution");
+        assert!(error
+            .to_string()
+            .contains("failed to open Cargo profile lock"));
+        assert!(root.exists());
+        assert!(!profile.join(".cargo-lock").exists());
         Ok(())
     }
 
