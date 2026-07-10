@@ -242,7 +242,20 @@ pub(crate) fn plan_incremental_sweep(
                 continue;
             }
 
-            let metrics = incremental_metrics(&path)?;
+            let metrics = match incremental_metrics(&path) {
+                Ok(metrics) => metrics,
+                Err(error) if is_not_found_error(&error) => {
+                    candidates.push(skipped_candidate(
+                        path,
+                        &incremental_dir,
+                        &profile_dir,
+                        &lock_path,
+                        "incremental root changed while it was being inspected",
+                    ));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let last_activity_unix = metrics.last_activity_unix;
             let activity_age_days = last_activity_unix.and_then(|unix| age_days(now, unix));
             let action = if activity_age_days.is_some_and(|age| age >= days) {
@@ -428,11 +441,19 @@ pub(crate) fn with_cargo_profile_locks<T>(
     worktree: &Path,
     action: impl FnOnce() -> T,
 ) -> Result<T> {
-    let lock_paths = cargo_profile_lock_paths(target_dir, worktree)?;
-    let locks = wait_for_profile_locks(&lock_paths)?;
-    let result = action();
-    drop(locks);
-    Ok(result)
+    loop {
+        let lock_paths = cargo_profile_lock_paths(target_dir, worktree)?;
+        let locks = wait_for_profile_locks(&lock_paths)?;
+        let refreshed_lock_paths = cargo_profile_lock_paths(target_dir, worktree)?;
+        if refreshed_lock_paths != lock_paths {
+            eprintln!("  Cargo profile set changed while locking; retrying sweep coordination");
+            drop(locks);
+            continue;
+        }
+        let result = action();
+        drop(locks);
+        return Ok(result);
+    }
 }
 
 fn cargo_profile_lock_paths(target_dir: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
@@ -709,6 +730,7 @@ fn logical_size(path: &Path) -> Result<u64> {
     Ok(incremental_metrics(path)?.logical_bytes)
 }
 
+#[derive(Debug)]
 struct IncrementalMetrics {
     last_activity_unix: Option<i64>,
     logical_bytes: u64,
@@ -728,6 +750,14 @@ fn incremental_metrics(path: &Path) -> Result<IncrementalMetrics> {
     Ok(IncrementalMetrics {
         last_activity_unix: newest,
         logical_bytes: bytes,
+    })
+}
+
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
     })
 }
 
@@ -822,6 +852,15 @@ mod tests {
             .read(true)
             .open(path)?
             .set_modified(modified)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_incremental_metrics_are_transient() -> Result<()> {
+        let temp = TempDir::new()?;
+        let error = incremental_metrics(&temp.path().join("removed-root"))
+            .expect_err("missing root should fail its metrics walk");
+        assert!(is_not_found_error(&error));
         Ok(())
     }
 
@@ -1039,27 +1078,36 @@ mod tests {
     }
 
     #[test]
-    fn coordinated_external_sweep_waits_for_every_profile_lock() -> Result<()> {
+    fn coordinated_external_sweep_retries_when_a_profile_appears() -> Result<()> {
         let (_temp, repo, target) = cargo_project()?;
         let host = profile(&target, "debug")?;
+        let host_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(host.join(".cargo-lock"))?;
+        host_lock.lock()?;
+
+        let (action_tx, action_rx) = mpsc::channel();
+        let thread_target = target.clone();
+        let thread_repo = repo.clone();
+        let handle = thread::spawn(move || {
+            with_cargo_profile_locks(&thread_target, &thread_repo, || action_tx.send(()).unwrap())
+        });
+        thread::sleep(Duration::from_millis(500));
         let cross = profile(&target, "aarch64-unknown-linux-musl/debug")?;
-        let contended = OpenOptions::new()
+        let cross_lock = OpenOptions::new()
             .read(true)
             .write(true)
             .open(cross.join(".cargo-lock"))?;
-        contended.lock()?;
-
-        let (action_tx, action_rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            with_cargo_profile_locks(&target, &repo, || action_tx.send(()).unwrap())
-        });
-        thread::sleep(Duration::from_millis(250));
+        cross_lock.lock()?;
+        host_lock.unlock()?;
+        thread::sleep(Duration::from_millis(500));
         assert!(matches!(
             action_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
 
-        contended.unlock()?;
+        cross_lock.unlock()?;
         action_rx.recv_timeout(Duration::from_secs(5))?;
         handle.join().expect("lock coordination thread panicked")?;
 

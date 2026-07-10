@@ -575,7 +575,7 @@ pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootC
         .iter()
         .map(|repo| plan_cleanup(Some(repo), options.clone()))
         .collect::<Result<Vec<_>>>()?;
-    let manifest = RootCleanupManifest {
+    let mut manifest = RootCleanupManifest {
         manifest_version: MANIFEST_VERSION,
         mode,
         generated_at,
@@ -585,8 +585,14 @@ pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootC
     let manifest_path = write_root_manifest(&manifest)?;
 
     if options.execute {
-        for repository in &manifest.repositories {
-            execute_cleanup_manifest(&repository.manifest)?;
+        for index in 0..manifest.repositories.len() {
+            let repo_root = manifest.repositories[index].manifest.repo_root.clone();
+            let mut refreshed_options = options.clone();
+            refreshed_options.now = SystemTime::now();
+            let refreshed = plan_cleanup(Some(&repo_root), refreshed_options)?;
+            manifest.repositories[index] = refreshed;
+            write_root_manifest(&manifest)?;
+            execute_cleanup_manifest(&manifest.repositories[index].manifest)?;
         }
     }
 
