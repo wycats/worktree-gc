@@ -202,7 +202,9 @@ pub(crate) fn plan_incremental_sweep(
         })? {
             let child = child?;
             let path = child.path();
-            let metadata = fs::symlink_metadata(&path)?;
+            let Some(metadata) = symlink_metadata_if_present(&path)? else {
+                continue;
+            };
             let name = child.file_name();
 
             if name == TRASH_DIR_NAME && metadata.is_dir() && !metadata.file_type().is_symlink() {
@@ -761,6 +763,15 @@ fn is_not_found_error(error: &anyhow::Error) -> bool {
     })
 }
 
+fn symlink_metadata_if_present(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect incremental entry {}", path.display())),
+    }
+}
+
 fn is_direct_real_child(path: &Path, incremental_dir: &Path) -> Result<bool> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -861,6 +872,15 @@ mod tests {
         let error = incremental_metrics(&temp.path().join("removed-root"))
             .expect_err("missing root should fail its metrics walk");
         assert!(is_not_found_error(&error));
+        Ok(())
+    }
+
+    #[test]
+    fn vanished_incremental_child_metadata_is_transient() -> Result<()> {
+        let temp = TempDir::new()?;
+        let vanished = temp.path().join("vanished-root");
+
+        assert!(symlink_metadata_if_present(&vanished)?.is_none());
         Ok(())
     }
 
