@@ -395,6 +395,12 @@ impl GeneratedDirConfig {
             Some(GeneratedCandidateAction::ReportOnly)
         } else if self.delete_names.iter().any(|candidate| candidate == name) {
             Some(GeneratedCandidateAction::Delete)
+        } else if self
+            .sweep_strategies
+            .iter()
+            .any(|strategy| strategy.name == name)
+        {
+            Some(GeneratedCandidateAction::SweepOnly)
         } else {
             None
         }
@@ -428,6 +434,7 @@ struct GeneratedCandidate {
 enum GeneratedCandidateAction {
     Delete,
     ReportOnly,
+    SweepOnly,
 }
 
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
@@ -623,6 +630,9 @@ pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 candidate.display()
             )
         })?;
+        if repositories.contains_key(&common_dir) {
+            continue;
+        }
         let worktrees = parse_worktree_list(&git_output(
             &candidate,
             ["worktree", "list", "--porcelain"],
@@ -633,7 +643,7 @@ pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
             .unwrap_or(candidate.as_path());
         let primary = fs::canonicalize(primary)
             .with_context(|| format!("failed to resolve primary worktree {}", primary.display()))?;
-        repositories.entry(common_dir).or_insert(primary);
+        repositories.insert(common_dir, primary);
     }
 
     let mut repositories = repositories.into_values().collect::<Vec<_>>();
@@ -1135,8 +1145,8 @@ fn scan_generated_dirs_for_worktree(
         let in_use = check_in_use && deletable_so_far && dir_has_open_handles(&candidate.path);
         let sweep_strategies = config.sweep_strategies(&candidate.name);
         let active = worktree_recent || dir_recent;
-        let sweeps = if active
-            && candidate.action == GeneratedCandidateAction::Delete
+        let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
+            && (active || candidate.action == GeneratedCandidateAction::SweepOnly)
             && !has_tracked_files
             && !sweep_strategies.is_empty()
         {
@@ -1156,6 +1166,38 @@ fn scan_generated_dirs_for_worktree(
                 GeneratedDirAction::Skip,
                 "a running process has open files in this directory".to_string(),
             )
+        } else if candidate.action == GeneratedCandidateAction::SweepOnly {
+            if has_tracked_files {
+                (
+                    GeneratedDirAction::Skip,
+                    "directory contains tracked files".to_string(),
+                )
+            } else if has_sweep_work {
+                let descriptions = sweeps
+                    .iter()
+                    .filter(|sweep| sweep.has_work())
+                    .map(|sweep| format!("{}: {}", sweep_tool_name(&sweep.tool), sweep.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                (
+                    GeneratedDirAction::Sweep,
+                    format!("explicit in-place sweep: {descriptions}"),
+                )
+            } else {
+                let planned_reason = sweeps
+                    .iter()
+                    .map(|sweep| sweep.reason.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                (
+                    GeneratedDirAction::Skip,
+                    if planned_reason.is_empty() {
+                        "explicit sweep found no eligible artifacts".to_string()
+                    } else {
+                        planned_reason
+                    },
+                )
+            }
         } else if active {
             if has_sweep_work {
                 let descriptions = sweeps
@@ -2274,6 +2316,38 @@ mod tests {
         assert!(json["generated_dirs"][0].get("sweeps").is_some());
         assert!(json["generated_dirs"][0].get("sweep_tool").is_none());
         assert!(json["generated_dirs"][0].get("sweep_days").is_none());
+
+        let explicit_only = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::from_names_with_default_sweeps(
+                    false,
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![SweepStrategy {
+                        name: "target".to_string(),
+                        tool: SweepTool::RustcIncremental,
+                        limit: SweepLimit::AgeDays { days: 14 },
+                    }],
+                ),
+                now: now(),
+            },
+        )?;
+        let target = explicit_only
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected_target)
+            .context("explicit sweep did not discover target")?;
+        assert_eq!(target.action, GeneratedDirAction::Sweep);
+        assert!(explicit_only.manifest.generated_delete_names.is_empty());
         Ok(())
     }
 

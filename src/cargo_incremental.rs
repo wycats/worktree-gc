@@ -240,7 +240,8 @@ pub(crate) fn plan_incremental_sweep(
                 continue;
             }
 
-            let last_activity_unix = newest_session_activity(&path)?;
+            let metrics = incremental_metrics(&path)?;
+            let last_activity_unix = metrics.last_activity_unix;
             let activity_age_days = last_activity_unix.and_then(|unix| age_days(now, unix));
             let action = if activity_age_days.is_some_and(|age| age >= days) {
                 SweepCandidateAction::Delete
@@ -258,7 +259,7 @@ pub(crate) fn plan_incremental_sweep(
             };
 
             candidates.push(SweepCandidateDecision {
-                logical_bytes: logical_size(&path)?,
+                logical_bytes: metrics.logical_bytes,
                 path,
                 incremental_dir: incremental_dir.clone(),
                 profile_dir: profile_dir.clone(),
@@ -675,24 +676,33 @@ fn skipped_candidate(
 }
 
 fn newest_session_activity(path: &Path) -> Result<Option<i64>> {
-    let mut newest = None;
-    for entry in WalkDir::new(path).follow_links(false) {
-        let entry = entry?;
-        newest = max_time(newest, modified_unix(&fs::symlink_metadata(entry.path())?));
-    }
-    Ok(newest)
+    Ok(incremental_metrics(path)?.last_activity_unix)
 }
 
 fn logical_size(path: &Path) -> Result<u64> {
+    Ok(incremental_metrics(path)?.logical_bytes)
+}
+
+struct IncrementalMetrics {
+    last_activity_unix: Option<i64>,
+    logical_bytes: u64,
+}
+
+fn incremental_metrics(path: &Path) -> Result<IncrementalMetrics> {
+    let mut newest = None;
     let mut bytes = 0u64;
     for entry in WalkDir::new(path).follow_links(false) {
         let entry = entry?;
         let metadata = fs::symlink_metadata(entry.path())?;
+        newest = max_time(newest, modified_unix(&metadata));
         if metadata.is_file() {
             bytes = bytes.saturating_add(metadata.len());
         }
     }
-    Ok(bytes)
+    Ok(IncrementalMetrics {
+        last_activity_unix: newest,
+        logical_bytes: bytes,
+    })
 }
 
 fn is_direct_real_child(path: &Path, incremental_dir: &Path) -> Result<bool> {
