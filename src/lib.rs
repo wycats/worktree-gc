@@ -662,7 +662,9 @@ pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
         )?);
         let primary = worktrees
             .iter()
-            .find(|worktree| !worktree.bare)
+            .find(|worktree| {
+                !worktree.bare && worktree.prunable.is_none() && worktree.path.exists()
+            })
             .map(|worktree| worktree.path.as_path())
             .unwrap_or(candidate.as_path());
         let primary = fs::canonicalize(primary)
@@ -2291,7 +2293,8 @@ mod tests {
     fn repository_discovery_uses_a_worktree_for_bare_common_repositories() -> Result<()> {
         let (temp, repo) = init_repo()?;
         let bare = temp.path().join("repo.git");
-        let linked = temp.path().join("bare-worktree");
+        let stale = temp.path().join("aaa-stale-worktree");
+        let linked = temp.path().join("zzz-valid-worktree");
         let clone = Command::new("git")
             .arg("clone")
             .arg("--bare")
@@ -2304,6 +2307,15 @@ mod tests {
                 String::from_utf8_lossy(&clone.stderr).trim()
             );
         }
+        git_output(
+            &bare,
+            [
+                "worktree",
+                "add",
+                stale.to_str().context("non-utf8 stale worktree path")?,
+            ],
+        )?;
+        fs::remove_dir_all(&stale)?;
         git_output(
             &bare,
             [
@@ -2327,8 +2339,11 @@ mod tests {
                 now: now(),
             },
         )?;
-        assert_eq!(report.worktrees.len(), 1);
-        assert!(report.worktrees[0].is_current);
+        assert!(report.worktrees.iter().any(|worktree| worktree.is_current));
+        assert!(report
+            .worktrees
+            .iter()
+            .any(|worktree| worktree.prunable.is_some()));
         Ok(())
     }
 
