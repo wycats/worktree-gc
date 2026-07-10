@@ -2,6 +2,7 @@
 name = "worktree-gc"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Triage and clean stale Git worktrees"
 repository = "https://github.com/wycats/worktree-gc"
 readme = "README.md"
@@ -20,7 +21,9 @@ pkg-fmt = "zip"
 
 [dependencies]
 anyhow = "1.0.95"
+cargo_metadata = "0.23.1"
 clap = { version = "4.5.28", features = ["derive"] }
+parse-size = "1.1.0"
 rayon = "1.10.0"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"

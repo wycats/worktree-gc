@@ -18,6 +18,8 @@ Install from source with Cargo:
 cargo install --locked worktree-gc
 ```
 
+`worktree-gc` requires Rust 1.89 or newer.
+
 After a version has been published to crates.io and its matching `vX.Y.Z`
 GitHub release has completed, `cargo-binstall` can install the prebuilt binary:
 
@@ -32,6 +34,24 @@ cargo run -- triage --repo /path/to/repo
 cargo run -- cleanup --repo /path/to/repo
 cargo run -- cleanup --repo /path/to/repo --execute
 ```
+
+Use repeatable `--root` options to discover and clean every repository under
+one or more directory trees:
+
+```sh
+cargo run -- cleanup \\
+  --root /path/to/code \\
+  --root /path/to/another/repository
+```
+
+Discovery stops descending when it reaches a Git repository, skips generated
+directories and materialized backups, and deduplicates linked worktrees by
+their Git common directory. Each owning repository contributes all of its
+linked worktrees, including worktrees located outside the discovery roots.
+`--root` and the single-repository `--repo` mode are mutually exclusive.
+Multi-root cleanup writes the ordinary per-repository manifests plus an
+aggregate manifest under `$XDG_STATE_HOME/worktree-gc` or
+`~/.local/state/worktree-gc`.
 
 `triage` reports prunable metadata, dirty worktrees, stale clean worktree removal candidates, and generated directory cleanup candidates. `audit` is kept as an alias for `triage`.
 
@@ -72,26 +92,52 @@ degrades to mtime-only judgment:
 cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-use --execute
 ```
 
-Active directories are normally skipped entirely, but some (Rust `target`
-dirs especially) accumulate stale incremental artifacts internally while
-staying "active" forever. A sweep strategy prunes those in place instead of
-skipping, delegating to a fingerprint-aware external tool that is safe to run
-against a live build:
+Active Rust `target` directories receive a built-in incremental-cache sweep
+during ordinary cleanup planning. Rustc incremental roots with no session
+activity for 14 days are selected for in-place pruning, while a whole `target`
+directory that has been inactive for 3 days remains a wholesale deletion
+candidate. The dry run records every root's path, newest activity, age, and
+logical size in the manifest.
+
+Override the built-in incremental window with an explicit strategy:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --sweep target=rustc-incremental:7 --execute
+```
+
+Before pruning, `worktree-gc` verifies the directory against `cargo metadata`
+and leaves shared or external build directories untouched. Execution waits for
+Cargo's profile lock, rechecks activity, atomically moves stale roots into a
+tool-owned quarantine, releases the lock, and then deletes the quarantine. A
+later execution recovers quarantine left by an interrupted run.
+
+The legacy `cargo-sweep` backend remains available as an additional explicit
+strategy for fingerprint-associated outputs. It can prune by age or keep an
+active target within a size budget:
 
 ```sh
 cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-sweep:3 --execute
+cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-sweep:max-size=50GB --execute
 ```
 
-This runs `cargo sweep --time 3` inside the containing worktree when `target`
-is too active to delete. Stale `target` dirs are still deleted wholesale.
-Requires `cargo-sweep` on `PATH` (`cargo install cargo-sweep`); if the sweep
-cannot run, an error is reported for that directory and the rest of the
-cleanup proceeds. `cargo-sweep` is the only supported tool today.
+When both strategies are configured, the built-in incremental sweep runs
+first. `cargo-sweep` intentionally leaves rustc's `incremental/` cache
+directories alone and requires `cargo-sweep` on `PATH`
+(`cargo install cargo-sweep`). Before invoking it, `worktree-gc` verifies the
+Cargo build directory and waits until it holds every existing host and
+cross-target profile lock. If the external command cannot run, an error is
+reported for the directory and cleanup continues.
+
+Use `--no-default-sweeps` to retain the generated-directory defaults without
+the built-in incremental sweep. `--no-default-generated` starts from an empty
+generated-directory policy and also disables default sweeps. Explicit
+`--sweep` entries remain available with either flag.
 
 Generated directory defaults are:
 
 - delete candidates: `node_modules`, `.next`, `.turbo`, `target`
 - report-only candidates: `dist`
+- in-place sweeps: `target=rustc-incremental:14`
 
 You can add repo-specific generated directory names:
 

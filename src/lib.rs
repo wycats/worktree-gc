@@ -1,7 +1,12 @@
+mod cargo_incremental;
+
 use anyhow::{bail, Context, Result};
+use cargo_incremental::{
+    cargo_project_dir, execute_incremental_sweep, plan_incremental_sweep, with_cargo_profile_locks,
+};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
@@ -12,10 +17,14 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use walkdir::WalkDir;
 
+pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
+
 pub const DEFAULT_STALE_DAYS: u64 = 30;
 pub const DEFAULT_GENERATED_DAYS: u64 = 7;
 pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", ".turbo", "target"];
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
+pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
+pub const MANIFEST_VERSION: u64 = 2;
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -77,7 +86,29 @@ pub struct CleanupRun {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RootTriageReport {
+    pub roots: Vec<PathBuf>,
+    pub repositories: Vec<TriageReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RootCleanupRun {
+    pub manifest_path: PathBuf,
+    pub manifest: RootCleanupManifest,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RootCleanupManifest {
+    pub manifest_version: u64,
+    pub mode: CleanupMode,
+    pub generated_at: String,
+    pub roots: Vec<PathBuf>,
+    pub repositories: Vec<CleanupRun>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CleanupManifest {
+    pub manifest_version: u64,
     pub mode: CleanupMode,
     pub generated_at: String,
     pub repo_root: PathBuf,
@@ -94,7 +125,7 @@ pub struct CleanupManifest {
     pub generated_dirs: Vec<GeneratedDirDecision>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupMode {
     DryRun,
@@ -131,8 +162,7 @@ pub struct GeneratedDirInfo {
     pub mtime: Option<String>,
     pub effective_days: u64,
     pub in_use: bool,
-    pub sweep_tool: Option<SweepTool>,
-    pub sweep_days: Option<u64>,
+    pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
 }
@@ -173,8 +203,7 @@ pub struct GeneratedDirDecision {
     pub mtime: Option<String>,
     pub effective_days: u64,
     pub in_use: bool,
-    pub sweep_tool: Option<SweepTool>,
-    pub sweep_days: Option<u64>,
+    pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
 }
@@ -188,21 +217,59 @@ pub struct GeneratedDirConfig {
 }
 
 // An in-place pruning strategy for generated dirs that are too active to
-// delete wholesale but accumulate stale artifacts internally (e.g. cargo
-// incremental artifacts in `target/`). The external tool is expected to be
-// fingerprint-aware and safe to run against a directory a build may be
-// using.
+// delete wholesale but accumulate stale artifacts internally (e.g. Cargo
+// fingerprint-associated build outputs in `target/`). Each sweep tool defines
+// which artifacts it can identify and remove.
 #[derive(Debug, Clone, Serialize)]
 pub struct SweepStrategy {
     pub name: String,
     pub tool: SweepTool,
-    pub days: u64,
+    pub limit: SweepLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SweepTool {
+    RustcIncremental,
+    CargoSweep,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SweepTool {
-    CargoSweep,
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SweepLimit {
+    AgeDays { days: u64 },
+    MaxSize { bytes: u64 },
+}
+
+impl SweepLimit {
+    fn age_days(&self) -> Option<u64> {
+        match self {
+            Self::AgeDays { days } => Some(*days),
+            Self::MaxSize { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SweepDecision {
+    pub tool: SweepTool,
+    pub limit: SweepLimit,
+    pub delegated: bool,
+    pub project_dir: Option<PathBuf>,
+    pub reason: String,
+    pub candidates: Vec<SweepCandidateDecision>,
+}
+
+impl SweepDecision {
+    fn has_work(&self) -> bool {
+        self.delegated
+            || self.candidates.iter().any(|candidate| {
+                matches!(
+                    candidate.action,
+                    SweepCandidateAction::Delete | SweepCandidateAction::RecoverTrash
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,7 +280,14 @@ pub struct GeneratedWindowOverride {
 
 impl Default for GeneratedDirConfig {
     fn default() -> Self {
-        Self::from_names(true, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        Self::from_names_with_default_sweeps(
+            true,
+            true,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 }
 
@@ -225,9 +299,28 @@ impl GeneratedDirConfig {
         window_overrides: Vec<(String, u64)>,
         sweep_strategies: Vec<SweepStrategy>,
     ) -> Self {
+        Self::from_names_with_default_sweeps(
+            include_defaults,
+            include_defaults,
+            delete_names,
+            report_only_names,
+            window_overrides,
+            sweep_strategies,
+        )
+    }
+
+    pub fn from_names_with_default_sweeps(
+        include_defaults: bool,
+        include_default_sweeps: bool,
+        delete_names: Vec<String>,
+        report_only_names: Vec<String>,
+        window_overrides: Vec<(String, u64)>,
+        sweep_strategies: Vec<SweepStrategy>,
+    ) -> Self {
         let mut delete = Vec::new();
         let mut report_only = Vec::new();
         let mut windows = Vec::new();
+        let mut sweeps = Vec::new();
 
         if include_defaults {
             delete.extend(
@@ -250,6 +343,16 @@ impl GeneratedDirConfig {
             );
         }
 
+        if include_defaults && include_default_sweeps {
+            sweeps.push(SweepStrategy {
+                name: "target".to_string(),
+                tool: SweepTool::RustcIncremental,
+                limit: SweepLimit::AgeDays {
+                    days: DEFAULT_INCREMENTAL_SWEEP_DAYS,
+                },
+            });
+        }
+
         delete.extend(delete_names);
         report_only.extend(report_only_names);
         windows.extend(
@@ -257,12 +360,13 @@ impl GeneratedDirConfig {
                 .into_iter()
                 .map(|(name, days)| GeneratedWindowOverride { name, days }),
         );
+        sweeps.extend(sweep_strategies);
 
         Self {
             delete_names: normalize_names(delete),
             report_only_names: normalize_names(report_only),
             window_overrides: windows,
-            sweep_strategies,
+            sweep_strategies: normalize_sweep_strategies(sweeps),
         }
     }
 
@@ -276,11 +380,11 @@ impl GeneratedDirConfig {
             .unwrap_or(generated_days)
     }
 
-    pub fn sweep_strategy(&self, name: &str) -> Option<&SweepStrategy> {
+    pub fn sweep_strategies(&self, name: &str) -> Vec<&SweepStrategy> {
         self.sweep_strategies
             .iter()
-            .rev()
-            .find(|strategy| strategy.name == name)
+            .filter(|strategy| strategy.name == name)
+            .collect()
     }
 
     fn candidate_action(&self, name: &str) -> Option<GeneratedCandidateAction> {
@@ -292,6 +396,12 @@ impl GeneratedDirConfig {
             Some(GeneratedCandidateAction::ReportOnly)
         } else if self.delete_names.iter().any(|candidate| candidate == name) {
             Some(GeneratedCandidateAction::Delete)
+        } else if self
+            .sweep_strategies
+            .iter()
+            .any(|strategy| strategy.name == name)
+        {
+            Some(GeneratedCandidateAction::SweepOnly)
         } else {
             None
         }
@@ -309,6 +419,7 @@ struct RawWorktree {
     path: PathBuf,
     head: Option<String>,
     branch: Option<String>,
+    bare: bool,
     detached: bool,
     prunable: Option<String>,
 }
@@ -325,6 +436,7 @@ struct GeneratedCandidate {
 enum GeneratedCandidateAction {
     Delete,
     ReportOnly,
+    SweepOnly,
 }
 
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
@@ -371,6 +483,15 @@ pub fn audit(repo: Option<&Path>, generated_days: u64, now: SystemTime) -> Resul
 }
 
 pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
+    let execute = options.execute;
+    let run = plan_cleanup(repo, options)?;
+    if execute {
+        execute_cleanup_manifest(&run.manifest)?;
+    }
+    Ok(run)
+}
+
+fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
     let generated_dirs = scan_generated_dirs(
@@ -393,14 +514,14 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
             mtime: dir.mtime.clone(),
             effective_days: dir.effective_days,
             in_use: dir.in_use,
-            sweep_tool: dir.sweep_tool.clone(),
-            sweep_days: dir.sweep_days,
+            sweeps: dir.sweeps.clone(),
             action: dir.action.clone(),
             reason: dir.reason.clone(),
         })
         .collect::<Vec<_>>();
 
     let manifest = CleanupManifest {
+        manifest_version: MANIFEST_VERSION,
         mode: if options.execute {
             CleanupMode::Execute
         } else {
@@ -423,15 +544,161 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
 
     let manifest_path = write_manifest(&context.git_common_dir, &manifest)?;
 
-    if options.execute {
-        run_worktree_prune(&context.current_worktree, true)?;
-        execute_cleanup(&manifest)?;
-    }
-
     Ok(CleanupRun {
         manifest_path,
         manifest,
     })
+}
+
+pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTriageReport> {
+    let roots = canonicalize_roots(roots)?;
+    let repositories = discover_repositories(&roots)?;
+    let repositories = repositories
+        .iter()
+        .map(|repo| triage(Some(repo), options.clone()))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(RootTriageReport {
+        roots,
+        repositories,
+    })
+}
+
+pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootCleanupRun> {
+    let roots = canonicalize_roots(roots)?;
+    let repositories = discover_repositories(&roots)?;
+    let generated_at = format_system_time(options.now);
+    let mode = if options.execute {
+        CleanupMode::Execute
+    } else {
+        CleanupMode::DryRun
+    };
+    let repositories = repositories
+        .iter()
+        .map(|repo| plan_cleanup(Some(repo), options.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut manifest = RootCleanupManifest {
+        manifest_version: MANIFEST_VERSION,
+        mode,
+        generated_at,
+        roots,
+        repositories,
+    };
+    let manifest_path = write_root_manifest(&manifest)?;
+
+    if options.execute {
+        for index in 0..manifest.repositories.len() {
+            let repo_root = manifest.repositories[index].manifest.repo_root.clone();
+            let mut refreshed_options = options.clone();
+            refreshed_options.now = SystemTime::now();
+            let refreshed = plan_cleanup(Some(&repo_root), refreshed_options)?;
+            manifest.repositories[index] = refreshed;
+            write_root_manifest(&manifest)?;
+            execute_cleanup_manifest(&manifest.repositories[index].manifest)?;
+        }
+    }
+
+    Ok(RootCleanupRun {
+        manifest_path,
+        manifest,
+    })
+}
+
+fn execute_cleanup_manifest(manifest: &CleanupManifest) -> Result<()> {
+    run_worktree_prune(&manifest.current_worktree, true)?;
+    execute_cleanup(manifest)
+}
+
+pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let roots = canonicalize_roots(roots)?;
+    let mut candidates = Vec::new();
+
+    for root in roots {
+        if root.join(".git").exists() {
+            candidates.push(root);
+            continue;
+        }
+
+        let mut walker = WalkDir::new(&root)
+            .follow_links(false)
+            .sort_by_file_name()
+            .into_iter();
+        while let Some(entry) = walker.next() {
+            let entry = entry.with_context(|| {
+                format!("failed to discover repositories under {}", root.display())
+            })?;
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            if entry.depth() > 0 && skip_repository_discovery_dir(entry.path()) {
+                walker.skip_current_dir();
+                continue;
+            }
+            if entry.path().join(".git").exists() {
+                candidates.push(entry.path().to_path_buf());
+                walker.skip_current_dir();
+            }
+        }
+    }
+
+    let mut repositories = BTreeMap::new();
+    for candidate in candidates {
+        let common_dir = git_output(
+            &candidate,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let common_dir = fs::canonicalize(common_dir.trim()).with_context(|| {
+            format!(
+                "failed to resolve Git common directory for {}",
+                candidate.display()
+            )
+        })?;
+        if repositories.contains_key(&common_dir) {
+            continue;
+        }
+        let worktrees = parse_worktree_list(&git_output(
+            &candidate,
+            ["worktree", "list", "--porcelain"],
+        )?);
+        let primary = worktrees
+            .iter()
+            .find(|worktree| {
+                !worktree.bare && worktree.prunable.is_none() && worktree.path.exists()
+            })
+            .map(|worktree| worktree.path.as_path())
+            .unwrap_or(candidate.as_path());
+        let primary = fs::canonicalize(primary)
+            .with_context(|| format!("failed to resolve primary worktree {}", primary.display()))?;
+        repositories.insert(common_dir, primary);
+    }
+
+    let mut repositories = repositories.into_values().collect::<Vec<_>>();
+    repositories.sort();
+    Ok(repositories)
+}
+
+fn canonicalize_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if roots.is_empty() {
+        bail!("at least one discovery root is required");
+    }
+    let mut canonical = roots
+        .iter()
+        .map(|root| {
+            fs::canonicalize(root)
+                .with_context(|| format!("failed to resolve discovery root {}", root.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+fn skip_repository_discovery_dir(path: &Path) -> bool {
+    let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | ".next" | ".turbo" | "dist" | ".worktree-gc-trash"
+    ) || name.contains(".materialized-backup-")
 }
 
 pub fn print_triage(report: &TriageReport) {
@@ -550,6 +817,66 @@ pub fn print_cleanup(run: &CleanupRun) {
             );
         }
     }
+
+    print_sweep_candidates(
+        run.manifest
+            .generated_dirs
+            .iter()
+            .map(|dir| (dir.path.as_path(), dir.sweeps.as_slice())),
+    );
+}
+
+pub fn print_root_triage(report: &RootTriageReport) {
+    println!(
+        "discovery roots: {}, repositories: {}",
+        report.roots.len(),
+        report.repositories.len()
+    );
+    for repository in &report.repositories {
+        println!();
+        println!("=== {} ===", repository.repo_root.display());
+        print_triage(repository);
+    }
+}
+
+pub fn print_root_cleanup(run: &RootCleanupRun) {
+    let removed_worktrees = run
+        .manifest
+        .repositories
+        .iter()
+        .flat_map(|run| &run.manifest.worktrees)
+        .filter(|decision| decision.action == WorktreeAction::Remove)
+        .count();
+    let deleted_dirs = run
+        .manifest
+        .repositories
+        .iter()
+        .flat_map(|run| &run.manifest.generated_dirs)
+        .filter(|decision| decision.action == GeneratedDirAction::Delete)
+        .count();
+    let swept_dirs = run
+        .manifest
+        .repositories
+        .iter()
+        .flat_map(|run| &run.manifest.generated_dirs)
+        .filter(|decision| decision.action == GeneratedDirAction::Sweep)
+        .count();
+
+    println!("aggregate manifest: {}", run.manifest_path.display());
+    println!(
+        "discovery roots: {}, repositories: {}",
+        run.manifest.roots.len(),
+        run.manifest.repositories.len()
+    );
+    println!(
+        "aggregate plan: {} worktrees, {} generated dirs, {} in-place sweeps",
+        removed_worktrees, deleted_dirs, swept_dirs
+    );
+    for repository in &run.manifest.repositories {
+        println!();
+        println!("=== {} ===", repository.manifest.repo_root.display());
+        print_cleanup(repository);
+    }
 }
 
 fn repo_context(repo: Option<&Path>) -> Result<RepoContext> {
@@ -579,6 +906,7 @@ fn inspect_worktrees(context: &RepoContext, now: SystemTime) -> Result<Vec<Workt
     let current_canonical = fs::canonicalize(&context.current_worktree)?;
 
     raw.into_par_iter()
+        .filter(|entry| !entry.bare)
         .map(|entry| inspect_worktree(entry, &current_canonical, now))
         .collect()
 }
@@ -686,6 +1014,8 @@ fn parse_worktree_list(output: &str) -> Vec<RawWorktree> {
             );
         } else if line == "detached" {
             entry.detached = true;
+        } else if line == "bare" {
+            entry.bare = true;
         } else if let Some(reason) = line.strip_prefix("prunable ") {
             entry.prunable = Some(reason.to_string());
         }
@@ -755,7 +1085,7 @@ fn scan_generated_dirs(
     now: SystemTime,
     config: &GeneratedDirConfig,
 ) -> Result<Vec<GeneratedDirInfo>> {
-    let dirs = worktrees
+    let mut dirs: Vec<GeneratedDirInfo> = worktrees
         .par_iter()
         .map(|worktree| {
             scan_generated_dirs_for_worktree(
@@ -771,6 +1101,31 @@ fn scan_generated_dirs(
         .into_iter()
         .flatten()
         .collect();
+
+    dirs.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut seen = HashSet::new();
+    for dir in &mut dirs {
+        for sweep in &mut dir.sweeps {
+            let roots = sweep
+                .candidates
+                .iter()
+                .map(|candidate| candidate.incremental_dir.clone())
+                .collect::<HashSet<_>>();
+            let owned_roots = roots
+                .into_iter()
+                .filter(|root| seen.insert((sweep.tool.clone(), root.clone())))
+                .collect::<HashSet<_>>();
+            sweep
+                .candidates
+                .retain(|candidate| owned_roots.contains(&candidate.incremental_dir));
+        }
+        if dir.action == GeneratedDirAction::Sweep
+            && !dir.sweeps.iter().any(SweepDecision::has_work)
+        {
+            dir.action = GeneratedDirAction::Skip;
+            dir.reason = "no stale sweep candidates remain after deduplication".to_string();
+        }
+    }
 
     Ok(dirs)
 }
@@ -817,7 +1172,18 @@ fn scan_generated_dirs_for_worktree(
             && !dir_recent
             && !has_tracked_files;
         let in_use = check_in_use && deletable_so_far && dir_has_open_handles(&candidate.path);
-        let sweep_strategy = config.sweep_strategy(&candidate.name);
+        let sweep_strategies = config.sweep_strategies(&candidate.name);
+        let active = worktree_recent || dir_recent;
+        let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
+            && (active || candidate.action == GeneratedCandidateAction::SweepOnly)
+            && !has_tracked_files
+            && !sweep_strategies.is_empty()
+        {
+            plan_sweep_decisions(&candidate.path, &worktree.path, sweep_strategies, now)?
+        } else {
+            Vec::new()
+        };
+        let has_sweep_work = sweeps.iter().any(SweepDecision::has_work);
 
         let (action, reason) = if candidate.action == GeneratedCandidateAction::ReportOnly {
             (
@@ -829,25 +1195,68 @@ fn scan_generated_dirs_for_worktree(
                 GeneratedDirAction::Skip,
                 "a running process has open files in this directory".to_string(),
             )
-        } else if worktree_recent || dir_recent {
-            match sweep_strategy {
-                Some(strategy) if !has_tracked_files => (
-                    GeneratedDirAction::Sweep,
-                    format!(
-                        "active directory with a sweep strategy: prune artifacts older than {} days in place",
-                        strategy.days
-                    ),
-                ),
-                _ => (
+        } else if candidate.action == GeneratedCandidateAction::SweepOnly {
+            if has_tracked_files {
+                (
                     GeneratedDirAction::Skip,
-                    if generated_activity_only {
+                    "directory contains tracked files".to_string(),
+                )
+            } else if has_sweep_work {
+                let descriptions = sweeps
+                    .iter()
+                    .filter(|sweep| sweep.has_work())
+                    .map(|sweep| format!("{}: {}", sweep_tool_name(&sweep.tool), sweep.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                (
+                    GeneratedDirAction::Sweep,
+                    format!("explicit in-place sweep: {descriptions}"),
+                )
+            } else {
+                let planned_reason = sweeps
+                    .iter()
+                    .map(|sweep| sweep.reason.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                (
+                    GeneratedDirAction::Skip,
+                    if planned_reason.is_empty() {
+                        "explicit sweep found no eligible artifacts".to_string()
+                    } else {
+                        planned_reason
+                    },
+                )
+            }
+        } else if active {
+            if has_sweep_work {
+                let descriptions = sweeps
+                    .iter()
+                    .filter(|sweep| sweep.has_work())
+                    .map(|sweep| format!("{}: {}", sweep_tool_name(&sweep.tool), sweep.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                (
+                    GeneratedDirAction::Sweep,
+                    format!("active directory with sweep work: {descriptions}"),
+                )
+            } else {
+                let planned_reason = sweeps
+                    .iter()
+                    .map(|sweep| sweep.reason.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                (
+                    GeneratedDirAction::Skip,
+                    if !planned_reason.is_empty() {
+                        planned_reason
+                    } else if generated_activity_only {
                         format!("generated directory activity is newer than {effective_days} days")
                     } else {
                         format!(
                             "worktree or generated directory activity is newer than {effective_days} days"
                         )
                     },
-                ),
+                )
             }
         } else if has_tracked_files {
             (
@@ -876,14 +1285,58 @@ fn scan_generated_dirs_for_worktree(
             mtime: mtime_unix.map(format_unix_time),
             effective_days,
             in_use,
-            sweep_tool: sweep_strategy.map(|strategy| strategy.tool.clone()),
-            sweep_days: sweep_strategy.map(|strategy| strategy.days),
+            sweeps,
             action,
             reason,
         });
     }
 
     Ok(dirs)
+}
+
+fn plan_sweep_decisions(
+    target_dir: &Path,
+    worktree: &Path,
+    mut strategies: Vec<&SweepStrategy>,
+    now: SystemTime,
+) -> Result<Vec<SweepDecision>> {
+    strategies.sort_by_key(|strategy| strategy.tool.clone());
+    strategies
+        .into_iter()
+        .map(|strategy| match strategy.tool {
+            SweepTool::RustcIncremental => {
+                let days = strategy
+                    .limit
+                    .age_days()
+                    .context("rustc-incremental requires an age-days limit")?;
+                let plan = plan_incremental_sweep(target_dir, worktree, days, now)?;
+                Ok(SweepDecision {
+                    tool: SweepTool::RustcIncremental,
+                    limit: strategy.limit.clone(),
+                    delegated: false,
+                    project_dir: cargo_project_dir(target_dir, worktree),
+                    reason: plan.reason,
+                    candidates: plan.candidates,
+                })
+            }
+            SweepTool::CargoSweep => Ok(SweepDecision {
+                tool: SweepTool::CargoSweep,
+                limit: strategy.limit.clone(),
+                delegated: true,
+                project_dir: cargo_project_dir(target_dir, worktree),
+                reason: match strategy.limit {
+                    SweepLimit::AgeDays { days } => {
+                        format!("delegate fingerprint-associated outputs older than {days} days")
+                    }
+                    SweepLimit::MaxSize { bytes } => format!(
+                        "delegate oldest fingerprint-associated outputs above {}",
+                        format_bytes(bytes)
+                    ),
+                },
+                candidates: Vec::new(),
+            }),
+        })
+        .collect()
 }
 
 // Newest mtime among the directory itself and its descendants up to
@@ -1120,54 +1573,85 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
             decision.path.display()
         );
         flush_stderr();
-        run_sweep(decision);
+        let run_id = format!(
+            "{}-{}",
+            manifest.generated_at.replace([':', '.'], "-"),
+            std::process::id()
+        );
+        run_sweeps(decision, &run_id)?;
     }
 
     Ok(())
 }
 
-// Sweep failures are reported but never fail the run: the tool may be
-// missing, and an unswept cache is merely disk pressure, not an error.
-fn run_sweep(decision: &GeneratedDirDecision) {
-    let (Some(tool), Some(days)) = (&decision.sweep_tool, decision.sweep_days) else {
-        return;
-    };
-    match tool {
-        SweepTool::CargoSweep => {
-            // Pass the project directory containing the matched target dir
-            // explicitly: the scan can match nested `target/` dirs
-            // (workspace members, vendored crates), and without a path
-            // cargo-sweep defaults to the project it happens to run in,
-            // which could silently sweep the wrong target.
-            let project_dir = decision.path.parent().unwrap_or(&decision.worktree_path);
-            let result = Command::new("cargo")
-                .arg("sweep")
-                .arg("--time")
-                .arg(days.to_string())
-                .arg(project_dir)
-                .current_dir(&decision.worktree_path)
-                .stdin(Stdio::null())
-                .output();
-            match result {
-                Ok(output) if output.status.success() => {
-                    // cargo-sweep logs its "Cleaned X GiB" line to stderr.
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if let Some(line) = stderr.lines().rev().find(|l| l.contains("Cleaned")) {
-                        eprintln!("  {}", line.trim_start_matches("[INFO] "));
+fn run_sweeps(decision: &GeneratedDirDecision, run_id: &str) -> Result<()> {
+    for sweep in &decision.sweeps {
+        match sweep.tool {
+            SweepTool::RustcIncremental => {
+                let days = sweep
+                    .limit
+                    .age_days()
+                    .context("rustc-incremental requires an age-days limit")?;
+                execute_incremental_sweep(&sweep.candidates, days, run_id)?;
+            }
+            // External cargo-sweep failures remain non-fatal so the rest of
+            // the planned cleanup can continue.
+            SweepTool::CargoSweep => {
+                // Pass the project directory containing the matched target dir
+                // explicitly: the scan can match nested `target/` dirs
+                // (workspace members, vendored crates), and without a path
+                // cargo-sweep defaults to the project it happens to run in,
+                // which could silently sweep the wrong target.
+                let project_dir = sweep
+                    .project_dir
+                    .as_deref()
+                    .unwrap_or(&decision.worktree_path);
+                let result =
+                    with_cargo_profile_locks(&decision.path, &decision.worktree_path, || {
+                        let mut command = Command::new("cargo");
+                        command.arg("sweep");
+                        match sweep.limit {
+                            SweepLimit::AgeDays { days } => {
+                                command.arg("--time").arg(days.to_string());
+                            }
+                            SweepLimit::MaxSize { bytes } => {
+                                command.arg("--maxsize").arg(format!("{bytes}B"));
+                            }
+                        }
+                        command
+                            .arg(project_dir)
+                            .current_dir(&decision.worktree_path)
+                            .stdin(Stdio::null())
+                            .output()
+                    });
+                match result {
+                    Ok(Ok(output)) if output.status.success() => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        if let Some(line) = stderr
+                            .lines()
+                            .rev()
+                            .find(|line| line.contains("Cleaned"))
+                            .or_else(|| stdout.lines().rev().find(|line| line.contains("Cleaned")))
+                        {
+                            eprintln!("  {}", line.trim_start_matches("[INFO] "));
+                        }
                     }
-                }
-                Ok(output) => {
-                    eprintln!(
-                        "  sweep failed (exit {:?}); is cargo-sweep installed? (cargo install cargo-sweep)",
-                        output.status.code()
-                    );
-                }
-                Err(error) => {
-                    eprintln!("  sweep failed to launch: {error}");
+                    Ok(Ok(output)) => {
+                        eprintln!(
+                            "  sweep failed (exit {:?}); is cargo-sweep installed? (cargo install cargo-sweep)",
+                            output.status.code()
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!("  sweep failed to launch: {error}");
+                    }
+                    Err(error) => eprintln!("  sweep skipped: {error:#}"),
                 }
             }
         }
     }
+    Ok(())
 }
 
 fn flush_stderr() {
@@ -1190,6 +1674,32 @@ fn write_manifest(git_common_dir: &Path, manifest: &CleanupManifest) -> Result<P
     let json = serde_json::to_vec_pretty(manifest)?;
     fs::write(&path, json).context("failed to write cleanup manifest")?;
 
+    Ok(path)
+}
+
+fn write_root_manifest(manifest: &RootCleanupManifest) -> Result<PathBuf> {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/state"))
+        })
+        .context("neither XDG_STATE_HOME nor HOME is set")?;
+    let manifest_dir = state_home.join("worktree-gc");
+    fs::create_dir_all(&manifest_dir)
+        .with_context(|| format!("failed to create {}", manifest_dir.display()))?;
+    let mode = match manifest.mode {
+        CleanupMode::DryRun => "dry-run",
+        CleanupMode::Execute => "execute",
+    };
+    let path = manifest_dir.join(format!(
+        "{}-roots-{mode}.json",
+        manifest.generated_at.replace([':', '.'], "-")
+    ));
+    let json = serde_json::to_vec_pretty(manifest)?;
+    fs::write(&path, json)
+        .with_context(|| format!("failed to write aggregate manifest {}", path.display()))?;
     Ok(path)
 }
 
@@ -1288,14 +1798,86 @@ fn print_generated(generated_dirs: &[GeneratedDirInfo]) {
         .filter(|d| d.action == GeneratedDirAction::Delete)
         .take(25)
         .collect::<Vec<_>>();
-    if delete.is_empty() {
+    if !delete.is_empty() {
+        println!();
+        println!("generated delete candidates (first 25):");
+        for dir in delete {
+            println!("- {} ({})", dir.path.display(), dir.reason);
+        }
+    }
+
+    print_sweep_candidates(
+        generated_dirs
+            .iter()
+            .map(|dir| (dir.path.as_path(), dir.sweeps.as_slice())),
+    );
+}
+
+fn print_sweep_candidates<'a>(dirs: impl IntoIterator<Item = (&'a Path, &'a [SweepDecision])>) {
+    let candidates = dirs
+        .into_iter()
+        .flat_map(|(target, sweeps)| {
+            sweeps.iter().flat_map(move |sweep| {
+                sweep
+                    .candidates
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            candidate.action,
+                            SweepCandidateAction::Delete | SweepCandidateAction::RecoverTrash
+                        )
+                    })
+                    .map(move |candidate| (target, sweep, candidate))
+            })
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
         return;
     }
 
+    let bytes = candidates
+        .iter()
+        .map(|(_, _, candidate)| candidate.logical_bytes)
+        .sum::<u64>();
     println!();
-    println!("generated delete candidates (first 25):");
-    for dir in delete {
-        println!("- {} ({})", dir.path.display(), dir.reason);
+    println!(
+        "generated sweep artifacts: {} entries, {} logical",
+        candidates.len(),
+        format_bytes(bytes)
+    );
+    for (target, sweep, candidate) in candidates.iter().take(50) {
+        let activity = candidate
+            .activity_age_days
+            .map(|days| format!("{days}d old"))
+            .unwrap_or_else(|| "interrupted-run quarantine".to_string());
+        println!(
+            "- {} [{} in {}; {}, {}]",
+            candidate.path.display(),
+            sweep_tool_name(&sweep.tool),
+            target.display(),
+            activity,
+            format_bytes(candidate.logical_bytes)
+        );
+    }
+    if candidates.len() > 50 {
+        println!("- ... and {} more (see manifest)", candidates.len() - 50);
+    }
+}
+
+fn sweep_tool_name(tool: &SweepTool) -> &'static str {
+    match tool {
+        SweepTool::RustcIncremental => "rustc-incremental",
+        SweepTool::CargoSweep => "cargo-sweep",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / MIB)
     }
 }
 
@@ -1452,6 +2034,21 @@ fn normalize_names(names: Vec<String>) -> Vec<String> {
     normalized
 }
 
+fn normalize_sweep_strategies(strategies: Vec<SweepStrategy>) -> Vec<SweepStrategy> {
+    let mut normalized: Vec<SweepStrategy> = Vec::new();
+    for strategy in strategies {
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|existing| existing.name == strategy.name && existing.tool == strategy.tool)
+        {
+            *existing = strategy;
+        } else {
+            normalized.push(strategy);
+        }
+    }
+    normalized
+}
+
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -1597,6 +2194,258 @@ mod tests {
     }
 
     #[test]
+    fn default_and_explicit_sweep_strategies_compose_by_tool() {
+        let config = GeneratedDirConfig::from_names_with_default_sweeps(
+            true,
+            true,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                SweepStrategy {
+                    name: "target".to_string(),
+                    tool: SweepTool::RustcIncremental,
+                    limit: SweepLimit::AgeDays { days: 7 },
+                },
+                SweepStrategy {
+                    name: "target".to_string(),
+                    tool: SweepTool::CargoSweep,
+                    limit: SweepLimit::AgeDays { days: 30 },
+                },
+            ],
+        );
+
+        let target_sweeps = config.sweep_strategies("target");
+        assert_eq!(target_sweeps.len(), 2);
+        assert_eq!(
+            target_sweeps
+                .iter()
+                .find(|strategy| strategy.tool == SweepTool::RustcIncremental)
+                .map(|strategy| &strategy.limit),
+            Some(&SweepLimit::AgeDays { days: 7 })
+        );
+        assert_eq!(
+            target_sweeps
+                .iter()
+                .find(|strategy| strategy.tool == SweepTool::CargoSweep)
+                .map(|strategy| &strategy.limit),
+            Some(&SweepLimit::AgeDays { days: 30 })
+        );
+
+        let without_sweeps = GeneratedDirConfig::from_names_with_default_sweeps(
+            true,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(without_sweeps.sweep_strategies("target").is_empty());
+        assert!(without_sweeps
+            .delete_names
+            .iter()
+            .any(|name| name == "target"));
+
+        let without_generated_defaults = GeneratedDirConfig::from_names_with_default_sweeps(
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(without_generated_defaults.delete_names.is_empty());
+        assert!(without_generated_defaults.sweep_strategies.is_empty());
+    }
+
+    #[test]
+    fn repository_discovery_stops_at_repo_boundaries_and_deduplicates_worktrees() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let worktrees_dir = temp.path().join("repo.worktrees");
+        fs::create_dir(&worktrees_dir)?;
+        let linked = worktrees_dir.join("feature");
+        add_worktree(&repo, &linked, "discovery-feature")?;
+
+        let nested = repo.join("vendor/nested-repository");
+        fs::create_dir_all(&nested)?;
+        git_output(&nested, ["init"])?;
+
+        let other = temp.path().join("other");
+        fs::create_dir(&other)?;
+        git_output(&other, ["init"])?;
+
+        let backup = temp.path().join("old.materialized-backup-20260709");
+        fs::create_dir(&backup)?;
+        git_output(&backup, ["init"])?;
+
+        let repositories = discover_repositories(&[temp.path().to_path_buf()])?;
+        assert_eq!(
+            repositories,
+            vec![fs::canonicalize(&other)?, fs::canonicalize(&repo)?]
+        );
+
+        let linked_only = discover_repositories(&[linked])?;
+        assert_eq!(linked_only, vec![fs::canonicalize(repo)?]);
+        Ok(())
+    }
+
+    #[test]
+    fn repository_discovery_uses_a_worktree_for_bare_common_repositories() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let bare = temp.path().join("repo.git");
+        let stale = temp.path().join("aaa-stale-worktree");
+        let linked = temp.path().join("zzz-valid-worktree");
+        let clone = Command::new("git")
+            .arg("clone")
+            .arg("--bare")
+            .arg(&repo)
+            .arg(&bare)
+            .output()?;
+        if !clone.status.success() {
+            bail!(
+                "bare clone failed: {}",
+                String::from_utf8_lossy(&clone.stderr).trim()
+            );
+        }
+        git_output(
+            &bare,
+            [
+                "worktree",
+                "add",
+                stale.to_str().context("non-utf8 stale worktree path")?,
+            ],
+        )?;
+        fs::remove_dir_all(&stale)?;
+        git_output(
+            &bare,
+            [
+                "worktree",
+                "add",
+                linked.to_str().context("non-utf8 worktree path")?,
+            ],
+        )?;
+
+        let repositories = discover_repositories(std::slice::from_ref(&linked))?;
+        assert_eq!(repositories, vec![fs::canonicalize(&linked)?]);
+
+        let report = triage(
+            Some(&linked),
+            TriageOptions {
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+        assert!(report.worktrees.iter().any(|worktree| worktree.is_current));
+        assert!(report
+            .worktrees
+            .iter()
+            .any(|worktree| worktree.prunable.is_some()));
+        Ok(())
+    }
+
+    #[test]
+    fn default_incremental_sweep_activates_and_manifest_is_v2() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let profile = repo.join("target/debug");
+        let root = profile.join("incremental/fixture-old");
+        let session = root.join("s-session-hash");
+        fs::create_dir_all(&session)?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        let dep_graph = session.join("dep-graph.bin");
+        fs::write(&dep_graph, "old")?;
+        let old = unix_days_before_now(20);
+        set_mtime(&dep_graph, old)?;
+        set_mtime(&session, old)?;
+        set_mtime(&root, old)?;
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        let expected_target = fs::canonicalize(repo.join("target"))?;
+        let target = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected_target)
+            .context("missing target decision")?;
+        assert_eq!(target.action, GeneratedDirAction::Sweep);
+        let sweep = target
+            .sweeps
+            .iter()
+            .find(|sweep| sweep.tool == SweepTool::RustcIncremental)
+            .context("missing default incremental sweep")?;
+        assert_eq!(
+            sweep.limit,
+            SweepLimit::AgeDays {
+                days: DEFAULT_INCREMENTAL_SWEEP_DAYS
+            }
+        );
+        assert!(sweep
+            .candidates
+            .iter()
+            .any(|candidate| candidate.action == SweepCandidateAction::Delete));
+
+        let json = serde_json::to_value(&run.manifest)?;
+        assert_eq!(json["manifest_version"], MANIFEST_VERSION);
+        assert!(json["generated_dirs"][0].get("sweeps").is_some());
+        assert!(json["generated_dirs"][0].get("sweep_tool").is_none());
+        assert!(json["generated_dirs"][0].get("sweep_days").is_none());
+
+        let explicit_only = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::from_names_with_default_sweeps(
+                    false,
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![SweepStrategy {
+                        name: "target".to_string(),
+                        tool: SweepTool::RustcIncremental,
+                        limit: SweepLimit::AgeDays { days: 14 },
+                    }],
+                ),
+                now: now(),
+            },
+        )?;
+        let target = explicit_only
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == expected_target)
+            .context("explicit sweep did not discover target")?;
+        assert_eq!(target.action, GeneratedDirAction::Sweep);
+        assert!(explicit_only.manifest.generated_delete_names.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn deep_activity_in_generated_dir_prevents_deletion() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let worktree = repo.with_file_name("deep-activity");
@@ -1683,7 +2532,7 @@ mod tests {
         let strategy = SweepStrategy {
             name: "target".to_string(),
             tool: SweepTool::CargoSweep,
-            days: 3,
+            limit: SweepLimit::AgeDays { days: 3 },
         };
 
         let report = triage(
@@ -1711,8 +2560,12 @@ mod tests {
             .context("missing target entry")?;
 
         assert_eq!(dir.action, GeneratedDirAction::Sweep);
-        assert_eq!(dir.sweep_tool, Some(SweepTool::CargoSweep));
-        assert_eq!(dir.sweep_days, Some(3));
+        let sweep = dir
+            .sweeps
+            .iter()
+            .find(|sweep| sweep.tool == SweepTool::CargoSweep)
+            .context("missing cargo-sweep plan")?;
+        assert_eq!(sweep.limit, SweepLimit::AgeDays { days: 3 });
 
         // Stale dirs with a sweep strategy still prefer wholesale deletion.
         set_mtime(
@@ -1737,7 +2590,7 @@ mod tests {
                     vec![SweepStrategy {
                         name: "target".to_string(),
                         tool: SweepTool::CargoSweep,
-                        days: 3,
+                        limit: SweepLimit::AgeDays { days: 3 },
                     }],
                 ),
                 now: now(),
@@ -1751,6 +2604,64 @@ mod tests {
             .context("missing target entry")?;
 
         assert_eq!(dir.action, GeneratedDirAction::Delete);
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_sweep_uses_the_manifest_owner_for_nested_target_directories() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        fs::create_dir_all(repo.join(".cargo"))?;
+        fs::write(
+            repo.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"build/target\"\n",
+        )?;
+        fs::create_dir_all(repo.join("build/target/debug"))?;
+        fs::write(repo.join("build/target/debug/binary"), "bits\n")?;
+        set_mtime(
+            &repo.join("build/target/debug/binary"),
+            unix_days_before_now(1),
+        )?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::from_names(
+                    false,
+                    vec!["target".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                    vec![SweepStrategy {
+                        name: "target".to_string(),
+                        tool: SweepTool::CargoSweep,
+                        limit: SweepLimit::AgeDays { days: 3 },
+                    }],
+                ),
+                now: now(),
+            },
+        )?;
+
+        let target = fs::canonicalize(repo.join("build/target"))?;
+        let decision = report
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == target)
+            .context("missing nested target decision")?;
+        let sweep = decision
+            .sweeps
+            .iter()
+            .find(|sweep| sweep.tool == SweepTool::CargoSweep)
+            .context("missing cargo-sweep decision")?;
+        assert_eq!(sweep.project_dir, Some(fs::canonicalize(repo)?));
         Ok(())
     }
 
