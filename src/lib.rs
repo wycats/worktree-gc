@@ -2,13 +2,15 @@ mod cargo_incremental;
 
 use anyhow::{bail, Context, Result};
 use cargo_incremental::{
-    cargo_project_dir, execute_incremental_sweep, plan_incremental_sweep, with_cargo_profile_locks,
+    cargo_project_dir, execute_incremental_sweep_with_timeout, is_cargo_lock_timeout,
+    plan_incremental_sweep, with_cargo_profile_locks_timeout,
 };
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -58,6 +60,8 @@ pub struct CleanupOptions {
     pub generated_activity_only: bool,
     pub check_in_use: bool,
     pub generated_config: GeneratedDirConfig,
+    pub cargo_lock_timeout: Option<Duration>,
+    pub defer_lock_timeouts: bool,
     pub now: SystemTime,
 }
 
@@ -118,6 +122,8 @@ pub struct CleanupManifest {
     pub generated_days: u64,
     pub generated_activity_only: bool,
     pub check_in_use: bool,
+    pub cargo_lock_timeout_secs: Option<u64>,
+    pub defer_lock_timeouts: bool,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
     pub prune_output: String,
@@ -535,6 +541,8 @@ fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupR
         generated_days: options.generated_days,
         generated_activity_only: options.generated_activity_only,
         check_in_use: options.check_in_use,
+        cargo_lock_timeout_secs: options.cargo_lock_timeout.map(|timeout| timeout.as_secs()),
+        defer_lock_timeouts: options.defer_lock_timeouts,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
         prune_output,
@@ -554,7 +562,7 @@ pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTri
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
     let repositories = repositories
-        .iter()
+        .par_iter()
         .map(|repo| triage(Some(repo), options.clone()))
         .collect::<Result<Vec<_>>>()?;
 
@@ -567,6 +575,15 @@ pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTri
 pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootCleanupRun> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
+    cleanup_repositories(&roots, &repositories, options)
+}
+
+pub fn cleanup_repositories(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    options: CleanupOptions,
+) -> Result<RootCleanupRun> {
+    let roots = canonicalize_roots(roots)?;
     let generated_at = format_system_time(options.now);
     let mode = if options.execute {
         CleanupMode::Execute
@@ -574,7 +591,7 @@ pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootC
         CleanupMode::DryRun
     };
     let repositories = repositories
-        .iter()
+        .par_iter()
         .map(|repo| plan_cleanup(Some(repo), options.clone()))
         .collect::<Result<Vec<_>>>()?;
     let mut manifest = RootCleanupManifest {
@@ -619,6 +636,11 @@ pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
             continue;
         }
 
+        if let Some(discovered) = discover_repositories_with_ripgrep(&root)? {
+            candidates.extend(discovered);
+            continue;
+        }
+
         let mut walker = WalkDir::new(&root)
             .follow_links(false)
             .sort_by_file_name()
@@ -641,8 +663,14 @@ pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
         }
     }
 
-    let mut repositories = BTreeMap::new();
+    let mut hinted_repositories = BTreeMap::new();
     for candidate in candidates {
+        let key = git_common_dir_hint(&candidate).unwrap_or_else(|| candidate.clone());
+        hinted_repositories.entry(key).or_insert(candidate);
+    }
+
+    let mut repositories = BTreeMap::new();
+    for candidate in hinted_repositories.into_values() {
         let common_dir = git_output(
             &candidate,
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -675,6 +703,105 @@ pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut repositories = repositories.into_values().collect::<Vec<_>>();
     repositories.sort();
     Ok(repositories)
+}
+
+fn git_common_dir_hint(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    if dot_git.is_dir() {
+        return fs::canonicalize(dot_git).ok();
+    }
+    let contents = fs::read_to_string(&dot_git).ok()?;
+    let git_dir = contents.trim().strip_prefix("gitdir: ")?;
+    let git_dir = fs::canonicalize(resolve_relative(worktree, Path::new(git_dir))).ok()?;
+    let parent = git_dir.parent()?;
+    if parent.file_name() == Some(OsStr::new("worktrees")) {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        Some(git_dir)
+    }
+}
+
+fn discover_repositories_with_ripgrep(root: &Path) -> Result<Option<Vec<PathBuf>>> {
+    let sibling_rg = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("rg")))
+        .filter(|path| path.is_file());
+    let output = match Command::new(sibling_rg.as_deref().unwrap_or_else(|| Path::new("rg")))
+        .args([
+            "--files",
+            "--hidden",
+            "--no-ignore",
+            "-g",
+            "**/.git",
+            "-g",
+            "**/.git/HEAD",
+            "-g",
+            "!**/node_modules/**",
+            "-g",
+            "!**/target/**",
+            "-g",
+            "!**/.next/**",
+            "-g",
+            "!**/.turbo/**",
+            "-g",
+            "!**/dist/**",
+        ])
+        .arg(root)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to run ripgrep repository discovery"),
+    };
+    if !output.status.success() && output.status.code() != Some(1) {
+        bail!(
+            "ripgrep repository discovery failed under {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut repositories = split_nul_or_line_paths(&output.stdout)
+        .into_iter()
+        .filter_map(|path| {
+            if path.file_name() == Some(OsStr::new("HEAD"))
+                && path.parent()?.file_name() == Some(OsStr::new(".git"))
+            {
+                path.parent()?.parent().map(Path::to_path_buf)
+            } else if path.file_name() == Some(OsStr::new(".git")) {
+                path.parent().map(Path::to_path_buf)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    repositories.sort();
+    repositories.dedup();
+    let mut top_level = Vec::<PathBuf>::new();
+    for repository in repositories {
+        let excluded = repository
+            .ancestors()
+            .take_while(|ancestor| *ancestor != root)
+            .any(skip_repository_discovery_dir);
+        if excluded {
+            continue;
+        }
+        if !top_level
+            .iter()
+            .any(|parent| repository.starts_with(parent))
+        {
+            top_level.push(repository);
+        }
+    }
+    Ok(Some(top_level))
+}
+
+fn split_nul_or_line_paths(output: &[u8]) -> Vec<PathBuf> {
+    output
+        .split(|byte| *byte == b'\0' || *byte == b'\n')
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
+        .collect()
 }
 
 fn canonicalize_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -1147,6 +1274,11 @@ fn scan_generated_dirs_for_worktree(
     let candidates = generated_candidates(worktree, config)?;
     let ignored_paths = git_ignored_paths(&worktree.path, &candidates)?;
     let tracked_paths = git_tracked_paths(&worktree.path, &candidates)?;
+    let open_generated_dirs = if check_in_use {
+        dirs_with_open_handles(candidates.iter().map(|candidate| candidate.path.as_path()))
+    } else {
+        HashSet::new()
+    };
 
     for candidate in candidates {
         let effective_days = config.effective_days(&candidate.name, generated_days);
@@ -1171,7 +1303,7 @@ fn scan_generated_dirs_for_worktree(
             && !worktree_recent
             && !dir_recent
             && !has_tracked_files;
-        let in_use = check_in_use && deletable_so_far && dir_has_open_handles(&candidate.path);
+        let in_use = deletable_so_far && open_generated_dirs.contains(&candidate.path);
         let sweep_strategies = config.sweep_strategies(&candidate.name);
         let active = worktree_recent || dir_recent;
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
@@ -1372,69 +1504,151 @@ fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
 // deep mtime sampling remains the primary guard; this is a second line of
 // defense for long-idle processes that hold handles without writing.
 #[cfg(unix)]
-fn dir_has_open_handles(path: &Path) -> bool {
-    let Some(path_str) = path.to_str() else {
-        return false;
-    };
-
-    let output = Command::new("lsof")
-        .args(["-Fn", "+d", path_str])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+fn dirs_with_open_handles<'a>(paths: impl Iterator<Item = &'a Path>) -> HashSet<PathBuf> {
+    let paths = paths.map(Path::to_path_buf).collect::<Vec<_>>();
+    if paths.is_empty() {
+        return HashSet::new();
+    }
+    let mut command = Command::new("lsof");
+    command.arg("-Fn");
+    for path in &paths {
+        command.arg("+d").arg(path);
+    }
+    let output = command.stdin(Stdio::null()).stderr(Stdio::null()).output();
 
     match output {
         Ok(output) => output
             .stdout
             .split(|byte| *byte == b'\n')
-            .any(|line| line.first() == Some(&b'n')),
-        Err(_) => false,
+            .filter_map(|line| line.strip_prefix(b"n"))
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .filter_map(|open_path| {
+                let open_path = Path::new(open_path);
+                paths
+                    .iter()
+                    .find(|candidate| open_path.starts_with(candidate))
+                    .cloned()
+            })
+            .collect(),
+        Err(_) => HashSet::new(),
     }
 }
 
 #[cfg(not(unix))]
-fn dir_has_open_handles(_path: &Path) -> bool {
-    false
+fn dirs_with_open_handles<'a>(_paths: impl Iterator<Item = &'a Path>) -> HashSet<PathBuf> {
+    HashSet::new()
 }
 
 fn generated_candidates(
     worktree: &WorktreeInfo,
     config: &GeneratedDirConfig,
 ) -> Result<Vec<GeneratedCandidate>> {
-    let mut candidates = Vec::new();
-    let mut walker = WalkDir::new(&worktree.path).follow_links(false).into_iter();
+    let mut paths = Vec::new();
+    paths.extend(git_generated_path_listing(
+        &worktree.path,
+        &["ls-files", "-z", "--cached"],
+        config,
+    )?);
+    paths.extend(git_generated_path_listing(
+        &worktree.path,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+        ],
+        config,
+    )?);
+    paths.extend(git_generated_path_listing(
+        &worktree.path,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+        ],
+        config,
+    )?);
 
-    while let Some(entry) = walker.next() {
-        let entry = entry?;
-        if !entry.file_type().is_dir() || entry.depth() == 0 {
-            continue;
+    let mut candidates = BTreeMap::new();
+    for listed in paths {
+        let listed = Path::new(&listed);
+        let mut relative = PathBuf::new();
+        for component in listed.components() {
+            relative.push(component.as_os_str());
+            let name = component.as_os_str().to_string_lossy();
+            let Some(action) = config.candidate_action(&name) else {
+                continue;
+            };
+            let path = worktree.path.join(&relative);
+            let is_real_dir = fs::symlink_metadata(&path)
+                .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_real_dir {
+                candidates
+                    .entry(relative.clone())
+                    .or_insert_with(|| GeneratedCandidate {
+                        path,
+                        relative: relative.clone(),
+                        name: name.into_owned(),
+                        action,
+                    });
+            }
+            break;
         }
-
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
-            walker.skip_current_dir();
-            continue;
-        }
-
-        let Some(action) = config.candidate_action(&name) else {
-            continue;
-        };
-
-        walker.skip_current_dir();
-        let path = entry.path().to_path_buf();
-        let relative = path
-            .strip_prefix(&worktree.path)
-            .context("generated path was outside worktree")?
-            .to_path_buf();
-        candidates.push(GeneratedCandidate {
-            path,
-            relative,
-            name,
-            action,
-        });
     }
 
-    Ok(candidates)
+    Ok(candidates.into_values().collect())
+}
+
+fn git_generated_path_listing(
+    worktree: &Path,
+    args: &[&str],
+    config: &GeneratedDirConfig,
+) -> Result<Vec<String>> {
+    let mut command = Command::new("git");
+    command.args(args).arg("--");
+    for name in config
+        .delete_names
+        .iter()
+        .chain(&config.report_only_names)
+        .chain(
+            config
+                .sweep_strategies
+                .iter()
+                .map(|strategy| &strategy.name),
+        )
+    {
+        command.arg(format!(":(glob)**/{}/**", git_glob_escape(name)));
+    }
+    let output = command
+        .current_dir(worktree)
+        .output()
+        .with_context(|| format!("failed to list Git paths in {}", worktree.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git path listing failed in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(split_nul_strings(&output.stdout))
+}
+
+fn git_glob_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '*' | '?' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn plan_worktree_cleanup(
@@ -1578,13 +1792,57 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
             manifest.generated_at.replace([':', '.'], "-"),
             std::process::id()
         );
-        run_sweeps(decision, &run_id)?;
+        if let Err(error) = run_sweeps(
+            decision,
+            &run_id,
+            manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
+        ) {
+            if manifest.defer_lock_timeouts && is_cargo_lock_timeout(&error) {
+                write_deferred_sweep(decision, &run_id, &error)?;
+                eprintln!(
+                    "  deferred {} until a later run: {error:#}",
+                    decision.path.display()
+                );
+                continue;
+            }
+            return Err(error);
+        }
     }
 
     Ok(())
 }
 
-fn run_sweeps(decision: &GeneratedDirDecision, run_id: &str) -> Result<()> {
+fn write_deferred_sweep(
+    decision: &GeneratedDirDecision,
+    run_id: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .context("neither XDG_STATE_HOME nor HOME is set")?;
+    let inbox = state_home.join("worktree-gc/inbox");
+    fs::create_dir_all(&inbox)?;
+    let mut hasher = DefaultHasher::new();
+    decision.path.hash(&mut hasher);
+    let path = inbox.join(format!("{run_id}-{:016x}.json", hasher.finish()));
+    let event = serde_json::json!({
+        "manifest_version": MANIFEST_VERSION,
+        "kind": "cargo_lock_timeout",
+        "deferred_at": run_id,
+        "path": decision.path,
+        "worktree_path": decision.worktree_path,
+        "reason": format!("{error:#}"),
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&event)?)?;
+    Ok(())
+}
+
+fn run_sweeps(
+    decision: &GeneratedDirDecision,
+    run_id: &str,
+    cargo_lock_timeout: Option<Duration>,
+) -> Result<()> {
     for sweep in &decision.sweeps {
         match sweep.tool {
             SweepTool::RustcIncremental => {
@@ -1592,7 +1850,12 @@ fn run_sweeps(decision: &GeneratedDirDecision, run_id: &str) -> Result<()> {
                     .limit
                     .age_days()
                     .context("rustc-incremental requires an age-days limit")?;
-                execute_incremental_sweep(&sweep.candidates, days, run_id)?;
+                execute_incremental_sweep_with_timeout(
+                    &sweep.candidates,
+                    days,
+                    run_id,
+                    cargo_lock_timeout,
+                )?;
             }
             // External cargo-sweep failures remain non-fatal so the rest of
             // the planned cleanup can continue.
@@ -1606,8 +1869,11 @@ fn run_sweeps(decision: &GeneratedDirDecision, run_id: &str) -> Result<()> {
                     .project_dir
                     .as_deref()
                     .unwrap_or(&decision.worktree_path);
-                let result =
-                    with_cargo_profile_locks(&decision.path, &decision.worktree_path, || {
+                let result = with_cargo_profile_locks_timeout(
+                    &decision.path,
+                    &decision.worktree_path,
+                    cargo_lock_timeout,
+                    || {
                         let mut command = Command::new("cargo");
                         command.arg("sweep");
                         match sweep.limit {
@@ -1623,7 +1889,8 @@ fn run_sweeps(decision: &GeneratedDirDecision, run_id: &str) -> Result<()> {
                             .current_dir(&decision.worktree_path)
                             .stdin(Stdio::null())
                             .output()
-                    });
+                    },
+                );
                 match result {
                     Ok(Ok(output)) if output.status.success() => {
                         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2377,6 +2644,8 @@ mod tests {
                 generated_activity_only: false,
                 check_in_use: false,
                 generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
                 now: now(),
             },
         )?;
@@ -2431,6 +2700,8 @@ mod tests {
                         limit: SweepLimit::AgeDays { days: 14 },
                     }],
                 ),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
                 now: now(),
             },
         )?;
@@ -2743,7 +3014,10 @@ mod tests {
         add_worktree(&repo, &worktree, "in-use-branch")?;
         fs::create_dir_all(worktree.join("node_modules"))?;
         fs::write(worktree.join("node_modules/.lock"), "held\n")?;
+        fs::create_dir_all(worktree.join(".next"))?;
+        fs::write(worktree.join(".next/cache"), "idle\n")?;
         let expected = fs::canonicalize(worktree.join("node_modules"))?;
+        let idle = fs::canonicalize(worktree.join(".next"))?;
 
         // Simulate a package manager holding its lockfile: real mtimes are
         // far older than the fixed test clock, so without the handle probe
@@ -2770,6 +3044,13 @@ mod tests {
 
         assert_eq!(dir.action, GeneratedDirAction::Skip);
         assert!(dir.in_use);
+        let idle = report
+            .generated_dirs
+            .iter()
+            .find(|dir| dir.path == idle)
+            .context("missing idle .next entry")?;
+        assert_eq!(idle.action, GeneratedDirAction::Delete);
+        assert!(!idle.in_use);
         Ok(())
     }
 
@@ -2786,6 +3067,8 @@ mod tests {
             generated_activity_only: false,
             check_in_use: false,
             generated_config: GeneratedDirConfig::default(),
+            cargo_lock_timeout: None,
+            defer_lock_timeouts: false,
             now: now(),
         };
         let run = cleanup(Some(&repo), options)?;
@@ -2833,6 +3116,8 @@ mod tests {
             generated_activity_only: false,
             check_in_use: false,
             generated_config: GeneratedDirConfig::default(),
+            cargo_lock_timeout: None,
+            defer_lock_timeouts: false,
             now: now(),
         };
         cleanup(Some(&repo), options)?;
@@ -2868,6 +3153,8 @@ mod tests {
             generated_activity_only: false,
             check_in_use: false,
             generated_config: GeneratedDirConfig::default(),
+            cargo_lock_timeout: None,
+            defer_lock_timeouts: false,
             now: now(),
         };
         cleanup(Some(&repo), options)?;
@@ -2927,6 +3214,8 @@ mod tests {
             generated_activity_only: true,
             check_in_use: false,
             generated_config: GeneratedDirConfig::default(),
+            cargo_lock_timeout: None,
+            defer_lock_timeouts: false,
             now: now(),
         };
         cleanup(Some(&repo), options)?;
