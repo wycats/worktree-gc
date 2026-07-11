@@ -1500,38 +1500,76 @@ fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
 // too slow for multi-gigabyte caches, so this probes the directory and its
 // immediate children (`+d`). That catches the common live-dev-server shapes
 // (a held lockfile, trace file, or cache subdirectory handle) without the
-// full walk. Errors and unsupported platforms degrade to "not in use" —
-// deep mtime sampling remains the primary guard; this is a second line of
-// defense for long-idle processes that hold handles without writing.
+// full walk. Candidate sets are chunked below the OS argument limit. A failed
+// batch retries one directory at a time and keeps any individually unprobeable
+// directory protected; an unavailable lsof still degrades to mtime-only
+// judgment on supported platforms.
 #[cfg(unix)]
 fn dirs_with_open_handles<'a>(paths: impl Iterator<Item = &'a Path>) -> HashSet<PathBuf> {
+    const LSOF_PATH_CHUNK_SIZE: usize = 64;
+
     let paths = paths.map(Path::to_path_buf).collect::<Vec<_>>();
     if paths.is_empty() {
         return HashSet::new();
     }
+    let mut open = HashSet::new();
+    for chunk in paths.chunks(LSOF_PATH_CHUNK_SIZE) {
+        match probe_open_handles(chunk) {
+            Ok(found) => open.extend(found),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return HashSet::new(),
+            Err(error) => {
+                eprintln!(
+                    "warning: batched lsof probe failed ({error}); retrying {} paths individually",
+                    chunk.len()
+                );
+                for path in chunk {
+                    match probe_open_handles(std::slice::from_ref(path)) {
+                        Ok(found) => open.extend(found),
+                        Err(individual_error)
+                            if individual_error.kind() == io::ErrorKind::NotFound =>
+                        {
+                            return HashSet::new();
+                        }
+                        Err(individual_error) => {
+                            eprintln!(
+                                "warning: lsof probe failed for {}; keeping it protected: {individual_error}",
+                                path.display()
+                            );
+                            open.insert(path.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    open
+}
+
+#[cfg(unix)]
+fn probe_open_handles(paths: &[PathBuf]) -> io::Result<HashSet<PathBuf>> {
     let mut command = Command::new("lsof");
     command.arg("-Fn");
-    for path in &paths {
+    for path in paths {
         command.arg("+d").arg(path);
     }
-    let output = command.stdin(Stdio::null()).stderr(Stdio::null()).output();
+    let output = command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
 
-    match output {
-        Ok(output) => output
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| line.strip_prefix(b"n"))
-            .filter_map(|line| std::str::from_utf8(line).ok())
-            .filter_map(|open_path| {
-                let open_path = Path::new(open_path);
-                paths
-                    .iter()
-                    .find(|candidate| open_path.starts_with(candidate))
-                    .cloned()
-            })
-            .collect(),
-        Err(_) => HashSet::new(),
-    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(b"n"))
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .filter_map(|open_path| {
+            let open_path = Path::new(open_path);
+            paths
+                .iter()
+                .find(|candidate| open_path.starts_with(candidate))
+                .cloned()
+        })
+        .collect())
 }
 
 #[cfg(not(unix))]
@@ -1913,6 +1951,7 @@ fn run_sweeps(
                     Ok(Err(error)) => {
                         eprintln!("  sweep failed to launch: {error}");
                     }
+                    Err(error) if is_cargo_lock_timeout(&error) => return Err(error),
                     Err(error) => eprintln!("  sweep skipped: {error:#}"),
                 }
             }
@@ -3051,6 +3090,88 @@ mod tests {
             .context("missing idle .next entry")?;
         assert_eq!(idle.action, GeneratedDirAction::Delete);
         assert!(!idle.in_use);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_handle_probe_chunks_large_candidate_sets() -> Result<()> {
+        if Command::new("lsof")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: lsof unavailable");
+            return Ok(());
+        }
+
+        let temp = TempDir::new()?;
+        let mut paths = Vec::new();
+        for index in 0..129 {
+            let path = temp.path().join(format!("candidate-{index}"));
+            fs::create_dir(&path)?;
+            paths.push(fs::canonicalize(path)?);
+        }
+        let held_path = paths.last().context("missing final candidate")?;
+        fs::write(held_path.join("held.lock"), "held")?;
+        let _held = fs::File::open(held_path.join("held.lock"))?;
+
+        let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path));
+        assert!(open.contains(held_path));
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_sweep_lock_timeouts_propagate_for_scheduled_deferral() -> Result<()> {
+        let temp = TempDir::new()?;
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let profile = repo.join("target/debug");
+        fs::create_dir_all(profile.join("incremental"))?;
+        let lock_path = profile.join(".cargo-lock");
+        fs::write(&lock_path, "")?;
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        held.lock()?;
+
+        let target = fs::canonicalize(repo.join("target"))?;
+        let repo = fs::canonicalize(repo)?;
+        let decision = GeneratedDirDecision {
+            path: target,
+            worktree_path: repo.clone(),
+            name: "target".to_string(),
+            mtime: None,
+            effective_days: 3,
+            in_use: false,
+            sweeps: vec![SweepDecision {
+                tool: SweepTool::CargoSweep,
+                limit: SweepLimit::MaxSize { bytes: 1_000_000 },
+                delegated: true,
+                project_dir: Some(repo),
+                reason: "test delegated sweep".to_string(),
+                candidates: Vec::new(),
+            }],
+            action: GeneratedDirAction::Sweep,
+            reason: "test sweep".to_string(),
+        };
+
+        let error = run_sweeps(
+            &decision,
+            "cargo-sweep-timeout-test",
+            Some(Duration::from_millis(20)),
+        )
+        .expect_err("cargo-sweep coordination timeout should propagate");
+        assert!(is_cargo_lock_timeout(&error));
+        held.unlock()?;
         Ok(())
     }
 

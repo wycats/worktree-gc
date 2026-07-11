@@ -389,18 +389,26 @@ fn scheduled_repositories(
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if !force_refresh && index_path.exists() {
-        let index: RepositoryIndex = serde_json::from_slice(&std::fs::read(&index_path)?)?;
-        let fresh =
-            now_unix.saturating_sub(index.generated_at_unix) < refresh_days.saturating_mul(86_400);
-        if fresh
-            && index.roots == canonical_roots
-            && index
-                .repositories
-                .iter()
-                .all(|repository| repository.exists())
-        {
-            return Ok(index.repositories);
+    if !force_refresh {
+        match read_repository_index(&index_path) {
+            Ok(Some(index)) => {
+                let fresh = now_unix.saturating_sub(index.generated_at_unix)
+                    < refresh_days.saturating_mul(86_400);
+                if fresh
+                    && index.roots == canonical_roots
+                    && index
+                        .repositories
+                        .iter()
+                        .all(|repository| repository.is_dir() && is_git_repository(repository))
+                {
+                    return Ok(index.repositories);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "warning: ignoring unreadable repository index {}: {error:#}",
+                index_path.display()
+            ),
         }
     }
 
@@ -410,11 +418,47 @@ fn scheduled_repositories(
         roots: canonical_roots,
         repositories: repositories.clone(),
     };
-    if let Some(parent) = index_path.parent() {
+    write_repository_index(&index_path, &index)?;
+    Ok(repositories)
+}
+
+fn read_repository_index(path: &std::path::Path) -> Result<Option<RepositoryIndex>> {
+    match std::fs::read(path) {
+        Ok(contents) => Ok(Some(serde_json::from_slice(&contents)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_repository_index(path: &std::path::Path, index: &RepositoryIndex) -> Result<()> {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
-    Ok(repositories)
+    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        std::fs::write(&temp, serde_json::to_vec_pretty(index)?)?;
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn is_git_repository(path: &std::path::Path) -> bool {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && std::fs::canonicalize(path).ok()
+            == std::fs::canonicalize(String::from_utf8_lossy(&output.stdout).trim()).ok()
 }
 
 fn print_inbox(limit: usize) -> Result<()> {
@@ -423,7 +467,9 @@ fn print_inbox(limit: usize) -> Result<()> {
         if printed >= limit {
             break;
         }
-        let event: serde_json::Value = serde_json::from_slice(&std::fs::read(&event_path)?)?;
+        let Some(event) = read_json_record(&event_path, "inbox event") else {
+            continue;
+        };
         println!(
             "- deferred: {} ({})",
             event["path"].as_str().unwrap_or("<unknown>"),
@@ -431,13 +477,15 @@ fn print_inbox(limit: usize) -> Result<()> {
         );
         printed += 1;
     }
-    let Some(path) = config::history_files()?.into_iter().next() else {
+    let Some((path, value)) = config::history_files()?
+        .into_iter()
+        .find_map(|path| read_json_record(&path, "run manifest").map(|value| (path, value)))
+    else {
         if printed == 0 {
             println!("inbox is empty: no scheduled run records found");
         }
         return Ok(());
     };
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
     let mut entries = Vec::new();
     if let Some(repositories) = value["repositories"].as_array() {
         for repository in repositories {
@@ -447,7 +495,10 @@ fn print_inbox(limit: usize) -> Result<()> {
                 for worktree in worktrees {
                     let dirty = worktree["dirty_count"].as_u64().unwrap_or_default();
                     let age = worktree["activity_age_days"].as_u64().unwrap_or_default();
-                    if worktree["action"] == "keep" && dirty > 0 && age >= stale_days {
+                    if worktree.get("action").and_then(|value| value.as_str()) == Some("keep")
+                        && dirty > 0
+                        && age >= stale_days
+                    {
                         entries.push(format!(
                             "worktree: {} (dirty files: {dirty}, inactive: {age} days)",
                             worktree["path"].as_str().unwrap_or("<unknown>")
@@ -457,11 +508,14 @@ fn print_inbox(limit: usize) -> Result<()> {
             }
             if let Some(dirs) = manifest["generated_dirs"].as_array() {
                 for dir in dirs {
-                    let protected = dir["in_use"] == true
+                    let protected = dir.get("in_use").and_then(|value| value.as_bool())
+                        == Some(true)
                         || dir["reason"]
                             .as_str()
                             .is_some_and(|reason| reason.contains("tracked files"));
-                    if dir["action"] == "skip" && protected {
+                    if dir.get("action").and_then(|value| value.as_str()) == Some("skip")
+                        && protected
+                    {
                         entries.push(format!(
                             "generated: {} ({})",
                             dir["path"].as_str().unwrap_or("<unknown>"),
@@ -479,9 +533,27 @@ fn print_inbox(limit: usize) -> Result<()> {
     Ok(())
 }
 
+fn read_json_record(path: &std::path::Path, kind: &str) -> Option<serde_json::Value> {
+    match std::fs::read(path)
+        .map_err(anyhow::Error::from)
+        .and_then(|contents| serde_json::from_slice(&contents).map_err(anyhow::Error::from))
+    {
+        Ok(value) => Some(value),
+        Err(error) => {
+            eprintln!(
+                "warning: skipping malformed {kind} {}: {error:#}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
+    use tempfile::TempDir;
 
     fn cleanup_config(args: &[&str]) -> GeneratedDirConfig {
         let cli = Cli::try_parse_from(
@@ -582,5 +654,48 @@ mod tests {
             "cleanup",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn repository_index_is_atomic_and_validates_git_repositories() -> Result<()> {
+        let temp = TempDir::new()?;
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo)?;
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .status()?;
+        assert!(status.success());
+        let index_path = temp.path().join("state/repositories.json");
+        let index = RepositoryIndex {
+            generated_at_unix: 42,
+            roots: vec![temp.path().to_path_buf()],
+            repositories: vec![repo.clone()],
+        };
+
+        write_repository_index(&index_path, &index)?;
+        write_repository_index(&index_path, &index)?;
+        let loaded = read_repository_index(&index_path)?.context("missing index")?;
+        assert_eq!(loaded.generated_at_unix, 42);
+        assert!(is_git_repository(&repo));
+        assert!(!is_git_repository(temp.path()));
+        let nested = repo.join("nested");
+        std::fs::create_dir(&nested)?;
+        assert!(!is_git_repository(&nested));
+        assert!(!index_path
+            .with_extension(format!("json.{}.tmp", std::process::id()))
+            .exists());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_state_records_are_skipped() -> Result<()> {
+        let temp = TempDir::new()?;
+        let record = temp.path().join("truncated.json");
+        std::fs::write(&record, b"{\"path\":")?;
+
+        assert!(read_repository_index(&record).is_err());
+        assert!(read_json_record(&record, "test record").is_none());
+        Ok(())
     }
 }
