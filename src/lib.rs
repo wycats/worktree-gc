@@ -1617,6 +1617,7 @@ fn generated_candidates(
     for listed in paths {
         let listed = Path::new(&listed);
         let mut relative = PathBuf::new();
+        let mut matched = false;
         for component in listed.components() {
             relative.push(component.as_os_str());
             let name = component.as_os_str().to_string_lossy();
@@ -1637,11 +1638,77 @@ fn generated_candidates(
                         action,
                     });
             }
+            matched = true;
             break;
+        }
+        if !matched {
+            discover_generated_descendants(&worktree.path, listed, config, &mut candidates)?;
         }
     }
 
     Ok(candidates.into_values().collect())
+}
+
+fn discover_generated_descendants(
+    worktree: &Path,
+    listed: &Path,
+    config: &GeneratedDirConfig,
+    candidates: &mut BTreeMap<PathBuf, GeneratedCandidate>,
+) -> Result<()> {
+    let root = worktree.join(listed);
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+
+    let mut stack = vec![(root, listed.to_path_buf())];
+    while let Some((directory, relative)) = stack.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect ignored directory {}",
+                        directory.display()
+                    )
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".git" {
+                continue;
+            }
+            let child_relative = relative.join(entry.file_name());
+            if let Some(action) = config.candidate_action(&name) {
+                candidates
+                    .entry(child_relative.clone())
+                    .or_insert_with(|| GeneratedCandidate {
+                        path: entry.path(),
+                        relative: child_relative,
+                        name,
+                        action,
+                    });
+            } else {
+                stack.push((entry.path(), child_relative));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn git_generated_path_listing(
@@ -2972,6 +3039,38 @@ mod tests {
             .find(|sweep| sweep.tool == SweepTool::CargoSweep)
             .context("missing cargo-sweep decision")?;
         assert_eq!(sweep.project_dir, Some(fs::canonicalize(repo)?));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_dirs_under_collapsed_ignored_ancestors_are_discovered() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::write(repo.join(".gitignore"), "build/\n")?;
+        fs::create_dir_all(repo.join("build/node_modules/pkg"))?;
+        fs::write(
+            repo.join("build/node_modules/pkg/index.js"),
+            "module.exports = 1\n",
+        )?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        let expected = fs::canonicalize(repo.join("build/node_modules"))?;
+        let decision = report
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == expected)
+            .context("missing node_modules below ignored build ancestor")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
         Ok(())
     }
 

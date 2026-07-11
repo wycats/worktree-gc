@@ -349,9 +349,11 @@ fn main() -> Result<()> {
             )?;
             let run = cleanup_repositories(&scheduled.roots, &repositories, options)?;
             print_root_cleanup(&run);
-            let removed = config::prune_history(scheduled.history.retention_days, now)?;
-            if removed > 0 {
-                eprintln!("pruned {removed} expired run manifests");
+            if !dry_run {
+                let removed = config::prune_history(scheduled.history.retention_days, now)?;
+                if removed > 0 {
+                    eprintln!("pruned {removed} expired run manifests");
+                }
             }
         }
         Command::History { limit } => {
