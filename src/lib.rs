@@ -1674,17 +1674,8 @@ fn discover_generated_descendants(
 
     let mut stack = vec![(root, listed.to_path_buf())];
     while let Some((directory, relative)) = stack.pop() {
-        match fs::symlink_metadata(directory.join(".git")) {
-            Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to inspect repository boundary in {}",
-                        directory.display()
-                    )
-                });
-            }
+        if is_repository_boundary(&directory)? {
+            continue;
         }
 
         let entries = match fs::read_dir(&directory) {
@@ -1709,6 +1700,9 @@ fn discover_generated_descendants(
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 continue;
             }
+            if is_repository_boundary(&entry.path())? {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             if name == ".git" {
                 continue;
@@ -1729,6 +1723,19 @@ fn discover_generated_descendants(
         }
     }
     Ok(())
+}
+
+fn is_repository_boundary(directory: &Path) -> Result<bool> {
+    match fs::symlink_metadata(directory.join(".git")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect repository boundary in {}",
+                directory.display()
+            )
+        }),
+    }
 }
 
 fn git_generated_path_listing(
@@ -1852,6 +1859,11 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
         .iter()
         .filter(|decision| decision.action == GeneratedDirAction::Sweep)
         .collect::<Vec<_>>();
+    let run_id = format!(
+        "{}-{}",
+        manifest.generated_at.replace([':', '.'], "-"),
+        std::process::id()
+    );
 
     eprintln!(
         "executing cleanup: {} worktrees, {} generated dirs, {} sweeps",
@@ -1898,9 +1910,19 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
             continue;
         }
 
-        if decision.path.exists() {
-            fs::remove_dir_all(&decision.path)
-                .with_context(|| format!("failed to remove {}", decision.path.display()))?;
+        if let Err(error) = remove_generated_directory(
+            decision,
+            manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
+        ) {
+            if manifest.defer_lock_timeouts && is_cargo_lock_timeout(&error) {
+                write_deferred_cargo_action(decision, &run_id, &error)?;
+                eprintln!(
+                    "  deferred {} until a later run: {error:#}",
+                    decision.path.display()
+                );
+                continue;
+            }
+            return Err(error);
         }
     }
 
@@ -1912,18 +1934,13 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
             decision.path.display()
         );
         flush_stderr();
-        let run_id = format!(
-            "{}-{}",
-            manifest.generated_at.replace([':', '.'], "-"),
-            std::process::id()
-        );
         if let Err(error) = run_sweeps(
             decision,
             &run_id,
             manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
         ) {
             if manifest.defer_lock_timeouts && is_cargo_lock_timeout(&error) {
-                write_deferred_sweep(decision, &run_id, &error)?;
+                write_deferred_cargo_action(decision, &run_id, &error)?;
                 eprintln!(
                     "  deferred {} until a later run: {error:#}",
                     decision.path.display()
@@ -1937,7 +1954,29 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
     Ok(())
 }
 
-fn write_deferred_sweep(
+fn remove_generated_directory(
+    decision: &GeneratedDirDecision,
+    cargo_lock_timeout: Option<Duration>,
+) -> Result<()> {
+    if !decision.path.exists() {
+        return Ok(());
+    }
+
+    let remove = || fs::remove_dir_all(&decision.path);
+    if decision.name == "target" && cargo_lock_timeout.is_some() {
+        with_cargo_profile_locks_timeout(
+            &decision.path,
+            &decision.worktree_path,
+            cargo_lock_timeout,
+            remove,
+        )??;
+    } else {
+        remove()?;
+    }
+    Ok(())
+}
+
+fn write_deferred_cargo_action(
     decision: &GeneratedDirDecision,
     run_id: &str,
     error: &anyhow::Error,
@@ -3141,6 +3180,14 @@ mod tests {
         git_output(&nested, ["init"])?;
         fs::write(nested.join("node_modules/pkg/index.js"), "inner\n")?;
 
+        let generated_repository = repo.join("build/vendor/node_modules");
+        fs::create_dir_all(&generated_repository)?;
+        git_output(&generated_repository, ["init"])?;
+        fs::write(
+            generated_repository.join("README.md"),
+            "nested repository\n",
+        )?;
+
         let report = triage(
             Some(&repo),
             TriageOptions {
@@ -3155,6 +3202,7 @@ mod tests {
 
         let outer = fs::canonicalize(repo.join("build/node_modules"))?;
         let nested = fs::canonicalize(nested)?;
+        let generated_repository = fs::canonicalize(generated_repository)?;
         assert!(report
             .generated_dirs
             .iter()
@@ -3163,6 +3211,54 @@ mod tests {
             .generated_dirs
             .iter()
             .all(|decision| !decision.path.starts_with(&nested)));
+        assert!(report
+            .generated_dirs
+            .iter()
+            .all(|decision| !decision.path.starts_with(&generated_repository)));
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_target_deletion_waits_for_cargo_profile_locks() -> Result<()> {
+        let temp = TempDir::new()?;
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let profile = repo.join("target/debug");
+        fs::create_dir_all(&profile)?;
+        fs::write(profile.join("artifact"), "stale")?;
+        let lock_path = profile.join(".cargo-lock");
+        fs::write(&lock_path, "")?;
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        held.lock()?;
+
+        let decision = GeneratedDirDecision {
+            path: fs::canonicalize(repo.join("target"))?,
+            worktree_path: fs::canonicalize(&repo)?,
+            name: "target".to_string(),
+            mtime: None,
+            effective_days: 3,
+            in_use: false,
+            sweeps: Vec::new(),
+            action: GeneratedDirAction::Delete,
+            reason: "stale target".to_string(),
+        };
+
+        let error = remove_generated_directory(&decision, Some(Duration::from_millis(20)))
+            .expect_err("contended target deletion should time out");
+        assert!(is_cargo_lock_timeout(&error));
+        assert!(decision.path.exists());
+
+        held.unlock()?;
+        remove_generated_directory(&decision, Some(Duration::from_secs(1)))?;
+        assert!(!decision.path.exists());
         Ok(())
     }
 

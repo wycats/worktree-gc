@@ -439,13 +439,28 @@ fn write_repository_index(path: &std::path::Path, index: &RepositoryIndex) -> Re
     let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let result = (|| -> Result<()> {
         std::fs::write(&temp, serde_json::to_vec_pretty(index)?)?;
-        std::fs::rename(&temp, path)?;
+        replace_repository_index(&temp, path)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn replace_repository_index(temp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(temp, path)
+}
+
+#[cfg(windows)]
+fn replace_repository_index(temp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::rename(temp, path)
 }
 
 fn is_git_repository(path: &std::path::Path) -> bool {
