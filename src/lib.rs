@@ -1554,12 +1554,13 @@ fn probe_open_handles(paths: &[PathBuf]) -> io::Result<HashSet<PathBuf>> {
     }
     let output = command.stdin(Stdio::null()).output()?;
 
-    if !output.status.success() && (output.status.code() != Some(1) || !output.stderr.is_empty()) {
-        return Err(io::Error::other(format!(
-            "lsof exited with {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    if let Some(error) = lsof_probe_error(
+        output.status.success(),
+        output.status.code(),
+        &output.stderr,
+        paths,
+    ) {
+        return Err(error);
     }
 
     Ok(output
@@ -1575,6 +1576,32 @@ fn probe_open_handles(paths: &[PathBuf]) -> io::Result<HashSet<PathBuf>> {
                 .cloned()
         })
         .collect())
+}
+
+#[cfg(unix)]
+fn lsof_probe_error(
+    success: bool,
+    status_code: Option<i32>,
+    stderr: &[u8],
+    paths: &[PathBuf],
+) -> Option<io::Error> {
+    if success {
+        return None;
+    }
+
+    let stderr = String::from_utf8_lossy(stderr);
+    let failed_path = paths.iter().any(|path| {
+        let path = path.to_string_lossy();
+        !path.is_empty() && stderr.contains(path.as_ref())
+    });
+    if status_code == Some(1) && !failed_path {
+        return None;
+    }
+
+    Some(io::Error::other(format!(
+        "lsof exited with {status_code:?}: {}",
+        stderr.trim()
+    )))
 }
 
 #[cfg(not(unix))]
@@ -3495,6 +3522,26 @@ mod tests {
         let error = probe_open_handles(&[missing]).expect_err("missing path should fail lsof");
         assert!(error.to_string().contains("lsof exited"));
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_lsof_warnings_do_not_fail_a_no_match_probe() {
+        let candidate = PathBuf::from("/tmp/worktree-gc-candidate");
+        assert!(lsof_probe_error(
+            false,
+            Some(1),
+            b"lsof: WARNING: can't stat() fuse mount /unrelated\n",
+            std::slice::from_ref(&candidate),
+        )
+        .is_none());
+        assert!(lsof_probe_error(
+            false,
+            Some(1),
+            b"lsof: WARNING: can't stat /tmp/worktree-gc-candidate\n",
+            std::slice::from_ref(&candidate),
+        )
+        .is_some());
     }
 
     #[test]
