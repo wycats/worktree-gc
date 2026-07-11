@@ -308,10 +308,20 @@ pub(crate) fn plan_incremental_sweep(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn execute_incremental_sweep(
     candidates: &[SweepCandidateDecision],
     days: u64,
     run_id: &str,
+) -> Result<()> {
+    execute_incremental_sweep_with_timeout(candidates, days, run_id, None)
+}
+
+pub(crate) fn execute_incremental_sweep_with_timeout(
+    candidates: &[SweepCandidateDecision],
+    days: u64,
+    run_id: &str,
+    lock_timeout: Option<Duration>,
 ) -> Result<()> {
     let mut groups: BTreeMap<(PathBuf, PathBuf), Vec<&SweepCandidateDecision>> = BTreeMap::new();
     for candidate in candidates {
@@ -333,7 +343,7 @@ pub(crate) fn execute_incremental_sweep(
         if !incremental_dir.exists() {
             continue;
         }
-        let lock = wait_for_profile_lock(&lock_path)?;
+        let lock = wait_for_profile_lock(&lock_path, lock_timeout)?;
         if !validate_planned_incremental_dir(&incremental_dir)? {
             continue;
         }
@@ -442,14 +452,24 @@ pub(crate) fn execute_incremental_sweep(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn with_cargo_profile_locks<T>(
     target_dir: &Path,
     worktree: &Path,
     action: impl FnOnce() -> T,
 ) -> Result<T> {
+    with_cargo_profile_locks_timeout(target_dir, worktree, None, action)
+}
+
+pub(crate) fn with_cargo_profile_locks_timeout<T>(
+    target_dir: &Path,
+    worktree: &Path,
+    lock_timeout: Option<Duration>,
+    action: impl FnOnce() -> T,
+) -> Result<T> {
     loop {
         let lock_paths = cargo_profile_lock_paths(target_dir, worktree)?;
-        let locks = wait_for_profile_locks(&lock_paths)?;
+        let locks = wait_for_profile_locks(&lock_paths, lock_timeout)?;
         let refreshed_lock_paths = cargo_profile_lock_paths(target_dir, worktree)?;
         if refreshed_lock_paths != lock_paths {
             eprintln!("  Cargo profile set changed while locking; retrying sweep coordination");
@@ -460,6 +480,28 @@ pub(crate) fn with_cargo_profile_locks<T>(
         drop(locks);
         return Ok(result);
     }
+}
+
+pub(crate) fn cargo_profile_locks_present(target_dir: &Path) -> Result<bool> {
+    for entry in WalkDir::new(target_dir)
+        .follow_links(false)
+        .min_depth(2)
+        .max_depth(3)
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to inspect Cargo profile locks under {}",
+                target_dir.display()
+            )
+        })?;
+        if entry.file_name() == ".cargo-lock"
+            && !entry.file_type().is_symlink()
+            && entry.file_type().is_file()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn cargo_profile_lock_paths(target_dir: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
@@ -550,7 +592,10 @@ fn cargo_profile_lock_paths(target_dir: &Path, worktree: &Path) -> Result<Vec<Pa
     Ok(lock_paths.into_iter().collect())
 }
 
-fn wait_for_profile_locks(lock_paths: &[PathBuf]) -> Result<Vec<File>> {
+fn wait_for_profile_locks(
+    lock_paths: &[PathBuf],
+    lock_timeout: Option<Duration>,
+) -> Result<Vec<File>> {
     let started = Instant::now();
     let mut backoff = Duration::from_millis(100);
     let mut next_progress = Duration::ZERO;
@@ -585,6 +630,7 @@ fn wait_for_profile_locks(lock_paths: &[PathBuf]) -> Result<Vec<File>> {
 
         if let Some(lock_path) = contended {
             drop(locks);
+            check_lock_timeout(started, lock_timeout, lock_path)?;
             if started.elapsed() >= next_progress {
                 eprintln!(
                     "  waiting for Cargo build locks; contended at {} ({:.0}s)",
@@ -638,7 +684,7 @@ fn validate_planned_incremental_dir(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn wait_for_profile_lock(lock_path: &Path) -> Result<File> {
+fn wait_for_profile_lock(lock_path: &Path, lock_timeout: Option<Duration>) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -652,6 +698,7 @@ fn wait_for_profile_lock(lock_path: &Path) -> Result<File> {
         match file.try_lock() {
             Ok(()) => return Ok(file),
             Err(TryLockError::WouldBlock) => {
+                check_lock_timeout(started, lock_timeout, lock_path)?;
                 if started.elapsed() >= next_progress {
                     eprintln!(
                         "  waiting for Cargo build lock {} ({:.0}s)",
@@ -674,6 +721,32 @@ fn wait_for_profile_lock(lock_path: &Path) -> Result<File> {
             }
         }
     }
+}
+
+fn check_lock_timeout(
+    started: Instant,
+    lock_timeout: Option<Duration>,
+    lock_path: &Path,
+) -> Result<()> {
+    if lock_timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "timed out waiting for Cargo build lock {}",
+                lock_path.display()
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub(crate) fn is_cargo_lock_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+    })
 }
 
 fn nearest_manifest(target_dir: &Path, worktree: &Path) -> Option<PathBuf> {
@@ -1081,6 +1154,21 @@ mod tests {
 
         handle.join().expect("sweep thread panicked")?;
         assert!(root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_lock_waits_time_out() -> Result<()> {
+        let temp = TempDir::new()?;
+        let lock_path = temp.path().join(".cargo-lock");
+        fs::write(&lock_path, "")?;
+        let held = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+        held.lock()?;
+
+        let error = wait_for_profile_lock(&lock_path, Some(Duration::from_millis(20)))
+            .expect_err("contended scheduled lock should time out");
+        assert!(is_cargo_lock_timeout(&error));
+        held.unlock()?;
         Ok(())
     }
 

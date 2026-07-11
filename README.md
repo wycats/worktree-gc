@@ -151,6 +151,60 @@ Or start from an empty generated-directory policy:
 cargo run -- triage --repo /path/to/repo --no-default-generated --delete-generated coverage
 ```
 
+## Scheduled cleanup
+
+`worktree-gc scheduled` reads its roots and cleanup policy from
+`$XDG_CONFIG_HOME/worktree-gc/config.toml` or
+`~/.config/worktree-gc/config.toml`. Scheduled mode executes cleanup by
+default; use `--dry-run` when validating a new configuration.
+
+```toml
+roots = [
+  "/Users/me/Code",
+  "/Users/me/Documents/sandboxd",
+  "/Users/me/plugins",
+]
+
+[cleanup]
+stale_days = 14
+generated_days = 7
+generated_activity_only = true
+check_in_use = true
+cargo_lock_timeout_minutes = 30
+# Requires cargo-sweep; omit to use only the built-in incremental sweep.
+cargo_sweep_max_size = "50GB"
+
+[history]
+retention_days = 90
+repository_refresh_days = 7
+```
+
+The Cargo lock timeout applies to each generated `target` directory. A
+contended target is deferred to a later run, recorded under
+`$XDG_STATE_HOME/worktree-gc/inbox` (or
+`~/.local/state/worktree-gc/inbox`), and does not prevent the remaining
+worktrees from being cleaned.
+
+Each scheduled run writes the normal per-repository manifests and a structured
+aggregate manifest. Aggregate manifests are retained for the configured
+history window. Query them with:
+
+```sh
+worktree-gc history
+worktree-gc inbox
+```
+
+The inbox reports deferred Cargo sweeps, old dirty worktrees, and generated
+directories protected by open handles or tracked files. It is intentionally a
+review surface; cleanup decisions remain manifest-driven.
+
+Repository discovery uses `.git` markers while pruning generated trees, then
+caches the owning-repository index for `repository_refresh_days`. Use
+`worktree-gc scheduled --refresh-repositories --dry-run` after adding or moving
+repositories when you want the index refreshed immediately. Generated
+directory discovery uses Git's index and collapsed ignored/untracked directory
+views; it does not recursively stat every file in a worktree.
+
 ## Releases
 
 The first crate version must be published manually. After that, configure
