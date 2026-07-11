@@ -1581,6 +1581,13 @@ fn generated_candidates(
     worktree: &WorktreeInfo,
     config: &GeneratedDirConfig,
 ) -> Result<Vec<GeneratedCandidate>> {
+    if config.delete_names.is_empty()
+        && config.report_only_names.is_empty()
+        && config.sweep_strategies.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+
     let mut paths = Vec::new();
     paths.extend(git_generated_path_listing(
         &worktree.path,
@@ -1667,6 +1674,19 @@ fn discover_generated_descendants(
 
     let mut stack = vec![(root, listed.to_path_buf())];
     while let Some((directory, relative)) = stack.pop() {
+        match fs::symlink_metadata(directory.join(".git")) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect repository boundary in {}",
+                        directory.display()
+                    )
+                });
+            }
+        }
+
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -3071,6 +3091,78 @@ mod tests {
             .find(|decision| decision.path == expected)
             .context("missing node_modules below ignored build ancestor")?;
         assert_eq!(decision.action, GeneratedDirAction::Delete);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_generated_policy_does_not_inspect_the_worktree() -> Result<()> {
+        let temp = TempDir::new()?;
+        let missing_worktree = temp.path().join("missing-worktree");
+        let worktree = WorktreeInfo {
+            path: missing_worktree,
+            head: None,
+            branch: None,
+            detached: false,
+            prunable: None,
+            exists: false,
+            is_current: false,
+            dirty_count: None,
+            upstream: None,
+            ahead: None,
+            behind: None,
+            last_commit_unix: None,
+            last_commit: None,
+            activity_unix: None,
+            activity_age_days: None,
+        };
+        let config = GeneratedDirConfig::from_names_with_default_sweeps(
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(generated_candidates(&worktree, &config)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn generated_discovery_stops_at_nested_repository_boundaries() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::write(repo.join(".gitignore"), "build/\n")?;
+
+        fs::create_dir_all(repo.join("build/node_modules/pkg"))?;
+        fs::write(repo.join("build/node_modules/pkg/index.js"), "outer\n")?;
+
+        let nested = repo.join("build/inner");
+        fs::create_dir_all(nested.join("node_modules/pkg"))?;
+        git_output(&nested, ["init"])?;
+        fs::write(nested.join("node_modules/pkg/index.js"), "inner\n")?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        let outer = fs::canonicalize(repo.join("build/node_modules"))?;
+        let nested = fs::canonicalize(nested)?;
+        assert!(report
+            .generated_dirs
+            .iter()
+            .any(|decision| decision.path == outer));
+        assert!(report
+            .generated_dirs
+            .iter()
+            .all(|decision| !decision.path.starts_with(&nested)));
         Ok(())
     }
 
