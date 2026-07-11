@@ -482,6 +482,28 @@ pub(crate) fn with_cargo_profile_locks_timeout<T>(
     }
 }
 
+pub(crate) fn cargo_profile_locks_present(target_dir: &Path) -> Result<bool> {
+    for entry in WalkDir::new(target_dir)
+        .follow_links(false)
+        .min_depth(2)
+        .max_depth(3)
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to inspect Cargo profile locks under {}",
+                target_dir.display()
+            )
+        })?;
+        if entry.file_name() == ".cargo-lock"
+            && !entry.file_type().is_symlink()
+            && entry.file_type().is_file()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn cargo_profile_lock_paths(target_dir: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
     let target_dir = fs::canonicalize(target_dir)
         .with_context(|| format!("failed to canonicalize {}", target_dir.display()))?;

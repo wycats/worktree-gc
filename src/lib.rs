@@ -2,8 +2,8 @@ mod cargo_incremental;
 
 use anyhow::{bail, Context, Result};
 use cargo_incremental::{
-    cargo_project_dir, execute_incremental_sweep_with_timeout, is_cargo_lock_timeout,
-    plan_incremental_sweep, with_cargo_profile_locks_timeout,
+    cargo_profile_locks_present, cargo_project_dir, execute_incremental_sweep_with_timeout,
+    is_cargo_lock_timeout, plan_incremental_sweep, with_cargo_profile_locks_timeout,
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -1552,10 +1552,15 @@ fn probe_open_handles(paths: &[PathBuf]) -> io::Result<HashSet<PathBuf>> {
     for path in paths {
         command.arg("+d").arg(path);
     }
-    let output = command
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
+    let output = command.stdin(Stdio::null()).output()?;
+
+    if !output.status.success() && (output.status.code() != Some(1) || !output.stderr.is_empty()) {
+        return Err(io::Error::other(format!(
+            "lsof exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
 
     Ok(output
         .stdout
@@ -1635,7 +1640,7 @@ fn generated_candidates(
             let is_real_dir = fs::symlink_metadata(&path)
                 .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
                 .unwrap_or(false);
-            if is_real_dir {
+            if is_real_dir && !is_repository_boundary(&path)? {
                 candidates
                     .entry(relative.clone())
                     .or_insert_with(|| GeneratedCandidate {
@@ -1963,13 +1968,21 @@ fn remove_generated_directory(
     }
 
     let remove = || fs::remove_dir_all(&decision.path);
-    if decision.name == "target" && cargo_lock_timeout.is_some() {
+    if decision.name == "target"
+        && cargo_lock_timeout.is_some()
+        && cargo_profile_locks_present(&decision.path)?
+    {
         with_cargo_profile_locks_timeout(
             &decision.path,
             &decision.worktree_path,
             cargo_lock_timeout,
             remove,
         )??;
+    } else if decision.name == "target" && cargo_lock_timeout.is_some() {
+        eprintln!(
+            "  keeping {} because it has no Cargo profile locks to coordinate",
+            decision.path.display()
+        );
     } else {
         remove()?;
     }
@@ -3219,6 +3232,35 @@ mod tests {
     }
 
     #[test]
+    fn direct_generated_matches_skip_nested_repository_roots() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::write(repo.join(".gitignore"), "node_modules/\n")?;
+        let nested = repo.join("node_modules");
+        fs::create_dir_all(&nested)?;
+        git_output(&nested, ["init"])?;
+        fs::write(nested.join("README.md"), "nested repository\n")?;
+        let nested = fs::canonicalize(nested)?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        assert!(report
+            .generated_dirs
+            .iter()
+            .all(|decision| !decision.path.starts_with(&nested)));
+        Ok(())
+    }
+
+    #[test]
     fn scheduled_target_deletion_waits_for_cargo_profile_locks() -> Result<()> {
         let temp = TempDir::new()?;
         let repo = temp.path().join("repo");
@@ -3259,6 +3301,30 @@ mod tests {
         held.unlock()?;
         remove_generated_directory(&decision, Some(Duration::from_secs(1)))?;
         assert!(!decision.path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_target_deletion_keeps_uncoordinated_targets() -> Result<()> {
+        let temp = TempDir::new()?;
+        let repo = temp.path().join("repo");
+        let target = repo.join("target");
+        fs::create_dir_all(&target)?;
+        fs::write(target.join("artifact"), "stale")?;
+        let decision = GeneratedDirDecision {
+            path: fs::canonicalize(target)?,
+            worktree_path: fs::canonicalize(repo)?,
+            name: "target".to_string(),
+            mtime: None,
+            effective_days: 3,
+            in_use: false,
+            sweeps: Vec::new(),
+            action: GeneratedDirAction::Delete,
+            reason: "stale target".to_string(),
+        };
+
+        remove_generated_directory(&decision, Some(Duration::from_millis(20)))?;
+        assert!(decision.path.exists());
         Ok(())
     }
 
@@ -3407,6 +3473,27 @@ mod tests {
 
         let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path));
         assert!(open.contains(held_path));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_lsof_probes_are_reported_as_errors() -> Result<()> {
+        if Command::new("lsof")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: lsof unavailable");
+            return Ok(());
+        }
+
+        let temp = TempDir::new()?;
+        let missing = temp.path().join("missing");
+        let error = probe_open_handles(&[missing]).expect_err("missing path should fail lsof");
+        assert!(error.to_string().contains("lsof exited"));
         Ok(())
     }
 
