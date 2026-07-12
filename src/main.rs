@@ -9,7 +9,8 @@ use worktree_gc::{
     list_protections, print_cleanup, print_root_cleanup, print_root_triage, print_triage,
     remove_protection, renew_protection, triage, triage_roots, CleanupOptions, GeneratedDirConfig,
     SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
-    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -296,6 +297,11 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
         anyhow::ensure!(
             !normalized.is_empty(),
             "invalid generated_windows key {name:?}: name must not be empty"
+        );
+        anyhow::ensure!(
+            DEFAULT_GENERATED_DELETE_NAMES.contains(&normalized),
+            "invalid generated_windows key {name:?}: scheduled cleanup supports {}",
+            DEFAULT_GENERATED_DELETE_NAMES.join(", ")
         );
         anyhow::ensure!(
             generated_windows
@@ -808,6 +814,12 @@ generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
         let error = scheduled_generated_config(&duplicate)
             .expect_err("normalized duplicate names must be rejected");
         assert!(error.to_string().contains("duplicate name \"target\""));
+
+        let typo: config::CleanupConfig = toml::from_str("generated_windows = { '.nex' = 7 }")?;
+        let error = scheduled_generated_config(&typo)
+            .expect_err("inactive scheduled names must be rejected");
+        assert!(error.to_string().contains("generated_windows key \".nex\""));
+        assert!(error.to_string().contains(".next"));
         Ok(())
     }
 
