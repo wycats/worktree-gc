@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -17,6 +18,7 @@ pub(crate) struct Config {
 pub(crate) struct CleanupConfig {
     pub stale_days: u64,
     pub generated_days: u64,
+    pub generated_windows: BTreeMap<String, u64>,
     pub generated_activity_only: bool,
     pub check_in_use: bool,
     pub cargo_lock_timeout_minutes: u64,
@@ -35,6 +37,7 @@ impl Default for CleanupConfig {
         Self {
             stale_days: 14,
             generated_days: 7,
+            generated_windows: BTreeMap::new(),
             generated_activity_only: true,
             check_in_use: true,
             cargo_lock_timeout_minutes: 30,
@@ -146,6 +149,8 @@ roots = ["/code", "/plugins"]
 
 [cleanup]
 stale_days = 12
+generated_days = 9
+generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
 cargo_lock_timeout_minutes = 45
 cargo_sweep_max_size = "50GB"
 
@@ -156,7 +161,11 @@ retention_days = 120
 
         assert_eq!(config.roots.len(), 2);
         assert_eq!(config.cleanup.stale_days, 12);
-        assert_eq!(config.cleanup.generated_days, 7);
+        assert_eq!(config.cleanup.generated_days, 9);
+        assert_eq!(config.cleanup.generated_windows[".next"], 7);
+        assert_eq!(config.cleanup.generated_windows[".turbo"], 8);
+        assert_eq!(config.cleanup.generated_windows["target"], 9);
+        assert_eq!(config.cleanup.generated_windows["node_modules"], 10);
         assert_eq!(config.cleanup.cargo_lock_timeout_minutes, 45);
         assert_eq!(config.history.retention_days, 120);
         assert_eq!(config.history.repository_refresh_days, 7);
