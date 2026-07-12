@@ -156,12 +156,7 @@ fn add_protection_at(
 ) -> Result<ProtectionLease> {
     validate_ttl(ttl_days)?;
     let reason = reason.trim();
-    if reason.is_empty() {
-        bail!("protection reason must not be empty");
-    }
-    if reason.chars().any(char::is_control) {
-        bail!("protection reason must not contain control characters");
-    }
+    validate_reason(reason)?;
     let path = fs::canonicalize(path)
         .with_context(|| format!("failed to resolve protection path {}", path.display()))?;
     let mut registry = read_registry(registry_path)?;
@@ -280,6 +275,16 @@ fn validate_ttl(ttl_days: u64) -> Result<()> {
     Ok(())
 }
 
+fn validate_reason(reason: &str) -> Result<()> {
+    if reason.trim().is_empty() {
+        bail!("protection reason must not be empty");
+    }
+    if reason.chars().any(char::is_control) {
+        bail!("protection reason must not contain control characters");
+    }
+    Ok(())
+}
+
 fn find_lease(leases: &[ProtectionLease], selector: &str) -> Result<usize> {
     if let Some(index) = leases.iter().position(|lease| lease.id == selector) {
         return Ok(index);
@@ -314,6 +319,15 @@ fn read_registry(path: &Path) -> Result<ProtectionRegistry> {
             path.display()
         );
     }
+    for lease in &registry.leases {
+        validate_reason(&lease.reason).with_context(|| {
+            format!(
+                "invalid protection reason for lease {} in {}",
+                lease.id,
+                path.display()
+            )
+        })?;
+    }
     Ok(registry)
 }
 
@@ -341,7 +355,14 @@ fn with_registry_lock<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> 
 
 fn finish_registry_operation<T>(operation: Result<T>, unlock: Result<()>) -> Result<T> {
     match operation {
-        Err(error) => Err(error),
+        Err(error) => {
+            if let Err(unlock_error) = unlock {
+                eprintln!(
+                    "warning: protection registry unlock also failed after an operation error: {unlock_error:#}"
+                );
+            }
+            Err(error)
+        }
         Ok(value) => {
             unlock?;
             Ok(value)
@@ -403,6 +424,28 @@ mod tests {
         let unlock = finish_registry_operation(Ok(()), Err(anyhow::anyhow!("unlock failed")))
             .expect_err("unlock should fail after a successful operation");
         assert_eq!(unlock.to_string(), "unlock failed");
+    }
+
+    #[test]
+    fn registry_reads_reject_reason_injection() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut lease = add_protection_at(&registry, &protected, "safe reason".into(), 7, now)?;
+        lease.reason = "forged\nlog entry".into();
+        write_registry(
+            &registry,
+            &ProtectionRegistry {
+                version: REGISTRY_VERSION,
+                leases: vec![lease],
+            },
+        )?;
+
+        let error = read_registry(&registry).expect_err("forged reasons should fail closed");
+        assert!(error.to_string().contains("invalid protection reason"));
+        Ok(())
     }
 
     #[test]
