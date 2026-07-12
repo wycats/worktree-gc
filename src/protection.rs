@@ -206,6 +206,8 @@ fn add_protection_at(
     validate_reason(reason)?;
     let path = fs::canonicalize(path)
         .with_context(|| format!("failed to resolve protection path {}", path.display()))?;
+    validate_stored_path(&path)
+        .with_context(|| format!("invalid protection path {}", path.display()))?;
     let mut registry = read_registry(registry_path)?;
     registry.leases.retain(|lease| lease.is_active(now));
     if registry.leases.iter().any(|lease| lease.path == path) {
@@ -948,6 +950,22 @@ mod tests {
                 .expect_err("control characters should be rejected");
             assert!(error.to_string().contains("control characters"));
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_rejects_path_output_injection() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("protections.json");
+        let protected = temp.path().join("forged\npath");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+
+        let error = add_protection_at(&registry, &protected, "fixture".into(), 7, now)
+            .expect_err("control characters in paths should be rejected before writing");
+        assert!(error.to_string().contains("invalid protection path"));
+        assert!(!registry.exists());
         Ok(())
     }
 }
