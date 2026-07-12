@@ -9,7 +9,7 @@ use worktree_gc::{
     list_protections, print_cleanup, print_root_cleanup, print_root_triage, print_triage,
     remove_protection, renew_protection, triage, triage_roots, CleanupOptions, GeneratedDirConfig,
     SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
-    DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -113,7 +113,11 @@ enum ProtectCommand {
     /// Protect a path and everything below it
     Add {
         path: PathBuf,
-        #[arg(long, value_parser = parse_protection_ttl, default_value = "7d")]
+        #[arg(
+            long,
+            value_parser = parse_protection_ttl,
+            default_value_t = DEFAULT_PROTECTION_TTL_DAYS
+        )]
         ttl: u64,
         #[arg(long)]
         reason: String,
@@ -121,7 +125,11 @@ enum ProtectCommand {
     /// Extend an active protection by id or exact path
     Renew {
         selector: String,
-        #[arg(long, value_parser = parse_protection_ttl, default_value = "7d")]
+        #[arg(
+            long,
+            value_parser = parse_protection_ttl,
+            default_value_t = DEFAULT_PROTECTION_TTL_DAYS
+        )]
         ttl: u64,
     },
     /// Remove an active protection by id or exact path
@@ -760,6 +768,25 @@ mod tests {
 
     #[test]
     fn protection_cli_parses_expiring_add_and_renew_commands() {
+        let default_add = Cli::try_parse_from([
+            "worktree-gc",
+            "protect",
+            "add",
+            "/tmp/worktree",
+            "--reason",
+            "active packaging",
+        ])
+        .expect("protect add default should parse");
+        assert!(matches!(
+            default_add.command,
+            Command::Protect {
+                command: ProtectCommand::Add {
+                    ttl: DEFAULT_PROTECTION_TTL_DAYS,
+                    ..
+                }
+            }
+        ));
+
         let add = Cli::try_parse_from([
             "worktree-gc",
             "protect",
