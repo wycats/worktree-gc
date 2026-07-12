@@ -151,6 +151,31 @@ Or start from an empty generated-directory policy:
 cargo run -- triage --repo /path/to/repo --no-default-generated --delete-generated coverage
 ```
 
+## Expiring protections
+
+Use an expiring protection when a worktree or cache is intentionally idle but
+still belongs to active work:
+
+```sh
+worktree-gc protect add /path/to/worktree --ttl 7d --reason "release rehearsal"
+worktree-gc protect list
+worktree-gc protect renew p-0123456789abcdef --ttl 7d
+worktree-gc protect remove p-0123456789abcdef
+```
+
+Protections are recursive. Protecting a worktree also protects generated
+directories and Cargo sweeps below it; protecting a generated directory keeps
+an enclosing worktree from being removed. The default TTL is 7 days, and a
+single lease is capped at 30 days so forgotten protections expire. Renew a
+lease when the underlying intent is still active.
+
+The registry is stored atomically at
+`$XDG_STATE_HOME/worktree-gc/protections.json` (or
+`~/.local/state/worktree-gc/protections.json`). Active protections and their
+expiry are included in cleanup manifests. Cleanup reloads the registry before
+each deletion or sweep, so a protection added after planning still takes
+precedence during execution.
+
 ## Scheduled cleanup
 
 `worktree-gc scheduled` reads its roots and cleanup policy from
