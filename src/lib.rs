@@ -1,4 +1,5 @@
 mod cargo_incremental;
+mod protection;
 
 use anyhow::{bail, Context, Result};
 use cargo_incremental::{
@@ -20,13 +21,19 @@ use time::OffsetDateTime;
 use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
+pub use protection::{
+    active_protections, add_protection, list_protections, protection_for_path,
+    protection_registry_path, remove_protection, renew_protection, with_protection_guard,
+    with_protection_guard_for_paths, ProtectionGuardOutcome, ProtectionLease, ProtectionMatch,
+    DEFAULT_PROTECTION_TTL_DAYS, MAX_PROTECTION_TTL_DAYS,
+};
 
 pub const DEFAULT_STALE_DAYS: u64 = 30;
 pub const DEFAULT_GENERATED_DAYS: u64 = 7;
 pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", ".turbo", "target"];
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
-pub const MANIFEST_VERSION: u64 = 2;
+pub const MANIFEST_VERSION: u64 = 3;
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -76,6 +83,7 @@ pub struct TriageReport {
     pub check_in_use: bool,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
+    pub protections: Vec<ProtectionLease>,
     pub worktrees: Vec<WorktreeInfo>,
     pub worktree_decisions: Vec<WorktreeDecision>,
     pub generated_dirs: Vec<GeneratedDirInfo>,
@@ -126,6 +134,7 @@ pub struct CleanupManifest {
     pub defer_lock_timeouts: bool,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
+    pub protections: Vec<ProtectionLease>,
     pub prune_output: String,
     pub worktrees: Vec<WorktreeDecision>,
     pub generated_dirs: Vec<GeneratedDirDecision>,
@@ -168,6 +177,7 @@ pub struct GeneratedDirInfo {
     pub mtime: Option<String>,
     pub effective_days: u64,
     pub in_use: bool,
+    pub protection: Option<ProtectionMatch>,
     pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
@@ -186,8 +196,10 @@ pub enum GeneratedDirAction {
 pub struct WorktreeDecision {
     pub path: PathBuf,
     pub branch: Option<String>,
+    pub metadata_prunable: bool,
     pub action: WorktreeAction,
     pub reason: String,
+    pub protection: Option<ProtectionMatch>,
     pub dirty_count: Option<usize>,
     pub last_commit: Option<String>,
     pub activity_age_days: Option<u64>,
@@ -209,6 +221,7 @@ pub struct GeneratedDirDecision {
     pub mtime: Option<String>,
     pub effective_days: u64,
     pub in_use: bool,
+    pub protection: Option<ProtectionMatch>,
     pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
@@ -446,9 +459,19 @@ enum GeneratedCandidateAction {
 }
 
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
+    let protections = active_protections(options.now)?;
+    triage_with_protections(repo, options, &protections)
+}
+
+fn triage_with_protections(
+    repo: Option<&Path>,
+    options: TriageOptions,
+    protections: &[ProtectionLease],
+) -> Result<TriageReport> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
-    let worktree_decisions = plan_worktree_cleanup(&worktrees, options.stale_days, options.now);
+    let worktree_decisions =
+        plan_worktree_cleanup(&worktrees, options.stale_days, options.now, protections);
     let generated_dirs = scan_generated_dirs(
         &worktrees,
         options.generated_days,
@@ -456,6 +479,7 @@ pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageRepor
         options.check_in_use,
         options.now,
         &options.generated_config,
+        protections,
     )?;
 
     Ok(TriageReport {
@@ -468,6 +492,7 @@ pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageRepor
         check_in_use: options.check_in_use,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
+        protections: protections.to_vec(),
         worktrees,
         worktree_decisions,
         generated_dirs,
@@ -490,14 +515,19 @@ pub fn audit(repo: Option<&Path>, generated_days: u64, now: SystemTime) -> Resul
 
 pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
     let execute = options.execute;
-    let run = plan_cleanup(repo, options)?;
+    let protections = active_protections(options.now)?;
+    let run = plan_cleanup_with_protections(repo, options, &protections)?;
     if execute {
         execute_cleanup_manifest(&run.manifest)?;
     }
     Ok(run)
 }
 
-fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
+fn plan_cleanup_with_protections(
+    repo: Option<&Path>,
+    options: CleanupOptions,
+    protections: &[ProtectionLease],
+) -> Result<CleanupRun> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
     let generated_dirs = scan_generated_dirs(
@@ -507,10 +537,12 @@ fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupR
         options.check_in_use,
         options.now,
         &options.generated_config,
+        protections,
     )?;
     let prune_output = run_worktree_prune(&context.current_worktree, false)?;
 
-    let worktree_decisions = plan_worktree_cleanup(&worktrees, options.stale_days, options.now);
+    let worktree_decisions =
+        plan_worktree_cleanup(&worktrees, options.stale_days, options.now, protections);
     let generated_decisions = generated_dirs
         .iter()
         .map(|dir| GeneratedDirDecision {
@@ -520,6 +552,7 @@ fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupR
             mtime: dir.mtime.clone(),
             effective_days: dir.effective_days,
             in_use: dir.in_use,
+            protection: dir.protection.clone(),
             sweeps: dir.sweeps.clone(),
             action: dir.action.clone(),
             reason: dir.reason.clone(),
@@ -545,6 +578,7 @@ fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupR
         defer_lock_timeouts: options.defer_lock_timeouts,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
+        protections: protections.to_vec(),
         prune_output,
         worktrees: worktree_decisions,
         generated_dirs: generated_decisions,
@@ -561,9 +595,10 @@ fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupR
 pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTriageReport> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
+    let protections = active_protections(options.now)?;
     let repositories = repositories
         .par_iter()
-        .map(|repo| triage(Some(repo), options.clone()))
+        .map(|repo| triage_with_protections(Some(repo), options.clone(), &protections))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(RootTriageReport {
@@ -590,9 +625,10 @@ pub fn cleanup_repositories(
     } else {
         CleanupMode::DryRun
     };
+    let protections = active_protections(options.now)?;
     let repositories = repositories
         .par_iter()
-        .map(|repo| plan_cleanup(Some(repo), options.clone()))
+        .map(|repo| plan_cleanup_with_protections(Some(repo), options.clone(), &protections))
         .collect::<Result<Vec<_>>>()?;
     let mut manifest = RootCleanupManifest {
         manifest_version: MANIFEST_VERSION,
@@ -608,7 +644,12 @@ pub fn cleanup_repositories(
             let repo_root = manifest.repositories[index].manifest.repo_root.clone();
             let mut refreshed_options = options.clone();
             refreshed_options.now = SystemTime::now();
-            let refreshed = plan_cleanup(Some(&repo_root), refreshed_options)?;
+            let refreshed_protections = active_protections(refreshed_options.now)?;
+            let refreshed = plan_cleanup_with_protections(
+                Some(&repo_root),
+                refreshed_options,
+                &refreshed_protections,
+            )?;
             manifest.repositories[index] = refreshed;
             write_root_manifest(&manifest)?;
             execute_cleanup_manifest(&manifest.repositories[index].manifest)?;
@@ -622,8 +663,32 @@ pub fn cleanup_repositories(
 }
 
 fn execute_cleanup_manifest(manifest: &CleanupManifest) -> Result<()> {
-    run_worktree_prune(&manifest.current_worktree, true)?;
+    let worktree_paths = prunable_worktree_paths(&manifest.worktrees);
+    match with_protection_guard_for_paths(&worktree_paths, SystemTime::now(), || {
+        run_worktree_prune(&manifest.current_worktree, true)
+    })? {
+        ProtectionGuardOutcome::Protected(lease) => {
+            eprintln!(
+                "skipping worktree metadata prune because protection {} is active until {} for {}: {}",
+                lease.id,
+                format_unix_seconds(lease.expires_at_unix),
+                lease.path.display(),
+                lease.reason
+            );
+        }
+        ProtectionGuardOutcome::Executed(result) => {
+            result?;
+        }
+    }
     execute_cleanup(manifest)
+}
+
+fn prunable_worktree_paths(worktrees: &[WorktreeDecision]) -> Vec<PathBuf> {
+    worktrees
+        .iter()
+        .filter(|worktree| worktree.metadata_prunable)
+        .map(|worktree| worktree.path.clone())
+        .collect()
 }
 
 pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -874,6 +939,7 @@ pub fn print_triage(report: &TriageReport) {
         "generated dirs: {} delete candidates, {} sweep candidates, {} report-only",
         generated_delete, generated_sweep, dist_report
     );
+    print_protections(&report.protections);
 
     print_prunable(&report.worktrees);
     print_worktree_removals(&report.worktree_decisions);
@@ -920,6 +986,7 @@ pub fn print_cleanup(run: &CleanupRun) {
     println!("stale clean worktrees to remove: {}", remove);
     println!("generated dirs to delete: {}", generated_delete);
     println!("generated dirs to sweep in place: {}", generated_sweep);
+    print_protections(&run.manifest.protections);
 
     if !run.manifest.prune_output.trim().is_empty() {
         println!();
@@ -1211,6 +1278,7 @@ fn scan_generated_dirs(
     check_in_use: bool,
     now: SystemTime,
     config: &GeneratedDirConfig,
+    protections: &[ProtectionLease],
 ) -> Result<Vec<GeneratedDirInfo>> {
     let mut dirs: Vec<GeneratedDirInfo> = worktrees
         .par_iter()
@@ -1222,6 +1290,7 @@ fn scan_generated_dirs(
                 check_in_use,
                 now,
                 config,
+                protections,
             )
         })
         .collect::<Result<Vec<_>>>()?
@@ -1264,6 +1333,7 @@ fn scan_generated_dirs_for_worktree(
     check_in_use: bool,
     now: SystemTime,
     config: &GeneratedDirConfig,
+    protections: &[ProtectionLease],
 ) -> Result<Vec<GeneratedDirInfo>> {
     let mut dirs = Vec::new();
 
@@ -1281,6 +1351,7 @@ fn scan_generated_dirs_for_worktree(
     };
 
     for candidate in candidates {
+        let protection = protection_for_path(&candidate.path, protections);
         let effective_days = config.effective_days(&candidate.name, generated_days);
         let worktree_recent = !generated_activity_only
             && (worktree.is_current
@@ -1307,6 +1378,7 @@ fn scan_generated_dirs_for_worktree(
         let sweep_strategies = config.sweep_strategies(&candidate.name);
         let active = worktree_recent || dir_recent;
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
+            && protection.is_none()
             && (active || candidate.action == GeneratedCandidateAction::SweepOnly)
             && !has_tracked_files
             && !sweep_strategies.is_empty()
@@ -1321,6 +1393,16 @@ fn scan_generated_dirs_for_worktree(
             (
                 GeneratedDirAction::ReportOnly,
                 format!("{} is configured as report-only", candidate.name),
+            )
+        } else if let Some(lease) = &protection {
+            (
+                GeneratedDirAction::Skip,
+                format!(
+                    "protected by {} until {}: {}",
+                    lease.id,
+                    format_unix_seconds(lease.expires_at_unix),
+                    lease.reason
+                ),
             )
         } else if in_use {
             (
@@ -1417,6 +1499,7 @@ fn scan_generated_dirs_for_worktree(
             mtime: mtime_unix.map(format_unix_time),
             effective_days,
             in_use,
+            protection,
             sweeps,
             action,
             reason,
@@ -1819,11 +1902,23 @@ fn plan_worktree_cleanup(
     worktrees: &[WorktreeInfo],
     stale_days: u64,
     now: SystemTime,
+    protections: &[ProtectionLease],
 ) -> Vec<WorktreeDecision> {
     worktrees
         .iter()
         .map(|worktree| {
-            let (action, reason) = if worktree.prunable.is_some() || !worktree.exists {
+            let protection = protection_for_path(&worktree.path, protections);
+            let (action, reason) = if let Some(lease) = &protection {
+                (
+                    WorktreeAction::Keep,
+                    format!(
+                        "protected by {} until {}: {}",
+                        lease.id,
+                        format_unix_seconds(lease.expires_at_unix),
+                        lease.reason
+                    ),
+                )
+            } else if worktree.prunable.is_some() || !worktree.exists {
                 (
                     WorktreeAction::PruneMetadata,
                     worktree
@@ -1865,8 +1960,10 @@ fn plan_worktree_cleanup(
             WorktreeDecision {
                 path: worktree.path.clone(),
                 branch: worktree.branch.clone(),
+                metadata_prunable: worktree.prunable.is_some() || !worktree.exists,
                 action,
                 reason,
+                protection,
                 dirty_count: worktree.dirty_count,
                 last_commit: worktree.last_commit.clone(),
                 activity_age_days: worktree.activity_age_days,
@@ -1915,16 +2012,22 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
         if decision.action != WorktreeAction::Remove {
             continue;
         }
-
-        git_status_command(
-            &manifest.current_worktree,
-            [
-                "worktree".as_ref(),
-                "remove".as_ref(),
-                decision.path.as_os_str(),
-            ],
-        )
-        .with_context(|| format!("failed to remove {}", decision.path.display()))?;
+        match with_protection_guard(&decision.path, SystemTime::now(), || {
+            git_status_command(
+                &manifest.current_worktree,
+                [
+                    "worktree".as_ref(),
+                    "remove".as_ref(),
+                    decision.path.as_os_str(),
+                ],
+            )
+            .with_context(|| format!("failed to remove {}", decision.path.display()))
+        })? {
+            ProtectionGuardOutcome::Protected(lease) => {
+                print_execution_protection(&decision.path, &lease);
+            }
+            ProtectionGuardOutcome::Executed(result) => result?,
+        }
     }
 
     for (index, decision) in generated_deletions.iter().enumerate() {
@@ -1941,11 +2044,19 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
         if decision.action != GeneratedDirAction::Delete {
             continue;
         }
-
-        if let Err(error) = remove_generated_directory(
-            decision,
-            manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
-        ) {
+        let result = match with_protection_guard(&decision.path, SystemTime::now(), || {
+            remove_generated_directory(
+                decision,
+                manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
+            )
+        })? {
+            ProtectionGuardOutcome::Protected(lease) => {
+                print_execution_protection(&decision.path, &lease);
+                continue;
+            }
+            ProtectionGuardOutcome::Executed(result) => result,
+        };
+        if let Err(error) = result {
             if manifest.defer_lock_timeouts && is_cargo_lock_timeout(&error) {
                 write_deferred_cargo_action(decision, &run_id, &error)?;
                 eprintln!(
@@ -1966,11 +2077,20 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
             decision.path.display()
         );
         flush_stderr();
-        if let Err(error) = run_sweeps(
-            decision,
-            &run_id,
-            manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
-        ) {
+        let result = match with_protection_guard(&decision.path, SystemTime::now(), || {
+            run_sweeps(
+                decision,
+                &run_id,
+                manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
+            )
+        })? {
+            ProtectionGuardOutcome::Protected(lease) => {
+                print_execution_protection(&decision.path, &lease);
+                continue;
+            }
+            ProtectionGuardOutcome::Executed(result) => result,
+        };
+        if let Err(error) = result {
             if manifest.defer_lock_timeouts && is_cargo_lock_timeout(&error) {
                 write_deferred_cargo_action(decision, &run_id, &error)?;
                 eprintln!(
@@ -1984,6 +2104,16 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_execution_protection(path: &Path, lease: &ProtectionMatch) {
+    eprintln!(
+        "  keeping {} because protection {} is active until {}: {}",
+        path.display(),
+        lease.id,
+        format_unix_seconds(lease.expires_at_unix),
+        lease.reason
+    );
 }
 
 fn remove_generated_directory(
@@ -2217,6 +2347,23 @@ fn print_prunable(worktrees: &[WorktreeInfo]) {
             "- {} ({})",
             worktree.path.display(),
             worktree.prunable.as_deref().unwrap_or("prunable")
+        );
+    }
+}
+
+fn print_protections(protections: &[ProtectionLease]) {
+    if protections.is_empty() {
+        return;
+    }
+    println!();
+    println!("active protections:");
+    for lease in protections {
+        println!(
+            "- {} {} until {} ({})",
+            lease.id,
+            lease.path.display(),
+            format_unix_seconds(lease.expires_at_unix),
+            lease.reason
         );
     }
 }
@@ -2566,6 +2713,13 @@ fn format_unix_time(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
+fn format_unix_seconds(unix: u64) -> String {
+    i64::try_from(unix)
+        .ok()
+        .map(format_unix_time)
+        .unwrap_or_else(|| unix.to_string())
+}
+
 fn format_system_time(time: SystemTime) -> String {
     system_time_to_unix(time)
         .map(format_unix_time)
@@ -2820,7 +2974,7 @@ mod tests {
     }
 
     #[test]
-    fn default_incremental_sweep_activates_and_manifest_is_v2() -> Result<()> {
+    fn default_incremental_sweep_activates_and_manifest_is_v3() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         fs::create_dir_all(repo.join("src"))?;
         fs::write(
@@ -3315,6 +3469,7 @@ mod tests {
             mtime: None,
             effective_days: 3,
             in_use: false,
+            protection: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
             reason: "stale target".to_string(),
@@ -3345,6 +3500,7 @@ mod tests {
             mtime: None,
             effective_days: 3,
             in_use: false,
+            protection: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
             reason: "stale target".to_string(),
@@ -3573,6 +3729,7 @@ mod tests {
             mtime: None,
             effective_days: 3,
             in_use: false,
+            protection: None,
             sweeps: vec![SweepDecision {
                 tool: SweepTool::CargoSweep,
                 limit: SweepLimit::MaxSize { bytes: 1_000_000 },
@@ -3634,7 +3791,7 @@ mod tests {
         let expected_worktree = fs::canonicalize(&worktree)?;
 
         let report = audit(Some(&repo), 7, now())?;
-        let decisions = plan_worktree_cleanup(&report.worktrees, 30, now());
+        let decisions = plan_worktree_cleanup(&report.worktrees, 30, now(), &[]);
         let decision = decisions
             .iter()
             .find(|decision| decision.path == expected_worktree)
@@ -3642,6 +3799,103 @@ mod tests {
 
         assert_eq!(decision.action, WorktreeAction::Keep);
         assert!(decision.reason.contains("dirty"));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_protection_keeps_a_clean_stale_worktree() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("protected-stale");
+        add_worktree(&repo, &worktree, "protected-stale-branch")?;
+        let report = audit(Some(&repo), 7, now())?;
+        let protected_path = fs::canonicalize(&worktree)?;
+        let lease = ProtectionLease {
+            id: "p-fixture".to_string(),
+            path: protected_path.clone(),
+            reason: "packaging in progress".to_string(),
+            created_at_unix: 1,
+            expires_at_unix: u64::MAX,
+        };
+
+        let decisions = plan_worktree_cleanup(&report.worktrees, 0, now(), &[lease]);
+        let decision = decisions
+            .iter()
+            .find(|decision| decision.path == protected_path)
+            .context("missing protected worktree decision")?;
+        assert_eq!(decision.action, WorktreeAction::Keep);
+        assert_eq!(
+            decision.protection.as_ref().map(|item| item.id.as_str()),
+            Some("p-fixture")
+        );
+        assert!(decision.reason.contains("packaging in progress"));
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_prune_guard_only_covers_prunable_worktrees() {
+        let decision = |path: &str, action, metadata_prunable| WorktreeDecision {
+            path: PathBuf::from(path),
+            branch: None,
+            metadata_prunable,
+            action,
+            reason: "fixture".to_string(),
+            protection: None,
+            dirty_count: None,
+            last_commit: None,
+            activity_age_days: None,
+        };
+        let worktrees = vec![
+            decision("/worktrees/current", WorktreeAction::Keep, false),
+            decision("/worktrees/stale", WorktreeAction::PruneMetadata, true),
+            decision("/worktrees/protected-stale", WorktreeAction::Keep, true),
+            decision("/worktrees/remove", WorktreeAction::Remove, false),
+        ];
+
+        assert_eq!(
+            prunable_worktree_paths(&worktrees),
+            vec![
+                PathBuf::from("/worktrees/stale"),
+                PathBuf::from("/worktrees/protected-stale")
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_worktree_protection_suppresses_generated_deletes_and_sweeps() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("target/debug"))?;
+        fs::write(repo.join("target/debug/.cargo-lock"), "")?;
+        fs::write(repo.join("target/debug/artifact"), "fixture")?;
+        let context = repo_context(Some(&repo))?;
+        let worktrees = inspect_worktrees(&context, now())?;
+        let protected_path = fs::canonicalize(&repo)?;
+        let lease = ProtectionLease {
+            id: "p-generated-fixture".to_string(),
+            path: protected_path,
+            reason: "focused tests".to_string(),
+            created_at_unix: 1,
+            expires_at_unix: u64::MAX,
+        };
+
+        let generated = scan_generated_dirs(
+            &worktrees,
+            0,
+            true,
+            false,
+            now(),
+            &GeneratedDirConfig::default(),
+            &[lease],
+        )?;
+        let target = generated
+            .iter()
+            .find(|decision| decision.name == "target")
+            .context("missing target decision")?;
+        assert_eq!(target.action, GeneratedDirAction::Skip);
+        assert!(target.sweeps.is_empty());
+        assert_eq!(
+            target.protection.as_ref().map(|item| item.id.as_str()),
+            Some("p-generated-fixture")
+        );
         Ok(())
     }
 

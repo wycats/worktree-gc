@@ -5,10 +5,11 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
-    cleanup, cleanup_repositories, cleanup_roots, discover_repositories, print_cleanup,
-    print_root_cleanup, print_root_triage, print_triage, triage, triage_roots, CleanupOptions,
-    GeneratedDirConfig, SweepLimit, SweepStrategy, SweepTool, TriageOptions,
-    DEFAULT_GENERATED_DAYS, DEFAULT_STALE_DAYS,
+    add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories,
+    list_protections, print_cleanup, print_root_cleanup, print_root_triage, print_triage,
+    remove_protection, renew_protection, triage, triage_roots, CleanupOptions, GeneratedDirConfig,
+    SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
+    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -100,6 +101,58 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Manage expiring recursive cleanup protections
+    Protect {
+        #[command(subcommand)]
+        command: ProtectCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProtectCommand {
+    /// Protect a path and everything below it
+    Add {
+        path: PathBuf,
+        #[arg(
+            long,
+            value_parser = parse_protection_ttl,
+            default_value_t = DEFAULT_PROTECTION_TTL_DAYS
+        )]
+        ttl: u64,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Extend an active protection by id or exact path
+    Renew {
+        selector: String,
+        #[arg(
+            long,
+            value_parser = parse_protection_ttl,
+            default_value_t = DEFAULT_PROTECTION_TTL_DAYS
+        )]
+        ttl: u64,
+    },
+    /// Remove an active protection by id or exact path
+    Remove { selector: String },
+    /// List active protections
+    List,
+}
+
+fn parse_protection_ttl(raw: &str) -> Result<u64, String> {
+    let days = raw
+        .strip_suffix('d')
+        .unwrap_or(raw)
+        .parse::<u64>()
+        .map_err(|_| format!("invalid TTL '{raw}'; expected a day count such as 7 or 7d"))?;
+    if days == 0 {
+        return Err("protection TTL must be at least 1 day".to_string());
+    }
+    if days > MAX_PROTECTION_TTL_DAYS {
+        return Err(format!(
+            "protection TTL cannot exceed {MAX_PROTECTION_TTL_DAYS} days"
+        ));
+    }
+    Ok(days)
 }
 
 #[derive(Debug, Clone, Args)]
@@ -362,9 +415,64 @@ fn main() -> Result<()> {
             }
         }
         Command::Inbox { limit } => print_inbox(limit)?,
+        Command::Protect { command } => match command {
+            ProtectCommand::Add { path, ttl, reason } => {
+                let lease = add_protection(&path, reason, ttl, now)?;
+                println!(
+                    "protected {} as {} until {}",
+                    lease.path.display(),
+                    lease.id,
+                    format_expiry(lease.expires_at_unix)
+                );
+            }
+            ProtectCommand::Renew { selector, ttl } => {
+                let lease = renew_protection(&selector, ttl, now)?;
+                println!(
+                    "renewed {} ({}) until {}",
+                    lease.path.display(),
+                    lease.id,
+                    format_expiry(lease.expires_at_unix)
+                );
+            }
+            ProtectCommand::Remove { selector } => {
+                let lease = remove_protection(&selector, now)?;
+                println!(
+                    "removed protection {} for {}",
+                    lease.id,
+                    lease.path.display()
+                );
+            }
+            ProtectCommand::List => {
+                let leases = list_protections(now)?;
+                if leases.is_empty() {
+                    println!("no active protections");
+                }
+                for lease in leases {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        lease.id,
+                        format_expiry(lease.expires_at_unix),
+                        lease.path.display(),
+                        lease.reason
+                    );
+                }
+            }
+        },
     }
 
     Ok(())
+}
+
+fn format_expiry(unix: u64) -> String {
+    i64::try_from(unix)
+        .ok()
+        .and_then(|unix| time::OffsetDateTime::from_unix_timestamp(unix).ok())
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| unix.to_string())
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -510,6 +618,17 @@ fn print_inbox(limit: usize) -> Result<()> {
             let stale_days = manifest["stale_days"].as_u64().unwrap_or_default();
             if let Some(worktrees) = manifest["worktrees"].as_array() {
                 for worktree in worktrees {
+                    if worktree
+                        .get("protection")
+                        .is_some_and(|value| value.is_object())
+                    {
+                        entries.push(format!(
+                            "worktree: {} ({})",
+                            worktree["path"].as_str().unwrap_or("<unknown>"),
+                            worktree["reason"].as_str().unwrap_or("protected")
+                        ));
+                        continue;
+                    }
                     let dirty = worktree["dirty_count"].as_u64().unwrap_or_default();
                     let age = worktree["activity_age_days"].as_u64().unwrap_or_default();
                     if worktree.get("action").and_then(|value| value.as_str()) == Some("keep")
@@ -527,6 +646,7 @@ fn print_inbox(limit: usize) -> Result<()> {
                 for dir in dirs {
                     let protected = dir.get("in_use").and_then(|value| value.as_bool())
                         == Some(true)
+                        || dir.get("protection").is_some_and(|value| value.is_object())
                         || dir["reason"]
                             .as_str()
                             .is_some_and(|reason| reason.contains("tracked files"));
@@ -645,6 +765,71 @@ mod tests {
         assert!(parse_sweep_strategy("target=rustc-incremental:nope").is_err());
         assert!(parse_sweep_strategy("target=rustc-incremental:max-size=50GB").is_err());
         assert!(parse_sweep_strategy("target=cargo-sweep:max-size=nope").is_err());
+    }
+
+    #[test]
+    fn protection_cli_parses_expiring_add_and_renew_commands() {
+        let default_add = Cli::try_parse_from([
+            "worktree-gc",
+            "protect",
+            "add",
+            "/tmp/worktree",
+            "--reason",
+            "active packaging",
+        ])
+        .expect("protect add default should parse");
+        assert!(matches!(
+            default_add.command,
+            Command::Protect {
+                command: ProtectCommand::Add {
+                    ttl: DEFAULT_PROTECTION_TTL_DAYS,
+                    ..
+                }
+            }
+        ));
+
+        let add = Cli::try_parse_from([
+            "worktree-gc",
+            "protect",
+            "add",
+            "/tmp/worktree",
+            "--ttl",
+            "14d",
+            "--reason",
+            "active packaging",
+        ])
+        .expect("protect add should parse");
+        match add.command {
+            Command::Protect {
+                command: ProtectCommand::Add { ttl, reason, .. },
+            } => {
+                assert_eq!(ttl, 14);
+                assert_eq!(reason, "active packaging");
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let renew = Cli::try_parse_from([
+            "worktree-gc",
+            "protect",
+            "renew",
+            "p-fixture",
+            "--ttl",
+            "30d",
+        ])
+        .expect("protect renew should parse");
+        assert!(matches!(
+            renew.command,
+            Command::Protect {
+                command: ProtectCommand::Renew { ttl: 30, .. }
+            }
+        ));
+        assert!(parse_protection_ttl("0d").is_err());
+        assert!(parse_protection_ttl("31d").is_err());
+        assert!(parse_protection_ttl("forever").is_err());
+        assert_eq!(parse_protection_ttl("7"), Ok(7));
+        assert_eq!(parse_protection_ttl("7d"), Ok(7));
+        assert_eq!(format_expiry(u64::MAX), u64::MAX.to_string());
     }
 
     #[test]
