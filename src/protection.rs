@@ -155,8 +155,12 @@ fn add_protection_at(
     now: SystemTime,
 ) -> Result<ProtectionLease> {
     validate_ttl(ttl_days)?;
-    if reason.trim().is_empty() {
+    let reason = reason.trim();
+    if reason.is_empty() {
         bail!("protection reason must not be empty");
+    }
+    if reason.chars().any(char::is_control) {
+        bail!("protection reason must not contain control characters");
     }
     let path = fs::canonicalize(path)
         .with_context(|| format!("failed to resolve protection path {}", path.display()))?;
@@ -177,7 +181,7 @@ fn add_protection_at(
     let lease = ProtectionLease {
         id: format!("p-{:016x}", hasher.finish()),
         path,
-        reason: reason.trim().to_string(),
+        reason: reason.to_string(),
         created_at_unix,
         expires_at_unix,
     };
@@ -573,6 +577,22 @@ mod tests {
         let error = add_protection_at(&registry, &protected, "second".into(), 7, now)
             .expect_err("duplicate active protection should fail");
         assert!(error.to_string().contains("protect renew"));
+        Ok(())
+    }
+
+    #[test]
+    fn reasons_reject_structured_output_injection() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+
+        for reason in ["line one\nline two", "column one\tcolumn two"] {
+            let error = add_protection_at(&registry, &protected, reason.into(), 7, now)
+                .expect_err("control characters should be rejected");
+            assert!(error.to_string().contains("control characters"));
+        }
         Ok(())
     }
 }
