@@ -306,6 +306,24 @@ fn read_active_protections(registry_path: &Path, now: SystemTime) -> Result<Vec<
             registry_path.display()
         );
     }
+    for lease in &registry.leases {
+        let canonical = fs::canonicalize(&lease.path).with_context(|| {
+            format!(
+                "failed to resolve active protection path {} for lease {} in {}",
+                lease.path.display(),
+                lease.id,
+                registry_path.display()
+            )
+        })?;
+        if canonical != lease.path {
+            bail!(
+                "active protection path {} for lease {} in {} is not canonical",
+                lease.path.display(),
+                lease.id,
+                registry_path.display()
+            );
+        }
+    }
     if registry.leases.len() != original_len {
         write_registry(registry_path, &registry)?;
     }
@@ -604,6 +622,48 @@ mod tests {
         let error = active_protections_at(&registry, now)
             .expect_err("out-of-policy expiry should fail closed");
         assert!(error.to_string().contains("expires beyond"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_reads_reject_missing_paths() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        fs::remove_dir(&protected)?;
+
+        let error = active_protections_at(&registry, now)
+            .expect_err("missing active paths should fail closed");
+        assert!(error.to_string().contains("failed to resolve"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_reads_reject_symlinked_paths() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        let linked = temp.path().join("linked");
+        fs::create_dir_all(&protected)?;
+        std::os::unix::fs::symlink(&protected, &linked)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut lease = add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        lease.path = linked;
+        write_registry(
+            &registry,
+            &ProtectionRegistry {
+                version: REGISTRY_VERSION,
+                leases: vec![lease],
+            },
+        )?;
+
+        let error = active_protections_at(&registry, now)
+            .expect_err("symlinked active paths should fail closed");
+        assert!(error.to_string().contains("is not canonical"));
         Ok(())
     }
 
