@@ -94,13 +94,7 @@ pub fn active_protections(now: SystemTime) -> Result<Vec<ProtectionLease>> {
 }
 
 fn active_protections_at(path: &Path, now: SystemTime) -> Result<Vec<ProtectionLease>> {
-    with_registry_lock(path, || {
-        Ok(read_registry(path)?
-            .leases
-            .into_iter()
-            .filter(|lease| lease.is_active(now))
-            .collect())
-    })
+    with_registry_lock(path, || read_active_protections(path, now))
 }
 
 #[cfg(test)]
@@ -132,11 +126,7 @@ fn with_protection_guard_at<T>(
     operation: impl FnOnce() -> T,
 ) -> Result<ProtectionGuardOutcome<T>> {
     with_registry_lock(registry_path, || {
-        let protections = read_registry(registry_path)?
-            .leases
-            .into_iter()
-            .filter(|lease| lease.is_active(now))
-            .collect::<Vec<_>>();
+        let protections = read_active_protections(registry_path, now)?;
         if let Some(lease) = protection_for_path(path, &protections) {
             return Ok(ProtectionGuardOutcome::Protected(lease));
         }
@@ -248,6 +238,10 @@ pub fn list_protections(now: SystemTime) -> Result<Vec<ProtectionLease>> {
 }
 
 fn list_protections_at(registry_path: &Path, now: SystemTime) -> Result<Vec<ProtectionLease>> {
+    read_active_protections(registry_path, now)
+}
+
+fn read_active_protections(registry_path: &Path, now: SystemTime) -> Result<Vec<ProtectionLease>> {
     let mut registry = read_registry(registry_path)?;
     let original_len = registry.leases.len();
     registry.leases.retain(|lease| lease.is_active(now));
@@ -384,6 +378,21 @@ mod tests {
         let error = active_protections_at(&registry, now)
             .expect_err("an unreadable registry must stop cleanup planning");
         assert!(error.to_string().contains("failed to parse"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_reads_compact_expired_leases() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let start = UNIX_EPOCH + Duration::from_secs(1_000);
+        add_protection_at(&registry, &protected, "short lease".into(), 1, start)?;
+
+        let expired = start + Duration::from_secs(86_400);
+        assert!(active_protections_at(&registry, expired)?.is_empty());
+        assert!(read_registry(&registry)?.leases.is_empty());
         Ok(())
     }
 
