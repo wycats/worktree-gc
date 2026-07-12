@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const REGISTRY_VERSION: u64 = 1;
@@ -69,6 +69,17 @@ fn optional_protection_registry_path() -> Option<PathBuf> {
     protection_registry_path_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
 
+#[cfg(not(test))]
+fn required_protection_registry_path() -> Result<PathBuf> {
+    required_registry_path_from(optional_protection_registry_path())
+}
+
+fn required_registry_path_from(path: Option<PathBuf>) -> Result<PathBuf> {
+    path.context(
+        "cannot execute destructive cleanup without XDG_STATE_HOME or HOME to enforce protections",
+    )
+}
+
 fn protection_registry_path_from(
     xdg_state_home: Option<OsString>,
     home: Option<OsString>,
@@ -115,9 +126,7 @@ pub fn with_protection_guard<T>(
     now: SystemTime,
     operation: impl FnOnce() -> T,
 ) -> Result<ProtectionGuardOutcome<T>> {
-    let Some(registry_path) = optional_protection_registry_path() else {
-        return Ok(ProtectionGuardOutcome::Executed(operation()));
-    };
+    let registry_path = required_protection_registry_path()?;
     with_protection_guard_at(&registry_path, path, now, operation)
 }
 
@@ -299,6 +308,19 @@ fn validate_reason(reason: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_stored_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("protection path must be absolute");
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        bail!("protection path must not contain '.' or '..' components");
+    }
+    Ok(())
+}
+
 fn find_lease(leases: &[ProtectionLease], selector: &str) -> Result<usize> {
     if let Some(index) = leases.iter().position(|lease| lease.id == selector) {
         return Ok(index);
@@ -337,6 +359,13 @@ fn read_registry(path: &Path) -> Result<ProtectionRegistry> {
         validate_reason(&lease.reason).with_context(|| {
             format!(
                 "invalid protection reason for lease {} in {}",
+                lease.id,
+                path.display()
+            )
+        })?;
+        validate_stored_path(&lease.path).with_context(|| {
+            format!(
+                "invalid protection path for lease {} in {}",
                 lease.id,
                 path.display()
             )
@@ -427,6 +456,15 @@ mod tests {
     }
 
     #[test]
+    fn destructive_guards_require_a_registry_location() {
+        let error = required_registry_path_from(None)
+            .expect_err("destructive operations must fail closed without state home");
+        assert!(error
+            .to_string()
+            .contains("cannot execute destructive cleanup"));
+    }
+
+    #[test]
     fn operation_errors_take_precedence_over_unlock_errors() {
         let operation = finish_registry_operation::<()>(
             Err(anyhow::anyhow!("operation failed")),
@@ -459,6 +497,28 @@ mod tests {
 
         let error = read_registry(&registry).expect_err("forged reasons should fail closed");
         assert!(error.to_string().contains("invalid protection reason"));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_reads_reject_noncanonical_paths() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut lease = add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        lease.path = PathBuf::from("../forged");
+        write_registry(
+            &registry,
+            &ProtectionRegistry {
+                version: REGISTRY_VERSION,
+                leases: vec![lease],
+            },
+        )?;
+
+        let error = read_registry(&registry).expect_err("relative paths should fail closed");
+        assert!(error.to_string().contains("invalid protection path"));
         Ok(())
     }
 
