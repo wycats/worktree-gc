@@ -120,6 +120,16 @@ pub fn with_protection_guard<T>(
     Ok(ProtectionGuardOutcome::Executed(operation()))
 }
 
+#[cfg(test)]
+pub fn with_protection_guard_for_paths<T>(
+    paths: &[PathBuf],
+    now: SystemTime,
+    operation: impl FnOnce() -> T,
+) -> Result<ProtectionGuardOutcome<T>> {
+    let _ = (paths, now);
+    Ok(ProtectionGuardOutcome::Executed(operation()))
+}
+
 #[cfg(not(test))]
 pub fn with_protection_guard<T>(
     path: &Path,
@@ -130,15 +140,42 @@ pub fn with_protection_guard<T>(
     with_protection_guard_at(&registry_path, path, now, operation)
 }
 
+#[cfg(not(test))]
+pub fn with_protection_guard_for_paths<T>(
+    paths: &[PathBuf],
+    now: SystemTime,
+    operation: impl FnOnce() -> T,
+) -> Result<ProtectionGuardOutcome<T>> {
+    let registry_path = required_protection_registry_path()?;
+    with_protection_guards_at(&registry_path, paths, now, operation)
+}
+
 fn with_protection_guard_at<T>(
     registry_path: &Path,
     path: &Path,
     now: SystemTime,
     operation: impl FnOnce() -> T,
 ) -> Result<ProtectionGuardOutcome<T>> {
+    with_protection_guards_at(
+        registry_path,
+        std::slice::from_ref(&path.to_path_buf()),
+        now,
+        operation,
+    )
+}
+
+fn with_protection_guards_at<T>(
+    registry_path: &Path,
+    paths: &[PathBuf],
+    now: SystemTime,
+    operation: impl FnOnce() -> T,
+) -> Result<ProtectionGuardOutcome<T>> {
     with_registry_lock(registry_path, || {
         let protections = read_active_protections(registry_path, now)?;
-        if let Some(lease) = protection_for_path(path, &protections) {
+        if let Some(lease) = paths
+            .iter()
+            .find_map(|path| protection_for_path(path, &protections))
+        {
             return Ok(ProtectionGuardOutcome::Protected(lease));
         }
         Ok(ProtectionGuardOutcome::Executed(operation()))
@@ -215,8 +252,9 @@ fn renew_protection_at(
     let mut registry = read_registry(registry_path)?;
     registry.leases.retain(|lease| lease.is_active(now));
     let index = find_lease(&registry.leases, selector)?;
-    registry.leases[index].expires_at_unix =
-        unix_seconds(now).saturating_add(ttl_days.saturating_mul(86_400));
+    registry.leases[index].expires_at_unix = registry.leases[index]
+        .expires_at_unix
+        .max(unix_seconds(now).saturating_add(ttl_days.saturating_mul(86_400)));
     let lease = registry.leases[index].clone();
     write_registry(registry_path, &registry)?;
     Ok(lease)
@@ -617,6 +655,25 @@ mod tests {
     }
 
     #[test]
+    fn multi_path_guard_blocks_global_repo_mutations() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        let sibling = temp.path().join("sibling");
+        fs::create_dir_all(&protected)?;
+        fs::create_dir_all(&sibling)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        add_protection_at(&registry, &protected, "active gate".into(), 7, now)?;
+        let ran = Cell::new(false);
+
+        let outcome =
+            with_protection_guards_at(&registry, &[sibling, protected], now, || ran.set(true))?;
+        assert!(matches!(outcome, ProtectionGuardOutcome::Protected(_)));
+        assert!(!ran.get());
+        Ok(())
+    }
+
+    #[test]
     fn guard_holds_the_registry_lock_through_the_operation() -> Result<()> {
         let temp = TempDir::new()?;
         let registry = temp.path().join("state/protections.json");
@@ -727,6 +784,20 @@ mod tests {
         let expired = start + std::time::Duration::from_secs(86_400);
         assert!(list_protections_at(&registry, expired)?.is_empty());
         assert!(read_registry(&registry)?.leases.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn renewal_never_shortens_an_active_lease() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let lease = add_protection_at(&registry, &protected, "fixture".into(), 30, now)?;
+
+        let renewed = renew_protection_at(&registry, &lease.id, DEFAULT_PROTECTION_TTL_DAYS, now)?;
+        assert_eq!(renewed.expires_at_unix, lease.expires_at_unix);
         Ok(())
     }
 

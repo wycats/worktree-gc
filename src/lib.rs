@@ -24,8 +24,8 @@ pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use protection::{
     active_protections, add_protection, list_protections, protection_for_path,
     protection_registry_path, remove_protection, renew_protection, with_protection_guard,
-    ProtectionGuardOutcome, ProtectionLease, ProtectionMatch, DEFAULT_PROTECTION_TTL_DAYS,
-    MAX_PROTECTION_TTL_DAYS,
+    with_protection_guard_for_paths, ProtectionGuardOutcome, ProtectionLease, ProtectionMatch,
+    DEFAULT_PROTECTION_TTL_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 pub const DEFAULT_STALE_DAYS: u64 = 30;
@@ -643,7 +643,27 @@ pub fn cleanup_repositories(
 }
 
 fn execute_cleanup_manifest(manifest: &CleanupManifest) -> Result<()> {
-    run_worktree_prune(&manifest.current_worktree, true)?;
+    let worktree_paths = manifest
+        .worktrees
+        .iter()
+        .map(|worktree| worktree.path.clone())
+        .collect::<Vec<_>>();
+    match with_protection_guard_for_paths(&worktree_paths, SystemTime::now(), || {
+        run_worktree_prune(&manifest.current_worktree, true)
+    })? {
+        ProtectionGuardOutcome::Protected(lease) => {
+            eprintln!(
+                "skipping worktree metadata prune because protection {} is active until {} for {}: {}",
+                lease.id,
+                format_unix_seconds(lease.expires_at_unix),
+                lease.path.display(),
+                lease.reason
+            );
+        }
+        ProtectionGuardOutcome::Executed(result) => {
+            result?;
+        }
+    }
     execute_cleanup(manifest)
 }
 
