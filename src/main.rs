@@ -3,7 +3,7 @@ mod config;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories,
     list_protections, print_cleanup, print_root_cleanup, print_root_triage, print_triage,
@@ -464,9 +464,9 @@ fn main() -> Result<()> {
 }
 
 fn format_expiry(unix: u64) -> String {
-    UNIX_EPOCH
-        .checked_add(std::time::Duration::from_secs(unix))
-        .map(time::OffsetDateTime::from)
+    i64::try_from(unix)
+        .ok()
+        .and_then(|unix| time::OffsetDateTime::from_unix_timestamp(unix).ok())
         .and_then(|value| {
             value
                 .format(&time::format_description::well_known::Rfc3339)

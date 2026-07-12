@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -364,6 +364,20 @@ fn validate_reason(reason: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_lease_id(id: &str) -> Result<()> {
+    let Some(hash) = id.strip_prefix("p-") else {
+        bail!("protection id must start with 'p-'");
+    };
+    if hash.len() != 16
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("protection id must contain 16 lowercase hexadecimal digits");
+    }
+    Ok(())
+}
+
 fn validate_stored_path(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         bail!("protection path must be absolute");
@@ -373,6 +387,9 @@ fn validate_stored_path(path: &Path) -> Result<()> {
         .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
         bail!("protection path must not contain '.' or '..' components");
+    }
+    if path.to_string_lossy().chars().any(char::is_control) {
+        bail!("protection path must not contain control characters");
     }
     Ok(())
 }
@@ -411,7 +428,11 @@ fn read_registry(path: &Path) -> Result<ProtectionRegistry> {
             path.display()
         );
     }
+    let mut ids = HashSet::new();
+    let mut paths = HashSet::new();
     for lease in &registry.leases {
+        validate_lease_id(&lease.id)
+            .with_context(|| format!("invalid protection id in {}", path.display()))?;
         validate_reason(&lease.reason).with_context(|| {
             format!(
                 "invalid protection reason for lease {} in {}",
@@ -426,6 +447,23 @@ fn read_registry(path: &Path) -> Result<ProtectionRegistry> {
                 path.display()
             )
         })?;
+        if lease.created_at_unix > lease.expires_at_unix {
+            bail!(
+                "protection {} in {} expires before it was created",
+                lease.id,
+                path.display()
+            );
+        }
+        if !ids.insert(&lease.id) {
+            bail!("duplicate protection id {} in {}", lease.id, path.display());
+        }
+        if !paths.insert(&lease.path) {
+            bail!(
+                "duplicate protection path {} in {}",
+                lease.path.display(),
+                path.display()
+            );
+        }
     }
     Ok(registry)
 }
@@ -553,6 +591,28 @@ mod tests {
 
         let error = read_registry(&registry).expect_err("forged reasons should fail closed");
         assert!(error.to_string().contains("invalid protection reason"));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_reads_reject_invalid_ids() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut lease = add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        lease.id = "p-forged\nentry".into();
+        write_registry(
+            &registry,
+            &ProtectionRegistry {
+                version: REGISTRY_VERSION,
+                leases: vec![lease],
+            },
+        )?;
+
+        let error = read_registry(&registry).expect_err("invalid ids should fail closed");
+        assert!(error.to_string().contains("invalid protection id"));
         Ok(())
     }
 
