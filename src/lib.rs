@@ -459,11 +459,19 @@ enum GeneratedCandidateAction {
 }
 
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
-    let context = repo_context(repo)?;
     let protections = active_protections(options.now)?;
+    triage_with_protections(repo, options, &protections)
+}
+
+fn triage_with_protections(
+    repo: Option<&Path>,
+    options: TriageOptions,
+    protections: &[ProtectionLease],
+) -> Result<TriageReport> {
+    let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
     let worktree_decisions =
-        plan_worktree_cleanup(&worktrees, options.stale_days, options.now, &protections);
+        plan_worktree_cleanup(&worktrees, options.stale_days, options.now, protections);
     let generated_dirs = scan_generated_dirs(
         &worktrees,
         options.generated_days,
@@ -471,7 +479,7 @@ pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageRepor
         options.check_in_use,
         options.now,
         &options.generated_config,
-        &protections,
+        protections,
     )?;
 
     Ok(TriageReport {
@@ -484,7 +492,7 @@ pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageRepor
         check_in_use: options.check_in_use,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
-        protections,
+        protections: protections.to_vec(),
         worktrees,
         worktree_decisions,
         generated_dirs,
@@ -507,16 +515,20 @@ pub fn audit(repo: Option<&Path>, generated_days: u64, now: SystemTime) -> Resul
 
 pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
     let execute = options.execute;
-    let run = plan_cleanup(repo, options)?;
+    let protections = active_protections(options.now)?;
+    let run = plan_cleanup_with_protections(repo, options, &protections)?;
     if execute {
         execute_cleanup_manifest(&run.manifest)?;
     }
     Ok(run)
 }
 
-fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
+fn plan_cleanup_with_protections(
+    repo: Option<&Path>,
+    options: CleanupOptions,
+    protections: &[ProtectionLease],
+) -> Result<CleanupRun> {
     let context = repo_context(repo)?;
-    let protections = active_protections(options.now)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
     let generated_dirs = scan_generated_dirs(
         &worktrees,
@@ -525,12 +537,12 @@ fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupR
         options.check_in_use,
         options.now,
         &options.generated_config,
-        &protections,
+        protections,
     )?;
     let prune_output = run_worktree_prune(&context.current_worktree, false)?;
 
     let worktree_decisions =
-        plan_worktree_cleanup(&worktrees, options.stale_days, options.now, &protections);
+        plan_worktree_cleanup(&worktrees, options.stale_days, options.now, protections);
     let generated_decisions = generated_dirs
         .iter()
         .map(|dir| GeneratedDirDecision {
@@ -566,7 +578,7 @@ fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupR
         defer_lock_timeouts: options.defer_lock_timeouts,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
-        protections,
+        protections: protections.to_vec(),
         prune_output,
         worktrees: worktree_decisions,
         generated_dirs: generated_decisions,
@@ -583,9 +595,10 @@ fn plan_cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupR
 pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTriageReport> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
+    let protections = active_protections(options.now)?;
     let repositories = repositories
         .par_iter()
-        .map(|repo| triage(Some(repo), options.clone()))
+        .map(|repo| triage_with_protections(Some(repo), options.clone(), &protections))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(RootTriageReport {
@@ -612,9 +625,10 @@ pub fn cleanup_repositories(
     } else {
         CleanupMode::DryRun
     };
+    let protections = active_protections(options.now)?;
     let repositories = repositories
         .par_iter()
-        .map(|repo| plan_cleanup(Some(repo), options.clone()))
+        .map(|repo| plan_cleanup_with_protections(Some(repo), options.clone(), &protections))
         .collect::<Result<Vec<_>>>()?;
     let mut manifest = RootCleanupManifest {
         manifest_version: MANIFEST_VERSION,
@@ -630,7 +644,12 @@ pub fn cleanup_repositories(
             let repo_root = manifest.repositories[index].manifest.repo_root.clone();
             let mut refreshed_options = options.clone();
             refreshed_options.now = SystemTime::now();
-            let refreshed = plan_cleanup(Some(&repo_root), refreshed_options)?;
+            let refreshed_protections = active_protections(refreshed_options.now)?;
+            let refreshed = plan_cleanup_with_protections(
+                Some(&repo_root),
+                refreshed_options,
+                &refreshed_protections,
+            )?;
             manifest.repositories[index] = refreshed;
             write_root_manifest(&manifest)?;
             execute_cleanup_manifest(&manifest.repositories[index].manifest)?;
