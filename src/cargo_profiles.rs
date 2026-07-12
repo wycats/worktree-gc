@@ -14,7 +14,10 @@ use walkdir::WalkDir;
 use crate::cargo_incremental::with_cargo_profile_locks_timeout;
 use crate::SweepCandidateAction;
 
-const PROFILE_ACTIVITY_SAMPLE_DEPTH: usize = 2;
+// Cargo build-script outputs commonly live below build/<unit>/out, and
+// generated files can add another directory or two. Keep this bounded while
+// sampling deeply enough that rewriting an existing output is visible.
+const PROFILE_ACTIVITY_SAMPLE_DEPTH: usize = 6;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CargoProfileCandidateDecision {
@@ -183,13 +186,7 @@ pub(crate) fn execute_cargo_profile_sweep(
         if !candidate.path.exists() {
             continue;
         }
-        let refreshed = plan_cargo_profile_sweep(target_dir, worktree, days, SystemTime::now())?;
-        let still_stale = refreshed.candidates.iter().any(|refreshed| {
-            refreshed.path == candidate.path
-                && refreshed.cargo_profile.as_deref() == Some(profile)
-                && refreshed.action == SweepCandidateAction::Delete
-        });
-        if !still_stale {
+        if !profile_is_stale(target_dir, worktree, &candidate.path, profile, days)? {
             eprintln!(
                 "  keeping refreshed Cargo profile {}",
                 candidate.path.display()
@@ -201,6 +198,13 @@ pub(crate) fn execute_cargo_profile_sweep(
         // released before spawning Cargo because Cargo owns the public cleanup
         // transaction and acquires the same profile lock itself.
         with_cargo_profile_locks_timeout(target_dir, worktree, timeout, || ())?;
+        if !profile_is_stale(target_dir, worktree, &candidate.path, profile, days)? {
+            eprintln!(
+                "  keeping Cargo profile refreshed while waiting for its lock {}",
+                candidate.path.display()
+            );
+            continue;
+        }
 
         let mut child = Command::new("cargo")
             .args(["clean", "--profile", profile, "--manifest-path"])
@@ -216,16 +220,12 @@ pub(crate) fn execute_cargo_profile_sweep(
                     candidate.path.display()
                 )
             })?;
-        wait_for_cargo_clean(&mut child, timeout, &candidate.path)?;
+        wait_for_cargo_clean(&mut child, &candidate.path)?;
     }
     Ok(())
 }
 
-fn wait_for_cargo_clean(
-    child: &mut std::process::Child,
-    timeout: Option<Duration>,
-    profile_dir: &Path,
-) -> Result<()> {
+fn wait_for_cargo_clean(child: &mut std::process::Child, profile_dir: &Path) -> Result<()> {
     let started = Instant::now();
     let mut next_progress = Duration::from_secs(10);
     loop {
@@ -238,18 +238,6 @@ fn wait_for_cargo_clean(
                 profile_dir.display()
             );
         }
-        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "timed out waiting for cargo clean of {}",
-                    profile_dir.display()
-                ),
-            )
-            .into());
-        }
         if started.elapsed() >= next_progress {
             eprintln!(
                 "  waiting for Cargo to clean {} ({:.0}s)",
@@ -260,6 +248,21 @@ fn wait_for_cargo_clean(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn profile_is_stale(
+    target_dir: &Path,
+    worktree: &Path,
+    candidate_path: &Path,
+    profile: &str,
+    days: u64,
+) -> Result<bool> {
+    let refreshed = plan_cargo_profile_sweep(target_dir, worktree, days, SystemTime::now())?;
+    Ok(refreshed.candidates.iter().any(|refreshed| {
+        refreshed.path == candidate_path
+            && refreshed.cargo_profile.as_deref() == Some(profile)
+            && refreshed.action == SweepCandidateAction::Delete
+    }))
 }
 
 struct BuildContext {
@@ -507,6 +510,70 @@ mod tests {
 
         assert!(profile.is_dir());
         assert!(profile.join("deps/new.rlib").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_build_output_activity_keeps_a_profile() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        let output_dir = profile.join("build/fixture-hash/out/nested");
+        fs::create_dir_all(&output_dir)?;
+        let output = output_dir.join("generated.rs");
+        fs::write(&output, "old output")?;
+        age_fixture(&profile)?;
+        for path in [
+            profile.join("build"),
+            profile.join("build/fixture-hash"),
+            profile.join("build/fixture-hash/out"),
+            output_dir,
+            output.clone(),
+        ] {
+            set_old(&path)?;
+        }
+
+        // Rewriting an existing output does not refresh its ancestors.
+        fs::write(&output, "fresh output")?;
+        let plan = plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, SystemTime::now())?;
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&profile).unwrap())
+            .context("missing debug profile")?;
+        assert_eq!(candidate.action, SweepCandidateAction::Keep);
+        Ok(())
+    }
+
+    #[test]
+    fn profiles_refreshed_while_waiting_for_a_lock_survive() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture(&profile)?;
+        let target = repo.join("target");
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let held = File::options()
+            .read(true)
+            .write(true)
+            .open(profile.join(".cargo-lock"))?;
+        held.lock()?;
+        let refreshed_artifact = profile.join("deps/refreshed.rlib");
+        let refresher = thread::spawn(move || -> Result<()> {
+            thread::sleep(Duration::from_millis(50));
+            fs::write(&refreshed_artifact, "fresh artifact")?;
+            held.unlock()?;
+            Ok(())
+        });
+
+        execute_cargo_profile_sweep(
+            &target,
+            &repo,
+            &repo,
+            &plan.candidates,
+            7,
+            Some(Duration::from_secs(2)),
+        )?;
+        refresher.join().expect("refresher thread panicked")?;
+
+        assert!(profile.is_dir());
+        assert!(profile.join("deps/refreshed.rlib").is_file());
         Ok(())
     }
 
