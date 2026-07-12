@@ -467,8 +467,9 @@ fn format_expiry(unix: u64) -> String {
     UNIX_EPOCH
         .checked_add(std::time::Duration::from_secs(unix))
         .map(time::OffsetDateTime::from)
-        .and_then(|time| {
-            time.format(&time::format_description::well_known::Rfc3339)
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
                 .ok()
         })
         .unwrap_or_else(|| unix.to_string())
