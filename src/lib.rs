@@ -2393,13 +2393,22 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
         generated_sweeps.len()
     );
 
-    if pass == ExecutionPass::Routine {
-        execute_worktree_removals(manifest, pass, &worktree_removals)?;
-    }
+    let nested_in_planned_removal = |path: &Path| {
+        pass == ExecutionPass::Routine
+            && worktree_removals
+                .iter()
+                .any(|worktree| path.starts_with(&worktree.path))
+    };
+    let mut satisfied_filesystems = HashSet::new();
 
     for (index, decision) in generated_deletions.iter().enumerate() {
-        if pass != ExecutionPass::Routine && !pressure_should_continue(manifest, &decision.path)? {
-            break;
+        if nested_in_planned_removal(&decision.path) {
+            continue;
+        }
+        if pass != ExecutionPass::Routine
+            && !pressure_should_continue(manifest, &decision.path, &mut satisfied_filesystems)?
+        {
+            continue;
         }
         if index == 0 || index % 25 == 0 {
             eprintln!(
@@ -2440,7 +2449,7 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
     }
 
     for (index, decision) in generated_sweeps.iter().enumerate() {
-        if !decision.path.exists() {
+        if !decision.path.exists() || nested_in_planned_removal(&decision.path) {
             continue;
         }
         eprintln!(
@@ -2476,9 +2485,12 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
         }
     }
 
-    if pass != ExecutionPass::Routine {
-        execute_worktree_removals(manifest, pass, &worktree_removals)?;
-    }
+    execute_worktree_removals(
+        manifest,
+        pass,
+        &worktree_removals,
+        &mut satisfied_filesystems,
+    )?;
 
     Ok(())
 }
@@ -2487,10 +2499,13 @@ fn execute_worktree_removals(
     manifest: &CleanupManifest,
     pass: ExecutionPass,
     worktree_removals: &[&WorktreeDecision],
+    satisfied_filesystems: &mut HashSet<String>,
 ) -> Result<()> {
     for (index, decision) in worktree_removals.iter().enumerate() {
-        if pass != ExecutionPass::Routine && !pressure_should_continue(manifest, &decision.path)? {
-            break;
+        if pass != ExecutionPass::Routine
+            && !pressure_should_continue(manifest, &decision.path, satisfied_filesystems)?
+        {
+            continue;
         }
         eprintln!(
             "[worktree {}/{}] removing {}",
@@ -2529,11 +2544,19 @@ fn execution_matches(class: CleanupClass, pass: ExecutionPass) -> bool {
     )
 }
 
-fn pressure_should_continue(manifest: &CleanupManifest, path: &Path) -> Result<bool> {
+fn pressure_should_continue(
+    manifest: &CleanupManifest,
+    path: &Path,
+    satisfied_filesystems: &mut HashSet<String>,
+) -> Result<bool> {
     let policy = manifest
         .pressure
         .as_ref()
         .context("pressure candidate has no pressure policy")?;
+    let filesystem = filesystem_key(path)?;
+    if satisfied_filesystems.contains(&filesystem) {
+        return Ok(false);
+    }
     let available = fs4::available_space(path)
         .with_context(|| format!("failed to read free space for {}", path.display()))?;
     if available >= policy.target_bytes {
@@ -2542,9 +2565,30 @@ fn pressure_should_continue(manifest: &CleanupManifest, path: &Path) -> Result<b
             path.display(),
             format_bytes(available)
         );
+        satisfied_filesystems.insert(filesystem);
         return Ok(false);
     }
     Ok(true)
+}
+
+fn filesystem_key(path: &Path) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("failed to inspect filesystem for {}", path.display()))?;
+        Ok(format!("device:{}", metadata.dev()))
+    }
+    #[cfg(not(unix))]
+    {
+        let root = path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve filesystem for {}", path.display()))?
+            .components()
+            .next()
+            .context("path has no filesystem component")?;
+        Ok(format!("root:{root:?}"))
+    }
 }
 
 fn generated_rebuild_rank(name: &str) -> u8 {

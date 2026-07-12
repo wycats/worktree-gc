@@ -18,6 +18,7 @@ use crate::SweepCandidateAction;
 // generated files can add another directory or two. Keep this bounded while
 // sampling deeply enough that rewriting an existing output is visible.
 const PROFILE_ACTIVITY_SAMPLE_DEPTH: usize = 6;
+const MIN_CARGO_CLEAN_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CargoProfileCandidateDecision {
@@ -220,12 +221,16 @@ pub(crate) fn execute_cargo_profile_sweep(
                     candidate.path.display()
                 )
             })?;
-        wait_for_cargo_clean(&mut child, &candidate.path)?;
+        wait_for_cargo_clean(&mut child, cargo_clean_timeout(timeout), &candidate.path)?;
     }
     Ok(())
 }
 
-fn wait_for_cargo_clean(child: &mut std::process::Child, profile_dir: &Path) -> Result<()> {
+fn wait_for_cargo_clean(
+    child: &mut std::process::Child,
+    timeout: Option<Duration>,
+    profile_dir: &Path,
+) -> Result<()> {
     let started = Instant::now();
     let mut next_progress = Duration::from_secs(10);
     loop {
@@ -238,6 +243,18 @@ fn wait_for_cargo_clean(child: &mut std::process::Child, profile_dir: &Path) -> 
                 profile_dir.display()
             );
         }
+        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for cargo clean of {}",
+                    profile_dir.display()
+                ),
+            )
+            .into());
+        }
         if started.elapsed() >= next_progress {
             eprintln!(
                 "  waiting for Cargo to clean {} ({:.0}s)",
@@ -248,6 +265,10 @@ fn wait_for_cargo_clean(child: &mut std::process::Child, profile_dir: &Path) -> 
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn cargo_clean_timeout(lock_timeout: Option<Duration>) -> Option<Duration> {
+    lock_timeout.map(|timeout| timeout.max(MIN_CARGO_CLEAN_TIMEOUT))
 }
 
 fn profile_is_stale(
@@ -602,6 +623,19 @@ mod tests {
         assert!(profile.is_dir());
         held.unlock()?;
         Ok(())
+    }
+
+    #[test]
+    fn cargo_clean_uses_a_distinct_longer_execution_timeout() {
+        assert_eq!(
+            cargo_clean_timeout(Some(Duration::from_secs(30 * 60))),
+            Some(MIN_CARGO_CLEAN_TIMEOUT)
+        );
+        assert_eq!(
+            cargo_clean_timeout(Some(Duration::from_secs(3 * 60 * 60))),
+            Some(Duration::from_secs(3 * 60 * 60))
+        );
+        assert_eq!(cargo_clean_timeout(None), None);
     }
 
     #[test]
