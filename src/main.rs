@@ -9,7 +9,8 @@ use worktree_gc::{
     list_protections, print_cleanup, print_root_cleanup, print_root_triage, print_triage,
     remove_protection, renew_protection, triage, triage_roots, CleanupOptions, GeneratedDirConfig,
     SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
-    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -289,6 +290,45 @@ fn tool_name(tool: &SweepTool) -> &'static str {
     }
 }
 
+fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<GeneratedDirConfig> {
+    let mut generated_windows = std::collections::BTreeMap::new();
+    for (name, days) in &cleanup.generated_windows {
+        let normalized = name.trim();
+        anyhow::ensure!(
+            !normalized.is_empty(),
+            "invalid generated_windows key {name:?}: name must not be empty"
+        );
+        anyhow::ensure!(
+            DEFAULT_GENERATED_DELETE_NAMES.contains(&normalized),
+            "invalid generated_windows key {name:?}: scheduled cleanup supports {}",
+            DEFAULT_GENERATED_DELETE_NAMES.join(", ")
+        );
+        anyhow::ensure!(
+            generated_windows
+                .insert(normalized.to_string(), *days)
+                .is_none(),
+            "generated_windows keys normalize to duplicate name {normalized:?}"
+        );
+    }
+    let mut sweeps = Vec::new();
+    if let Some(size) = &cleanup.cargo_sweep_max_size {
+        let bytes = parse_size::parse_size(size)?;
+        sweeps.push(SweepStrategy {
+            name: "target".to_string(),
+            tool: SweepTool::CargoSweep,
+            limit: SweepLimit::MaxSize { bytes },
+        });
+    }
+    Ok(GeneratedDirConfig::from_names_with_default_sweeps(
+        true,
+        true,
+        Vec::new(),
+        Vec::new(),
+        generated_windows.into_iter().collect(),
+        sweeps,
+    ))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let now = SystemTime::now();
@@ -362,29 +402,13 @@ fn main() -> Result<()> {
                 "scheduled mode reads roots from {}; do not pass --repo or --root",
                 config_path.display()
             );
-            let mut sweeps = Vec::new();
-            if let Some(size) = &scheduled.cleanup.cargo_sweep_max_size {
-                let bytes = parse_size::parse_size(size)?;
-                sweeps.push(SweepStrategy {
-                    name: "target".to_string(),
-                    tool: SweepTool::CargoSweep,
-                    limit: SweepLimit::MaxSize { bytes },
-                });
-            }
             let options = CleanupOptions {
                 execute: !dry_run,
                 stale_days: scheduled.cleanup.stale_days,
                 generated_days: scheduled.cleanup.generated_days,
                 generated_activity_only: scheduled.cleanup.generated_activity_only,
                 check_in_use: scheduled.cleanup.check_in_use,
-                generated_config: GeneratedDirConfig::from_names_with_default_sweeps(
-                    true,
-                    true,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    sweeps,
-                ),
+                generated_config: scheduled_generated_config(&scheduled.cleanup)?,
                 cargo_lock_timeout: Some(std::time::Duration::from_secs(
                     scheduled
                         .cleanup
@@ -742,6 +766,61 @@ mod tests {
                 bytes: 50_000_000_000
             }
         );
+    }
+
+    #[test]
+    fn scheduled_generated_windows_override_build_cache_defaults() -> Result<()> {
+        let cleanup: config::CleanupConfig = toml::from_str(
+            r#"
+generated_days = 14
+generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
+"#,
+        )?;
+        let generated = scheduled_generated_config(&cleanup)?;
+
+        assert_eq!(generated.effective_days(".next", cleanup.generated_days), 7);
+        assert_eq!(
+            generated.effective_days(".turbo", cleanup.generated_days),
+            8
+        );
+        assert_eq!(
+            generated.effective_days("target", cleanup.generated_days),
+            9
+        );
+        assert_eq!(
+            generated.effective_days("node_modules", cleanup.generated_days),
+            10
+        );
+        assert_eq!(
+            generated.effective_days("other", cleanup.generated_days),
+            14
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_generated_windows_normalize_names_and_report_invalid_keys() -> Result<()> {
+        let cleanup: config::CleanupConfig =
+            toml::from_str("generated_windows = { ' target ' = 7 }")?;
+        let generated = scheduled_generated_config(&cleanup)?;
+        assert_eq!(generated.effective_days("target", 14), 7);
+
+        let empty: config::CleanupConfig = toml::from_str("generated_windows = { '' = 7 }")?;
+        let error = scheduled_generated_config(&empty).expect_err("empty names must be rejected");
+        assert!(error.to_string().contains("generated_windows key \"\""));
+
+        let duplicate: config::CleanupConfig =
+            toml::from_str("generated_windows = { target = 7, ' target ' = 8 }")?;
+        let error = scheduled_generated_config(&duplicate)
+            .expect_err("normalized duplicate names must be rejected");
+        assert!(error.to_string().contains("duplicate name \"target\""));
+
+        let typo: config::CleanupConfig = toml::from_str("generated_windows = { '.nex' = 7 }")?;
+        let error = scheduled_generated_config(&typo)
+            .expect_err("inactive scheduled names must be rejected");
+        assert!(error.to_string().contains("generated_windows key \".nex\""));
+        assert!(error.to_string().contains(".next"));
+        Ok(())
     }
 
     #[test]
