@@ -72,10 +72,11 @@ fn protection_registry_path_from(
     xdg_state_home: Option<OsString>,
     home: Option<OsString>,
 ) -> Option<PathBuf> {
-    if let Some(path) = xdg_state_home {
+    if let Some(path) = xdg_state_home.filter(|path| !path.is_empty()) {
         return Some(PathBuf::from(path).join("worktree-gc/protections.json"));
     }
-    home.map(PathBuf::from)
+    home.filter(|path| !path.is_empty())
+        .map(PathBuf::from)
         .map(|home| home.join(".local/state/worktree-gc/protections.json"))
 }
 
@@ -328,9 +329,20 @@ fn with_registry_lock<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> 
     lock.lock()
         .with_context(|| format!("failed to lock protection registry {}", path.display()))?;
     let result = operation();
-    lock.unlock()
-        .with_context(|| format!("failed to unlock protection registry {}", path.display()))?;
-    result
+    let unlock = lock
+        .unlock()
+        .with_context(|| format!("failed to unlock protection registry {}", path.display()));
+    finish_registry_operation(result, unlock)
+}
+
+fn finish_registry_operation<T>(operation: Result<T>, unlock: Result<()>) -> Result<T> {
+    match operation {
+        Err(error) => Err(error),
+        Ok(value) => {
+            unlock?;
+            Ok(value)
+        }
+    }
 }
 
 fn write_registry(path: &Path, registry: &ProtectionRegistry) -> Result<()> {
@@ -363,6 +375,30 @@ mod tests {
     #[test]
     fn missing_state_home_means_no_optional_registry() {
         assert!(protection_registry_path_from(None, None).is_none());
+        assert!(protection_registry_path_from(Some(OsString::new()), None).is_none());
+        assert_eq!(
+            protection_registry_path_from(
+                Some(OsString::new()),
+                Some(OsString::from("/home/example"))
+            ),
+            Some(PathBuf::from(
+                "/home/example/.local/state/worktree-gc/protections.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn operation_errors_take_precedence_over_unlock_errors() {
+        let operation = finish_registry_operation::<()>(
+            Err(anyhow::anyhow!("operation failed")),
+            Err(anyhow::anyhow!("unlock failed")),
+        )
+        .expect_err("operation should fail");
+        assert_eq!(operation.to_string(), "operation failed");
+
+        let unlock = finish_registry_operation(Ok(()), Err(anyhow::anyhow!("unlock failed")))
+            .expect_err("unlock should fail after a successful operation");
+        assert_eq!(unlock.to_string(), "unlock failed");
     }
 
     #[test]
