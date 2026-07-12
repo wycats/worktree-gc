@@ -196,6 +196,7 @@ pub enum GeneratedDirAction {
 pub struct WorktreeDecision {
     pub path: PathBuf,
     pub branch: Option<String>,
+    pub metadata_prunable: bool,
     pub action: WorktreeAction,
     pub reason: String,
     pub protection: Option<ProtectionMatch>,
@@ -666,7 +667,7 @@ fn execute_cleanup_manifest(manifest: &CleanupManifest) -> Result<()> {
 fn prunable_worktree_paths(worktrees: &[WorktreeDecision]) -> Vec<PathBuf> {
     worktrees
         .iter()
-        .filter(|worktree| worktree.action == WorktreeAction::PruneMetadata)
+        .filter(|worktree| worktree.metadata_prunable)
         .map(|worktree| worktree.path.clone())
         .collect()
 }
@@ -1940,6 +1941,7 @@ fn plan_worktree_cleanup(
             WorktreeDecision {
                 path: worktree.path.clone(),
                 branch: worktree.branch.clone(),
+                metadata_prunable: worktree.prunable.is_some() || !worktree.exists,
                 action,
                 reason,
                 protection,
@@ -3812,9 +3814,10 @@ mod tests {
 
     #[test]
     fn metadata_prune_guard_only_covers_prunable_worktrees() {
-        let decision = |path: &str, action| WorktreeDecision {
+        let decision = |path: &str, action, metadata_prunable| WorktreeDecision {
             path: PathBuf::from(path),
             branch: None,
+            metadata_prunable,
             action,
             reason: "fixture".to_string(),
             protection: None,
@@ -3823,14 +3826,18 @@ mod tests {
             activity_age_days: None,
         };
         let worktrees = vec![
-            decision("/worktrees/current", WorktreeAction::Keep),
-            decision("/worktrees/stale", WorktreeAction::PruneMetadata),
-            decision("/worktrees/remove", WorktreeAction::Remove),
+            decision("/worktrees/current", WorktreeAction::Keep, false),
+            decision("/worktrees/stale", WorktreeAction::PruneMetadata, true),
+            decision("/worktrees/protected-stale", WorktreeAction::Keep, true),
+            decision("/worktrees/remove", WorktreeAction::Remove, false),
         ];
 
         assert_eq!(
             prunable_worktree_paths(&worktrees),
-            vec![PathBuf::from("/worktrees/stale")]
+            vec![
+                PathBuf::from("/worktrees/stale"),
+                PathBuf::from("/worktrees/protected-stale")
+            ]
         );
     }
 
