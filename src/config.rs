@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 pub(crate) struct Config {
     pub roots: Vec<PathBuf>,
     pub cleanup: CleanupConfig,
+    pub pressure: PressureConfig,
     pub history: HistoryConfig,
 }
 
@@ -30,6 +31,32 @@ pub(crate) struct CleanupConfig {
 pub(crate) struct HistoryConfig {
     pub retention_days: u64,
     pub repository_refresh_days: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct PressureConfig {
+    pub enter_free_space: Option<String>,
+    pub target_free_space: Option<String>,
+    pub generated_days: u64,
+    pub stale_days: u64,
+}
+
+impl PressureConfig {
+    pub(crate) fn enabled(&self) -> bool {
+        self.enter_free_space.is_some() || self.target_free_space.is_some()
+    }
+}
+
+impl Default for PressureConfig {
+    fn default() -> Self {
+        Self {
+            enter_free_space: None,
+            target_free_space: None,
+            generated_days: 1,
+            stale_days: 7,
+        }
+    }
 }
 
 impl Default for CleanupConfig {
@@ -154,6 +181,12 @@ generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
 cargo_lock_timeout_minutes = 45
 cargo_sweep_max_size = "50GB"
 
+[pressure]
+enter_free_space = "100GiB"
+target_free_space = "150GiB"
+generated_days = 1
+stale_days = 7
+
 [history]
 retention_days = 120
 "#,
@@ -167,6 +200,11 @@ retention_days = 120
         assert_eq!(config.cleanup.generated_windows["target"], 9);
         assert_eq!(config.cleanup.generated_windows["node_modules"], 10);
         assert_eq!(config.cleanup.cargo_lock_timeout_minutes, 45);
+        let pressure = config.pressure;
+        assert_eq!(pressure.enter_free_space.as_deref(), Some("100GiB"));
+        assert_eq!(pressure.target_free_space.as_deref(), Some("150GiB"));
+        assert_eq!(pressure.generated_days, 1);
+        assert_eq!(pressure.stale_days, 7);
         assert_eq!(config.history.retention_days, 120);
         assert_eq!(config.history.repository_refresh_days, 7);
         Ok(())

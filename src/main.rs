@@ -1,6 +1,6 @@
 mod config;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -8,7 +8,7 @@ use worktree_gc::{
     add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories,
     list_protections, print_cleanup, print_root_cleanup, print_root_triage, print_triage,
     remove_protection, renew_protection, triage, triage_roots, CleanupOptions, GeneratedDirConfig,
-    SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
+    PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
     DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
     MAX_PROTECTION_TTL_DAYS,
 };
@@ -188,7 +188,7 @@ struct GeneratedArgs {
         value_name = "NAME=TOOL:LIMIT",
         value_delimiter = ',',
         value_parser = parse_sweep_strategy,
-        help = "In-place pruning for active dirs (e.g. target=rustc-incremental:14 or target=cargo-sweep:max-size=50GB); repeat or comma-separate"
+        help = "In-place pruning for active dirs (e.g. target=rustc-incremental:14, target=cargo-clean-profiles:7, or target=cargo-sweep:max-size=50GB); repeat or comma-separate"
     )]
     sweep: Vec<SweepStrategy>,
 
@@ -233,10 +233,11 @@ fn parse_sweep_strategy(raw: &str) -> Result<SweepStrategy, String> {
         .ok_or_else(|| format!("expected TOOL:LIMIT in '{raw}'"))?;
     let tool = match tool.trim() {
         "rustc-incremental" => SweepTool::RustcIncremental,
+        "cargo-clean-profiles" => SweepTool::CargoCleanProfiles,
         "cargo-sweep" => SweepTool::CargoSweep,
         other => {
             return Err(format!(
-                "unknown sweep tool '{other}' (supported: rustc-incremental, cargo-sweep)"
+                "unknown sweep tool '{other}' (supported: rustc-incremental, cargo-clean-profiles, cargo-sweep)"
             ))
         }
     };
@@ -286,6 +287,7 @@ impl GeneratedArgs {
 fn tool_name(tool: &SweepTool) -> &'static str {
     match tool {
         SweepTool::RustcIncremental => "rustc-incremental",
+        SweepTool::CargoCleanProfiles => "cargo-clean-profiles",
         SweepTool::CargoSweep => "cargo-sweep",
     }
 }
@@ -327,6 +329,52 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
         generated_windows.into_iter().collect(),
         sweeps,
     ))
+}
+
+fn scheduled_pressure_policy(
+    pressure: &config::PressureConfig,
+    cleanup: &config::CleanupConfig,
+) -> Result<Option<PressurePolicy>> {
+    if !pressure.enabled() {
+        return Ok(None);
+    }
+    let enter = pressure
+        .enter_free_space
+        .as_deref()
+        .context("pressure.enter_free_space is required when pressure cleanup is configured")?;
+    let target = pressure
+        .target_free_space
+        .as_deref()
+        .context("pressure.target_free_space is required when pressure cleanup is configured")?;
+    let enter_bytes = parse_size::parse_size(enter)?;
+    let target_bytes = parse_size::parse_size(target)?;
+    anyhow::ensure!(
+        target_bytes > enter_bytes,
+        "pressure.target_free_space must be greater than pressure.enter_free_space"
+    );
+    anyhow::ensure!(
+        pressure.generated_days <= cleanup.generated_days,
+        "pressure.generated_days must not exceed cleanup.generated_days"
+    );
+    anyhow::ensure!(
+        pressure.generated_days > 0,
+        "pressure.generated_days must be at least 1"
+    );
+    anyhow::ensure!(
+        pressure.stale_days <= cleanup.stale_days,
+        "pressure.stale_days must not exceed cleanup.stale_days"
+    );
+    anyhow::ensure!(
+        pressure.stale_days > 0,
+        "pressure.stale_days must be at least 1"
+    );
+    Ok(Some(PressurePolicy {
+        enter_bytes,
+        target_bytes,
+        generated_days: pressure.generated_days,
+        stale_days: pressure.stale_days,
+        active: false,
+    }))
 }
 
 fn main() -> Result<()> {
@@ -376,6 +424,7 @@ fn main() -> Result<()> {
                 generated_config: generated.config(),
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
+                pressure: None,
                 now,
             };
             if roots.is_empty() {
@@ -416,6 +465,7 @@ fn main() -> Result<()> {
                         .saturating_mul(60),
                 )),
                 defer_lock_timeouts: true,
+                pressure: scheduled_pressure_policy(&scheduled.pressure, &scheduled.cleanup)?,
                 now,
             };
             let repositories = scheduled_repositories(
@@ -738,7 +788,16 @@ mod tests {
             "target=cargo-sweep:30",
         ]);
         let sweeps = config.sweep_strategies("target");
-        assert_eq!(sweeps.len(), 2);
+        assert_eq!(sweeps.len(), 3);
+        assert_eq!(
+            sweeps
+                .iter()
+                .find(|strategy| strategy.tool == SweepTool::CargoCleanProfiles)
+                .map(|strategy| &strategy.limit),
+            Some(&SweepLimit::AgeDays {
+                days: worktree_gc::DEFAULT_CARGO_PROFILE_SWEEP_DAYS
+            })
+        );
         assert_eq!(
             sweeps
                 .iter()
@@ -769,6 +828,15 @@ mod tests {
     }
 
     #[test]
+    fn cargo_clean_profiles_accepts_an_age_limit() {
+        let strategy = parse_sweep_strategy("target=cargo-clean-profiles:9")
+            .expect("Cargo profile strategy should parse");
+        assert_eq!(strategy.tool, SweepTool::CargoCleanProfiles);
+        assert_eq!(strategy.limit, SweepLimit::AgeDays { days: 9 });
+        assert!(parse_sweep_strategy("target=cargo-clean-profiles:max-size=1GB").is_err());
+    }
+
+    #[test]
     fn scheduled_generated_windows_override_build_cache_defaults() -> Result<()> {
         let cleanup: config::CleanupConfig = toml::from_str(
             r#"
@@ -796,6 +864,44 @@ generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
             14
         );
         Ok(())
+    }
+
+    #[test]
+    fn scheduled_pressure_policy_uses_free_space_hysteresis() -> Result<()> {
+        let pressure: config::PressureConfig = toml::from_str(
+            r#"
+enter_free_space = "100GiB"
+target_free_space = "150GiB"
+generated_days = 1
+stale_days = 7
+"#,
+        )?;
+        let cleanup = config::CleanupConfig::default();
+        let policy = scheduled_pressure_policy(&pressure, &cleanup)?.context("missing policy")?;
+        assert_eq!(policy.enter_bytes, 100 * 1024 * 1024 * 1024);
+        assert_eq!(policy.target_bytes, 150 * 1024 * 1024 * 1024);
+        assert_eq!(policy.generated_days, 1);
+        assert_eq!(policy.stale_days, 7);
+        assert!(!policy.active);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_pressure_policy_validates_thresholds() {
+        let cleanup = config::CleanupConfig::default();
+        let missing_target: config::PressureConfig =
+            toml::from_str("enter_free_space = '100GiB'").unwrap();
+        assert!(scheduled_pressure_policy(&missing_target, &cleanup).is_err());
+
+        let reversed: config::PressureConfig =
+            toml::from_str("enter_free_space = '150GiB'\ntarget_free_space = '100GiB'").unwrap();
+        assert!(scheduled_pressure_policy(&reversed, &cleanup).is_err());
+
+        let zero_days: config::PressureConfig = toml::from_str(
+            "enter_free_space = '100GiB'\ntarget_free_space = '150GiB'\ngenerated_days = 0",
+        )
+        .unwrap();
+        assert!(scheduled_pressure_policy(&zero_days, &cleanup).is_err());
     }
 
     #[test]
