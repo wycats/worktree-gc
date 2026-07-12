@@ -135,7 +135,7 @@ fn parse_protection_ttl(raw: &str) -> Result<u64, String> {
         .strip_suffix('d')
         .unwrap_or(raw)
         .parse::<u64>()
-        .map_err(|_| format!("invalid TTL '{raw}'; expected a day count such as 7d"))?;
+        .map_err(|_| format!("invalid TTL '{raw}'; expected a day count such as 7 or 7d"))?;
     if days == 0 {
         return Err("protection TTL must be at least 1 day".to_string());
     }
@@ -799,6 +799,8 @@ mod tests {
         assert!(parse_protection_ttl("0d").is_err());
         assert!(parse_protection_ttl("31d").is_err());
         assert!(parse_protection_ttl("forever").is_err());
+        assert_eq!(parse_protection_ttl("7"), Ok(7));
+        assert_eq!(parse_protection_ttl("7d"), Ok(7));
         assert_eq!(format_expiry(u64::MAX), u64::MAX.to_string());
     }
 
