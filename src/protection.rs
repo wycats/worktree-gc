@@ -14,6 +14,7 @@ pub const DEFAULT_PROTECTION_TTL_DAYS: u64 = 7;
 pub const MAX_PROTECTION_TTL_DAYS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProtectionLease {
     pub id: String,
     pub path: PathBuf,
@@ -245,6 +246,19 @@ fn read_active_protections(registry_path: &Path, now: SystemTime) -> Result<Vec<
     let mut registry = read_registry(registry_path)?;
     let original_len = registry.leases.len();
     registry.leases.retain(|lease| lease.is_active(now));
+    let max_expiry =
+        unix_seconds(now).saturating_add(MAX_PROTECTION_TTL_DAYS.saturating_mul(86_400));
+    if let Some(lease) = registry
+        .leases
+        .iter()
+        .find(|lease| lease.expires_at_unix > max_expiry)
+    {
+        bail!(
+            "protection {} in {} expires beyond the {MAX_PROTECTION_TTL_DAYS}-day limit",
+            lease.id,
+            registry_path.display()
+        );
+    }
     if registry.leases.len() != original_len {
         write_registry(registry_path, &registry)?;
     }
@@ -445,6 +459,53 @@ mod tests {
 
         let error = read_registry(&registry).expect_err("forged reasons should fail closed");
         assert!(error.to_string().contains("invalid protection reason"));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_reads_reject_unknown_lease_fields() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("protections.json");
+        fs::write(
+            &registry,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": REGISTRY_VERSION,
+                "leases": [{
+                    "id": "p-fixture",
+                    "path": "/tmp/protected",
+                    "reason": "fixture",
+                    "created_at_unix": 1,
+                    "expires_at_unix": 2,
+                    "unexpected": true
+                }]
+            }))?,
+        )?;
+
+        let error = read_registry(&registry).expect_err("unknown fields should fail closed");
+        assert!(format!("{error:#}").contains("unknown field"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_reads_reject_expiry_beyond_the_ttl_cap() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut lease = add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        lease.expires_at_unix = u64::MAX;
+        write_registry(
+            &registry,
+            &ProtectionRegistry {
+                version: REGISTRY_VERSION,
+                leases: vec![lease],
+            },
+        )?;
+
+        let error = active_protections_at(&registry, now)
+            .expect_err("out-of-policy expiry should fail closed");
+        assert!(error.to_string().contains("expires beyond"));
         Ok(())
     }
 
