@@ -643,11 +643,7 @@ pub fn cleanup_repositories(
 }
 
 fn execute_cleanup_manifest(manifest: &CleanupManifest) -> Result<()> {
-    let worktree_paths = manifest
-        .worktrees
-        .iter()
-        .map(|worktree| worktree.path.clone())
-        .collect::<Vec<_>>();
+    let worktree_paths = prunable_worktree_paths(&manifest.worktrees);
     match with_protection_guard_for_paths(&worktree_paths, SystemTime::now(), || {
         run_worktree_prune(&manifest.current_worktree, true)
     })? {
@@ -665,6 +661,14 @@ fn execute_cleanup_manifest(manifest: &CleanupManifest) -> Result<()> {
         }
     }
     execute_cleanup(manifest)
+}
+
+fn prunable_worktree_paths(worktrees: &[WorktreeDecision]) -> Vec<PathBuf> {
+    worktrees
+        .iter()
+        .filter(|worktree| worktree.action == WorktreeAction::PruneMetadata)
+        .map(|worktree| worktree.path.clone())
+        .collect()
 }
 
 pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -3804,6 +3808,30 @@ mod tests {
         );
         assert!(decision.reason.contains("packaging in progress"));
         Ok(())
+    }
+
+    #[test]
+    fn metadata_prune_guard_only_covers_prunable_worktrees() {
+        let decision = |path: &str, action| WorktreeDecision {
+            path: PathBuf::from(path),
+            branch: None,
+            action,
+            reason: "fixture".to_string(),
+            protection: None,
+            dirty_count: None,
+            last_commit: None,
+            activity_age_days: None,
+        };
+        let worktrees = vec![
+            decision("/worktrees/current", WorktreeAction::Keep),
+            decision("/worktrees/stale", WorktreeAction::PruneMetadata),
+            decision("/worktrees/remove", WorktreeAction::Remove),
+        ];
+
+        assert_eq!(
+            prunable_worktree_paths(&worktrees),
+            vec![PathBuf::from("/worktrees/stale")]
+        );
     }
 
     #[test]

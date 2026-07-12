@@ -205,9 +205,8 @@ fn add_protection_at(
     let reason = reason.trim();
     validate_reason(reason)?;
     let path = fs::canonicalize(path)
-        .with_context(|| format!("failed to resolve protection path {}", path.display()))?;
-    validate_stored_path(&path)
-        .with_context(|| format!("invalid protection path {}", path.display()))?;
+        .with_context(|| format!("failed to resolve protection path {path:?}"))?;
+    validate_stored_path(&path).with_context(|| format!("invalid protection path {path:?}"))?;
     let mut registry = read_registry(registry_path)?;
     registry.leases.retain(|lease| lease.is_active(now));
     if registry.leases.iter().any(|lease| lease.path == path) {
@@ -964,7 +963,10 @@ mod tests {
 
         let error = add_protection_at(&registry, &protected, "fixture".into(), 7, now)
             .expect_err("control characters in paths should be rejected before writing");
-        assert!(error.to_string().contains("invalid protection path"));
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("invalid protection path"));
+        assert!(rendered.contains("forged\\npath"));
+        assert!(!rendered.contains("forged\npath"));
         assert!(!registry.exists());
         Ok(())
     }
