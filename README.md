@@ -195,7 +195,7 @@ roots = [
 [cleanup]
 stale_days = 14
 generated_days = 7
-# Explicit entries override the tighter built-in 3-day window for build caches.
+# Per-directory entries override generated_days and any tighter built-in window.
 generated_windows = { ".next" = 7, ".turbo" = 7, target = 7, node_modules = 7 }
 generated_activity_only = true
 check_in_use = true
@@ -209,9 +209,9 @@ repository_refresh_days = 7
 ```
 
 `generated_windows` has the same meaning as repeated CLI
-`--generated-window NAME=DAYS` arguments. This lets scheduled policy override
-the tighter built-in window for `.next`, `.turbo`, and `target` without changing
-interactive cleanup defaults.
+`--generated-window NAME=DAYS` arguments and applies to any configured generated
+directory name. Build caches (`.next`, `.turbo`, and `target`) otherwise use a
+tighter built-in window; other names use `generated_days`.
 
 The Cargo lock timeout applies to each generated `target` directory. A
 contended target is deferred to a later run, recorded under

@@ -290,17 +290,20 @@ fn tool_name(tool: &SweepTool) -> &'static str {
 }
 
 fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<GeneratedDirConfig> {
-    let generated_windows = cleanup
-        .generated_windows
-        .iter()
-        .map(|(name, days)| {
-            anyhow::ensure!(
-                !name.is_empty() && name == name.trim(),
-                "generated window names must be non-empty and contain no surrounding whitespace"
-            );
-            Ok((name.clone(), *days))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut generated_windows = std::collections::BTreeMap::new();
+    for (name, days) in &cleanup.generated_windows {
+        let normalized = name.trim();
+        anyhow::ensure!(
+            !normalized.is_empty(),
+            "invalid generated_windows key {name:?}: name must not be empty"
+        );
+        anyhow::ensure!(
+            generated_windows
+                .insert(normalized.to_string(), *days)
+                .is_none(),
+            "generated_windows keys normalize to duplicate name {normalized:?}"
+        );
+    }
     let mut sweeps = Vec::new();
     if let Some(size) = &cleanup.cargo_sweep_max_size {
         let bytes = parse_size::parse_size(size)?;
@@ -315,7 +318,7 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
         true,
         Vec::new(),
         Vec::new(),
-        generated_windows,
+        generated_windows.into_iter().collect(),
         sweeps,
     ))
 }
@@ -790,10 +793,21 @@ generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
     }
 
     #[test]
-    fn scheduled_generated_windows_reject_ambiguous_names() -> Result<()> {
+    fn scheduled_generated_windows_normalize_names_and_report_invalid_keys() -> Result<()> {
         let cleanup: config::CleanupConfig =
             toml::from_str("generated_windows = { ' target ' = 7 }")?;
-        assert!(scheduled_generated_config(&cleanup).is_err());
+        let generated = scheduled_generated_config(&cleanup)?;
+        assert_eq!(generated.effective_days("target", 14), 7);
+
+        let empty: config::CleanupConfig = toml::from_str("generated_windows = { '' = 7 }")?;
+        let error = scheduled_generated_config(&empty).expect_err("empty names must be rejected");
+        assert!(error.to_string().contains("generated_windows key \"\""));
+
+        let duplicate: config::CleanupConfig =
+            toml::from_str("generated_windows = { target = 7, ' target ' = 8 }")?;
+        let error = scheduled_generated_config(&duplicate)
+            .expect_err("normalized duplicate names must be rejected");
+        assert!(error.to_string().contains("duplicate name \"target\""));
         Ok(())
     }
 
