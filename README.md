@@ -173,8 +173,10 @@ The registry is stored atomically at
 `$XDG_STATE_HOME/worktree-gc/protections.json` (or
 `~/.local/state/worktree-gc/protections.json`). Active protections and their
 expiry are included in cleanup manifests. Cleanup reloads the registry before
-each deletion or sweep, so a protection added after planning still takes
-precedence during execution.
+each deletion or sweep and holds the registry lock through that mutation. A
+protection created after planning but before the mutation lock is acquired
+takes precedence; a concurrent `protect add` waits for an operation that has
+already started.
 
 ## Scheduled cleanup
 

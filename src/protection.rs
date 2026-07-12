@@ -2,7 +2,8 @@ use anyhow::{bail, Context, Result};
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,12 @@ pub struct ProtectionMatch {
     pub expires_at_unix: u64,
 }
 
+#[derive(Debug)]
+pub enum ProtectionGuardOutcome<T> {
+    Protected(ProtectionMatch),
+    Executed(T),
+}
+
 impl From<&ProtectionLease> for ProtectionMatch {
     fn from(lease: &ProtectionLease) -> Self {
         Self {
@@ -54,11 +61,22 @@ struct ProtectionRegistry {
 }
 
 pub fn protection_registry_path() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(path).join("worktree-gc/protections.json"));
+    optional_protection_registry_path().context("neither XDG_STATE_HOME nor HOME is set")
+}
+
+fn optional_protection_registry_path() -> Option<PathBuf> {
+    protection_registry_path_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+fn protection_registry_path_from(
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(path) = xdg_state_home {
+        return Some(PathBuf::from(path).join("worktree-gc/protections.json"));
     }
-    let home = std::env::var_os("HOME").context("neither XDG_STATE_HOME nor HOME is set")?;
-    Ok(PathBuf::from(home).join(".local/state/worktree-gc/protections.json"))
+    home.map(PathBuf::from)
+        .map(|home| home.join(".local/state/worktree-gc/protections.json"))
 }
 
 #[cfg(test)]
@@ -69,16 +87,60 @@ pub fn active_protections(now: SystemTime) -> Result<Vec<ProtectionLease>> {
 
 #[cfg(not(test))]
 pub fn active_protections(now: SystemTime) -> Result<Vec<ProtectionLease>> {
-    let registry_path = protection_registry_path()?;
-    if !registry_path.exists() {
+    let Some(registry_path) = optional_protection_registry_path() else {
         return Ok(Vec::new());
-    }
-    with_registry_lock(&registry_path, || {
-        Ok(read_registry(&registry_path)?
+    };
+    active_protections_at(&registry_path, now)
+}
+
+fn active_protections_at(path: &Path, now: SystemTime) -> Result<Vec<ProtectionLease>> {
+    with_registry_lock(path, || {
+        Ok(read_registry(path)?
             .leases
             .into_iter()
             .filter(|lease| lease.is_active(now))
             .collect())
+    })
+}
+
+#[cfg(test)]
+pub fn with_protection_guard<T>(
+    path: &Path,
+    now: SystemTime,
+    operation: impl FnOnce() -> T,
+) -> Result<ProtectionGuardOutcome<T>> {
+    let _ = (path, now);
+    Ok(ProtectionGuardOutcome::Executed(operation()))
+}
+
+#[cfg(not(test))]
+pub fn with_protection_guard<T>(
+    path: &Path,
+    now: SystemTime,
+    operation: impl FnOnce() -> T,
+) -> Result<ProtectionGuardOutcome<T>> {
+    let Some(registry_path) = optional_protection_registry_path() else {
+        return Ok(ProtectionGuardOutcome::Executed(operation()));
+    };
+    with_protection_guard_at(&registry_path, path, now, operation)
+}
+
+fn with_protection_guard_at<T>(
+    registry_path: &Path,
+    path: &Path,
+    now: SystemTime,
+    operation: impl FnOnce() -> T,
+) -> Result<ProtectionGuardOutcome<T>> {
+    with_registry_lock(registry_path, || {
+        let protections = read_registry(registry_path)?
+            .leases
+            .into_iter()
+            .filter(|lease| lease.is_active(now))
+            .collect::<Vec<_>>();
+        if let Some(lease) = protection_for_path(path, &protections) {
+            return Ok(ProtectionGuardOutcome::Protected(lease));
+        }
+        Ok(ProtectionGuardOutcome::Executed(operation()))
     })
 }
 
@@ -272,7 +334,7 @@ fn with_registry_lock<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> 
     lock.lock()
         .with_context(|| format!("failed to lock protection registry {}", path.display()))?;
     let result = operation();
-    File::unlock(&lock)
+    lock.unlock()
         .with_context(|| format!("failed to unlock protection registry {}", path.display()))?;
     result
 }
@@ -298,7 +360,91 @@ fn unix_seconds(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn missing_state_home_means_no_optional_registry() {
+        assert!(protection_registry_path_from(None, None).is_none());
+    }
+
+    #[test]
+    fn active_reads_lock_even_when_the_registry_is_missing_and_fail_closed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+
+        assert!(active_protections_at(&registry, now)?.is_empty());
+        assert!(registry.parent().unwrap().join("protections.lock").exists());
+
+        fs::write(&registry, b"not json")?;
+        let error = active_protections_at(&registry, now)
+            .expect_err("an unreadable registry must stop cleanup planning");
+        assert!(error.to_string().contains("failed to parse"));
+        Ok(())
+    }
+
+    #[test]
+    fn guard_blocks_a_protected_operation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        add_protection_at(&registry, &protected, "active gate".into(), 7, now)?;
+        let ran = Cell::new(false);
+
+        let outcome = with_protection_guard_at(&registry, &protected, now, || ran.set(true))?;
+        assert!(matches!(outcome, ProtectionGuardOutcome::Protected(_)));
+        assert!(!ran.get());
+        Ok(())
+    }
+
+    #[test]
+    fn guard_holds_the_registry_lock_through_the_operation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let worker_registry = registry.clone();
+        let worker_protected = protected.clone();
+        let worker = thread::spawn(move || {
+            with_protection_guard_at(&worker_registry, &worker_protected, now, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv()?;
+
+        let (added_tx, added_rx) = mpsc::sync_channel(0);
+        let add_registry = registry.clone();
+        let add_protected = protected.clone();
+        let adder = thread::spawn(move || {
+            let result = with_registry_lock(&add_registry, || {
+                add_protection_at(&add_registry, &add_protected, "late lease".into(), 7, now)
+            });
+            added_tx.send(result).unwrap();
+        });
+
+        assert!(matches!(
+            added_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(())?;
+        assert!(matches!(
+            worker.join().unwrap()?,
+            ProtectionGuardOutcome::Executed(())
+        ));
+        added_rx.recv_timeout(Duration::from_secs(2))??;
+        adder.join().unwrap();
+        Ok(())
+    }
 
     #[test]
     fn recursive_matching_protects_ancestors_and_descendants() -> Result<()> {

@@ -456,10 +456,14 @@ fn main() -> Result<()> {
 }
 
 fn format_expiry(unix: u64) -> String {
-    let time = UNIX_EPOCH + std::time::Duration::from_secs(unix);
-    time::OffsetDateTime::from(time)
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| unix.to_string())
+    UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(unix))
+        .map(time::OffsetDateTime::from)
+        .and_then(|time| {
+            time.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| unix.to_string())
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -795,6 +799,7 @@ mod tests {
         assert!(parse_protection_ttl("0d").is_err());
         assert!(parse_protection_ttl("31d").is_err());
         assert!(parse_protection_ttl("forever").is_err());
+        assert_eq!(format_expiry(u64::MAX), u64::MAX.to_string());
     }
 
     #[test]

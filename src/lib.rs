@@ -23,8 +23,9 @@ use walkdir::WalkDir;
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use protection::{
     active_protections, add_protection, list_protections, protection_for_path,
-    protection_registry_path, remove_protection, renew_protection, ProtectionLease,
-    ProtectionMatch, DEFAULT_PROTECTION_TTL_DAYS, MAX_PROTECTION_TTL_DAYS,
+    protection_registry_path, remove_protection, renew_protection, with_protection_guard,
+    ProtectionGuardOutcome, ProtectionLease, ProtectionMatch, DEFAULT_PROTECTION_TTL_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 pub const DEFAULT_STALE_DAYS: u64 = 30;
@@ -1355,7 +1356,7 @@ fn scan_generated_dirs_for_worktree(
                 format!(
                     "protected by {} until {}: {}",
                     lease.id,
-                    format_unix_time(lease.expires_at_unix as i64),
+                    format_unix_seconds(lease.expires_at_unix),
                     lease.reason
                 ),
             )
@@ -1869,7 +1870,7 @@ fn plan_worktree_cleanup(
                     format!(
                         "protected by {} until {}: {}",
                         lease.id,
-                        format_unix_time(lease.expires_at_unix as i64),
+                        format_unix_seconds(lease.expires_at_unix),
                         lease.reason
                     ),
                 )
@@ -1966,25 +1967,22 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
         if decision.action != WorktreeAction::Remove {
             continue;
         }
-        if let Some(lease) = current_protection_for_path(&decision.path)? {
-            eprintln!(
-                "  keeping {} because protection {} is active: {}",
-                decision.path.display(),
-                lease.id,
-                lease.reason
-            );
-            continue;
+        match with_protection_guard(&decision.path, SystemTime::now(), || {
+            git_status_command(
+                &manifest.current_worktree,
+                [
+                    "worktree".as_ref(),
+                    "remove".as_ref(),
+                    decision.path.as_os_str(),
+                ],
+            )
+            .with_context(|| format!("failed to remove {}", decision.path.display()))
+        })? {
+            ProtectionGuardOutcome::Protected(lease) => {
+                print_execution_protection(&decision.path, &lease);
+            }
+            ProtectionGuardOutcome::Executed(result) => result?,
         }
-
-        git_status_command(
-            &manifest.current_worktree,
-            [
-                "worktree".as_ref(),
-                "remove".as_ref(),
-                decision.path.as_os_str(),
-            ],
-        )
-        .with_context(|| format!("failed to remove {}", decision.path.display()))?;
     }
 
     for (index, decision) in generated_deletions.iter().enumerate() {
@@ -2001,20 +1999,19 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
         if decision.action != GeneratedDirAction::Delete {
             continue;
         }
-        if let Some(lease) = current_protection_for_path(&decision.path)? {
-            eprintln!(
-                "  keeping {} because protection {} is active: {}",
-                decision.path.display(),
-                lease.id,
-                lease.reason
-            );
-            continue;
-        }
-
-        if let Err(error) = remove_generated_directory(
-            decision,
-            manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
-        ) {
+        let result = match with_protection_guard(&decision.path, SystemTime::now(), || {
+            remove_generated_directory(
+                decision,
+                manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
+            )
+        })? {
+            ProtectionGuardOutcome::Protected(lease) => {
+                print_execution_protection(&decision.path, &lease);
+                continue;
+            }
+            ProtectionGuardOutcome::Executed(result) => result,
+        };
+        if let Err(error) = result {
             if manifest.defer_lock_timeouts && is_cargo_lock_timeout(&error) {
                 write_deferred_cargo_action(decision, &run_id, &error)?;
                 eprintln!(
@@ -2035,20 +2032,20 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
             decision.path.display()
         );
         flush_stderr();
-        if let Some(lease) = current_protection_for_path(&decision.path)? {
-            eprintln!(
-                "  keeping {} because protection {} is active: {}",
-                decision.path.display(),
-                lease.id,
-                lease.reason
-            );
-            continue;
-        }
-        if let Err(error) = run_sweeps(
-            decision,
-            &run_id,
-            manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
-        ) {
+        let result = match with_protection_guard(&decision.path, SystemTime::now(), || {
+            run_sweeps(
+                decision,
+                &run_id,
+                manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
+            )
+        })? {
+            ProtectionGuardOutcome::Protected(lease) => {
+                print_execution_protection(&decision.path, &lease);
+                continue;
+            }
+            ProtectionGuardOutcome::Executed(result) => result,
+        };
+        if let Err(error) = result {
             if manifest.defer_lock_timeouts && is_cargo_lock_timeout(&error) {
                 write_deferred_cargo_action(decision, &run_id, &error)?;
                 eprintln!(
@@ -2064,9 +2061,14 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
     Ok(())
 }
 
-fn current_protection_for_path(path: &Path) -> Result<Option<ProtectionMatch>> {
-    let protections = active_protections(SystemTime::now())?;
-    Ok(protection_for_path(path, &protections))
+fn print_execution_protection(path: &Path, lease: &ProtectionMatch) {
+    eprintln!(
+        "  keeping {} because protection {} is active until {}: {}",
+        path.display(),
+        lease.id,
+        format_unix_seconds(lease.expires_at_unix),
+        lease.reason
+    );
 }
 
 fn remove_generated_directory(
@@ -2315,7 +2317,7 @@ fn print_protections(protections: &[ProtectionLease]) {
             "- {} {} until {} ({})",
             lease.id,
             lease.path.display(),
-            format_unix_time(lease.expires_at_unix as i64),
+            format_unix_seconds(lease.expires_at_unix),
             lease.reason
         );
     }
@@ -2663,6 +2665,13 @@ fn format_unix_time(unix: i64) -> String {
     OffsetDateTime::from_unix_timestamp(unix)
         .ok()
         .and_then(|dt| dt.format(&Rfc3339).ok())
+        .unwrap_or_else(|| unix.to_string())
+}
+
+fn format_unix_seconds(unix: u64) -> String {
+    i64::try_from(unix)
+        .ok()
+        .map(format_unix_time)
         .unwrap_or_else(|| unix.to_string())
 }
 
