@@ -724,22 +724,7 @@ pub fn cleanup_repositories(
             options.now,
         )?;
         let observations = observe_free_space(&observation_paths)?;
-        for observation in &observations {
-            if policy.target_bytes > observation.total_bytes {
-                bail!(
-                    "pressure target {} exceeds total filesystem capacity {} at {}",
-                    format_bytes(policy.target_bytes),
-                    format_bytes(observation.total_bytes),
-                    observation.path.display()
-                );
-            }
-        }
-        policy.entered_filesystems = observations
-            .iter()
-            .filter(|observation| observation.available_bytes < policy.enter_bytes)
-            .map(|observation| observation.filesystem.clone())
-            .collect();
-        policy.active = !policy.entered_filesystems.is_empty();
+        activate_pressure_policy(policy, &observations)?;
         Some(PressureRunDecision {
             policy: policy.clone(),
             observations,
@@ -836,6 +821,34 @@ pub fn cleanup_repositories(
         manifest_path,
         manifest,
     })
+}
+
+fn activate_pressure_policy(
+    policy: &mut PressurePolicy,
+    observations: &[PressureObservation],
+) -> Result<()> {
+    policy.entered_filesystems = observations
+        .iter()
+        .filter(|observation| observation.available_bytes < policy.enter_bytes)
+        .map(|observation| observation.filesystem.clone())
+        .collect();
+    for observation in observations.iter().filter(|observation| {
+        policy
+            .entered_filesystems
+            .iter()
+            .any(|filesystem| filesystem == &observation.filesystem)
+    }) {
+        if policy.target_bytes > observation.total_bytes {
+            bail!(
+                "pressure target {} exceeds total filesystem capacity {} at {}",
+                format_bytes(policy.target_bytes),
+                format_bytes(observation.total_bytes),
+                observation.path.display()
+            );
+        }
+    }
+    policy.active = !policy.entered_filesystems.is_empty();
+    Ok(())
 }
 
 fn observe_free_space(paths: &[PathBuf]) -> Result<Vec<PressureObservation>> {
@@ -4632,6 +4645,37 @@ mod tests {
         assert!(error
             .to_string()
             .contains("exceeds total filesystem capacity"));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_capacity_validation_ignores_filesystems_that_did_not_enter() -> Result<()> {
+        let mut policy = PressurePolicy {
+            enter_bytes: 100,
+            target_bytes: 150,
+            generated_days: 1,
+            stale_days: 7,
+            active: false,
+            entered_filesystems: Vec::new(),
+        };
+        let observations = vec![
+            PressureObservation {
+                path: PathBuf::from("/pressured"),
+                filesystem: "pressured".to_string(),
+                available_bytes: 50,
+                total_bytes: 200,
+            },
+            PressureObservation {
+                path: PathBuf::from("/healthy-small"),
+                filesystem: "healthy-small".to_string(),
+                available_bytes: 120,
+                total_bytes: 120,
+            },
+        ];
+
+        activate_pressure_policy(&mut policy, &observations)?;
+        assert_eq!(policy.entered_filesystems, vec!["pressured"]);
+        assert!(policy.active);
         Ok(())
     }
 
