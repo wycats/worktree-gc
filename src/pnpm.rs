@@ -7,8 +7,9 @@ use crate::{format_bytes, CleanupMode};
 use anyhow::{bail, Context, Result};
 use atomic_write_file::AtomicWriteFile;
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -16,11 +17,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PNPM_MANIFEST_VERSION: u64 = 2;
+const PNPM_MANIFEST_VERSION: u64 = 3;
 const SUPPORTED_PNPM_PLANNER_VERSION: &str = "10.32.1";
 const MINUTES_PER_DAY: u64 = 24 * 60;
 const DEFAULT_PNPM_SCAN_THREADS: usize = 1;
 const MAX_PNPM_SCAN_THREADS: usize = 64;
+const PNPM_EVIDENCE_CACHE_VERSION: u64 = 1;
+const PNPM_EVIDENCE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct PnpmCollectOptions {
@@ -100,6 +103,7 @@ pub struct PnpmPrunePlan {
     pub complete: bool,
     pub visited_entries: u64,
     pub eligibility_digest: String,
+    pub content_evidence: PnpmContentEvidence,
     pub planner_supported: bool,
     pub unreferenced_content_files: u64,
     pub alien_content_directories: u64,
@@ -122,6 +126,23 @@ pub struct PnpmPrunePlan {
     pub open_handle_check_complete: bool,
     pub open_paths: Vec<PathBuf>,
     pub active_pnpm_processes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PnpmContentEvidence {
+    pub cache_path: Option<PathBuf>,
+    pub prefix_index_complete: bool,
+    pub total_prefixes: u64,
+    pub covered_prefixes: u64,
+    pub cached_prefixes: u64,
+    pub freshly_scanned_prefixes: u64,
+    pub pending_prefixes: u64,
+    pub coverage_complete: bool,
+    pub point_in_time_complete: bool,
+    pub oldest_observation_unix: Option<u64>,
+    pub newest_observation_unix: Option<u64>,
+    pub max_cache_age_seconds: u64,
+    pub semantics: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -278,6 +299,23 @@ pub fn print_pnpm_collect(run: &PnpmCollectRun) {
         if plan.complete { "" } else { " | incomplete" }
     );
     println!(
+        "content evidence: {}/{} prefixes covered ({} cached, {} fresh, {} pending){}",
+        plan.content_evidence.covered_prefixes,
+        plan.content_evidence.total_prefixes,
+        plan.content_evidence.cached_prefixes,
+        plan.content_evidence.freshly_scanned_prefixes,
+        plan.content_evidence.pending_prefixes,
+        if plan.content_evidence.point_in_time_complete {
+            " | current-run complete"
+        } else if plan.content_evidence.coverage_complete {
+            " | historical coverage; fresh execution proof required"
+        } else if !plan.content_evidence.prefix_index_complete {
+            " | prefix index incomplete"
+        } else {
+            ""
+        }
+    );
+    println!(
         "  store: {} private | {} allocated",
         format_bytes(plan.store_expected_reclaim.private_reclaimable_bytes),
         format_bytes(plan.store_expected_reclaim.allocated_bytes)
@@ -379,10 +417,22 @@ fn snapshot_pnpm(identity: &PnpmIdentity, options: &PnpmCollectOptions) -> Resul
         .collect::<Vec<_>>();
     unsupported_layout_paths.sort();
     let mut remaining = options.max_entries;
+    let evidence_cache_path = if options.execute {
+        None
+    } else {
+        Some(pnpm_evidence_cache_path(identity)?)
+    };
     let content = if unsupported_layout_paths.contains(&store_files) {
         empty_content_snapshot()
     } else {
-        snapshot_content(&store_files, &mut remaining, options.scan_threads)?
+        snapshot_content(
+            &store_files,
+            &mut remaining,
+            options.scan_threads,
+            evidence_cache_path.as_deref(),
+            &identity.version,
+            unix_seconds(options.now),
+        )?
     };
     let metadata_directories = metadata_directories(&identity.cache_path)?;
     let store_tmp_path = identity.store_path.join("tmp");
@@ -431,6 +481,7 @@ fn snapshot_pnpm(identity: &PnpmIdentity, options: &PnpmCollectOptions) -> Resul
         complete,
         visited_entries: options.max_entries.saturating_sub(remaining),
         eligibility_digest: content.digest,
+        content_evidence: content.evidence,
         planner_supported: identity.version == SUPPORTED_PNPM_PLANNER_VERSION,
         unreferenced_content_files: content.files,
         alien_content_directories: content.alien_directories,
@@ -465,6 +516,78 @@ struct ContentSnapshot {
     unmanaged_entries: u64,
     unsupported_entries: u64,
     metrics: InventoryMetrics,
+    evidence: PnpmContentEvidence,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PnpmEvidenceCache {
+    cache_version: u64,
+    store_files: PathBuf,
+    pnpm_version: String,
+    prefixes: BTreeMap<String, CachedPrefixSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedPrefixSnapshot {
+    fingerprint: PrefixFingerprint,
+    observed_at_unix: u64,
+    digest: String,
+    files: u64,
+    alien_directories: u64,
+    unsupported_entries: u64,
+    metrics: CachedInventoryMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PrefixFingerprint {
+    device: Option<u64>,
+    inode: Option<u64>,
+    modified_seconds: Option<i64>,
+    modified_nanoseconds: Option<i64>,
+    changed_seconds: Option<i64>,
+    changed_nanoseconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedInventoryMetrics {
+    logical_bytes: u64,
+    allocated_bytes: u64,
+    private_reclaimable_bytes: u64,
+    private_reclaimable_complete: bool,
+    files: u64,
+    directories: u64,
+    hardlink_duplicates: u64,
+    errors: u64,
+}
+
+impl From<&InventoryMetrics> for CachedInventoryMetrics {
+    fn from(metrics: &InventoryMetrics) -> Self {
+        Self {
+            logical_bytes: metrics.logical_bytes,
+            allocated_bytes: metrics.allocated_bytes,
+            private_reclaimable_bytes: metrics.private_reclaimable_bytes,
+            private_reclaimable_complete: metrics.private_reclaimable_complete,
+            files: metrics.files,
+            directories: metrics.directories,
+            hardlink_duplicates: metrics.hardlink_duplicates,
+            errors: metrics.errors,
+        }
+    }
+}
+
+impl From<&CachedInventoryMetrics> for InventoryMetrics {
+    fn from(metrics: &CachedInventoryMetrics) -> Self {
+        Self {
+            logical_bytes: metrics.logical_bytes,
+            allocated_bytes: metrics.allocated_bytes,
+            private_reclaimable_bytes: metrics.private_reclaimable_bytes,
+            private_reclaimable_complete: metrics.private_reclaimable_complete,
+            files: metrics.files,
+            directories: metrics.directories,
+            hardlink_duplicates: metrics.hardlink_duplicates,
+            errors: metrics.errors,
+        }
+    }
 }
 
 fn empty_content_snapshot() -> ContentSnapshot {
@@ -478,6 +601,21 @@ fn empty_content_snapshot() -> ContentSnapshot {
         metrics: InventoryMetrics {
             private_reclaimable_complete: true,
             ..InventoryMetrics::default()
+        },
+        evidence: PnpmContentEvidence {
+            cache_path: None,
+            prefix_index_complete: true,
+            total_prefixes: 0,
+            covered_prefixes: 0,
+            cached_prefixes: 0,
+            freshly_scanned_prefixes: 0,
+            pending_prefixes: 0,
+            coverage_complete: true,
+            point_in_time_complete: true,
+            oldest_observation_unix: None,
+            newest_observation_unix: None,
+            max_cache_age_seconds: PNPM_EVIDENCE_MAX_AGE_SECONDS,
+            semantics: "empty content store observed in the current run".into(),
         },
     }
 }
@@ -496,6 +634,9 @@ fn snapshot_content(
     root: &Path,
     remaining: &mut u64,
     scan_threads: usize,
+    evidence_cache_path: Option<&Path>,
+    pnpm_version: &str,
+    observed_at_unix: u64,
 ) -> Result<ContentSnapshot> {
     let mut hasher = Sha256::new();
     let mut files = 0u64;
@@ -516,6 +657,21 @@ fn snapshot_content(
             unmanaged_entries,
             unsupported_entries,
             metrics,
+            evidence: PnpmContentEvidence {
+                cache_path: evidence_cache_path.map(Path::to_path_buf),
+                prefix_index_complete: true,
+                total_prefixes: 0,
+                covered_prefixes: 0,
+                cached_prefixes: 0,
+                freshly_scanned_prefixes: 0,
+                pending_prefixes: 0,
+                coverage_complete: true,
+                point_in_time_complete: true,
+                oldest_observation_unix: None,
+                newest_observation_unix: None,
+                max_cache_age_seconds: PNPM_EVIDENCE_MAX_AGE_SECONDS,
+                semantics: "content store is absent".into(),
+            },
         });
     }
 
@@ -530,16 +686,73 @@ fn snapshot_content(
     if let Some(error) = first_error {
         return Err(error).context("scan pnpm content-addressed store root");
     }
-    let mut complete = visit.exhausted;
+    let root_complete = visit.exhausted;
     prefixes.sort();
 
-    if !prefixes.is_empty() && *remaining == 0 {
-        complete = false;
-    } else if !prefixes.is_empty() {
-        let prefix_count = prefixes.len() as u64;
-        let base_budget = *remaining / prefix_count;
-        let extra_budget = *remaining % prefix_count;
-        let budgets = prefixes
+    let _evidence_lock = evidence_cache_path
+        .map(acquire_evidence_cache_lock)
+        .transpose()?;
+    let mut cache = evidence_cache_path
+        .map(|path| load_evidence_cache(path, root, pnpm_version))
+        .transpose()?
+        .unwrap_or_else(|| empty_evidence_cache(root, pnpm_version));
+    let current_prefix_keys = prefixes
+        .iter()
+        .filter_map(|prefix| prefix.to_str().map(str::to_owned))
+        .collect::<HashSet<_>>();
+    if root_complete {
+        cache
+            .prefixes
+            .retain(|prefix, _| current_prefix_keys.contains(prefix));
+    }
+
+    let total_prefixes = prefixes.len() as u64;
+    let mut observed_snapshots = Vec::new();
+    let mut pending = Vec::new();
+    let mut cached_prefixes = 0u64;
+    for prefix in prefixes {
+        let fingerprint = prefix_fingerprint(&root.join(&prefix))?;
+        let cache_key = prefix.to_str().map(str::to_owned);
+        let cached = cache_key
+            .as_ref()
+            .and_then(|key| cache.prefixes.get(key))
+            .filter(|cached| {
+                cached.fingerprint == fingerprint
+                    && cached.observed_at_unix <= observed_at_unix
+                    && observed_at_unix.saturating_sub(cached.observed_at_unix)
+                        <= PNPM_EVIDENCE_MAX_AGE_SECONDS
+            });
+        if let Some(cached) = cached {
+            cached_prefixes += 1;
+            observed_snapshots.push(ObservedPrefixSnapshot {
+                snapshot: cached_prefix_snapshot(prefix, cached),
+                observed_at_unix: cached.observed_at_unix,
+            });
+        } else {
+            if let Some(key) = &cache_key {
+                cache.prefixes.remove(key);
+            }
+            pending.push(PrefixToScan {
+                prefix,
+                cache_key,
+                fingerprint,
+            });
+        }
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(scan_threads)
+        .thread_name(|index| format!("pnpm-store-scan-{index}"))
+        .build()
+        .context("create bounded pnpm store scan pool")?;
+    let mut freshly_scanned_prefixes = 0u64;
+    while !pending.is_empty() && *remaining > 0 {
+        let batch_len = scan_threads.min(pending.len());
+        let batch = pending.drain(..batch_len).collect::<Vec<_>>();
+        let batch_count = batch.len() as u64;
+        let base_budget = *remaining / batch_count;
+        let extra_budget = *remaining % batch_count;
+        let scans = batch
             .into_iter()
             .enumerate()
             .map(|(index, prefix)| {
@@ -547,43 +760,262 @@ fn snapshot_content(
                 (prefix, budget)
             })
             .collect::<Vec<_>>();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(scan_threads)
-            .thread_name(|index| format!("pnpm-store-scan-{index}"))
-            .build()
-            .context("create bounded pnpm store scan pool")?;
-        let snapshots = pool.install(|| {
-            budgets
+        let results = pool.install(|| {
+            scans
                 .into_par_iter()
-                .map(|(prefix, budget)| snapshot_content_prefix(root, prefix, budget))
+                .map(|(prefix, budget)| {
+                    let snapshot = snapshot_content_prefix(root, prefix.prefix.clone(), budget)?;
+                    Ok::<_, anyhow::Error>((prefix, snapshot))
+                })
                 .collect::<Vec<_>>()
         });
-        for snapshot in snapshots {
-            let snapshot = snapshot?;
+        let mut incomplete_batch = false;
+        for result in results {
+            let (prefix, mut snapshot) = result?;
+            freshly_scanned_prefixes += 1;
             *remaining = remaining.saturating_sub(snapshot.visited_entries);
-            complete &= snapshot.complete;
-            link_counts_complete &= snapshot.link_counts_complete;
-            files = files.saturating_add(snapshot.files);
-            alien_directories = alien_directories.saturating_add(snapshot.alien_directories);
-            unsupported_entries = unsupported_entries.saturating_add(snapshot.unsupported_entries);
-            if snapshot.files > 0 {
-                hasher.update(snapshot.prefix.to_string_lossy().as_bytes());
-                hasher.update([0]);
-                hasher.update(snapshot.digest.as_bytes());
+            if prefix_fingerprint(&root.join(&prefix.prefix))? != prefix.fingerprint {
+                snapshot.complete = false;
             }
-            add_metrics(&mut metrics, &snapshot.metrics);
+            let cacheable = snapshot.complete
+                && snapshot.link_counts_complete
+                && snapshot.unsupported_entries == 0;
+            if cacheable {
+                if let Some(key) = prefix.cache_key {
+                    cache.prefixes.insert(
+                        key,
+                        CachedPrefixSnapshot {
+                            fingerprint: prefix.fingerprint,
+                            observed_at_unix,
+                            digest: snapshot.digest.clone(),
+                            files: snapshot.files,
+                            alien_directories: snapshot.alien_directories,
+                            unsupported_entries: snapshot.unsupported_entries,
+                            metrics: CachedInventoryMetrics::from(&snapshot.metrics),
+                        },
+                    );
+                }
+            } else {
+                incomplete_batch = true;
+            }
+            observed_snapshots.push(ObservedPrefixSnapshot {
+                snapshot,
+                observed_at_unix,
+            });
+        }
+        // A prefix larger than its share cannot be resumed safely without
+        // retaining per-entry evidence. Stop here; completed siblings are
+        // cached, so the next bounded run gives the remaining prefixes a
+        // larger share instead of repeating the whole store.
+        if incomplete_batch {
+            break;
         }
     }
+    if let Some(path) = evidence_cache_path {
+        write_evidence_cache(path, &cache)?;
+    }
+
+    observed_snapshots.sort_by(|left, right| {
+        left.snapshot
+            .prefix
+            .as_os_str()
+            .cmp(right.snapshot.prefix.as_os_str())
+    });
+    let mut covered_prefixes = 0u64;
+    let mut oldest_observation_unix = None;
+    let mut newest_observation_unix = None;
+    for observed in observed_snapshots {
+        let snapshot = observed.snapshot;
+        let prefix_complete =
+            snapshot.complete && snapshot.link_counts_complete && snapshot.unsupported_entries == 0;
+        covered_prefixes += u64::from(prefix_complete);
+        link_counts_complete &= snapshot.link_counts_complete;
+        files = files.saturating_add(snapshot.files);
+        alien_directories = alien_directories.saturating_add(snapshot.alien_directories);
+        unsupported_entries = unsupported_entries.saturating_add(snapshot.unsupported_entries);
+        if snapshot.files > 0 {
+            hasher.update(snapshot.prefix.to_string_lossy().as_bytes());
+            hasher.update([0]);
+            hasher.update(snapshot.digest.as_bytes());
+        }
+        add_metrics(&mut metrics, &snapshot.metrics);
+        if prefix_complete {
+            oldest_observation_unix = Some(
+                oldest_observation_unix.map_or(observed.observed_at_unix, |oldest: u64| {
+                    oldest.min(observed.observed_at_unix)
+                }),
+            );
+            newest_observation_unix = Some(
+                newest_observation_unix.map_or(observed.observed_at_unix, |newest: u64| {
+                    newest.max(observed.observed_at_unix)
+                }),
+            );
+        }
+    }
+    let pending_prefixes = total_prefixes.saturating_sub(covered_prefixes);
+    let coverage_complete = root_complete && pending_prefixes == 0;
+    let point_in_time_complete = coverage_complete && cached_prefixes == 0;
 
     Ok(ContentSnapshot {
-        complete: complete && link_counts_complete && unsupported_entries == 0,
+        complete: point_in_time_complete && link_counts_complete && unsupported_entries == 0,
         digest: format!("sha256:{:x}", hasher.finalize()),
         files,
         alien_directories,
         unmanaged_entries,
         unsupported_entries,
         metrics,
+        evidence: PnpmContentEvidence {
+            cache_path: evidence_cache_path.map(Path::to_path_buf),
+            prefix_index_complete: root_complete,
+            total_prefixes,
+            covered_prefixes,
+            cached_prefixes,
+            freshly_scanned_prefixes,
+            pending_prefixes,
+            coverage_complete,
+            point_in_time_complete,
+            oldest_observation_unix,
+            newest_observation_unix,
+            max_cache_age_seconds: PNPM_EVIDENCE_MAX_AGE_SECONDS,
+            semantics: if evidence_cache_path.is_some() {
+                "cached prefixes are advisory historical observations; only a fully fresh current run is executable evidence"
+            } else {
+                "all reported prefixes were observed in the current run"
+            }
+            .into(),
+        },
     })
+}
+
+#[derive(Debug)]
+struct PrefixToScan {
+    prefix: std::ffi::OsString,
+    cache_key: Option<String>,
+    fingerprint: PrefixFingerprint,
+}
+
+#[derive(Debug)]
+struct ObservedPrefixSnapshot {
+    snapshot: PrefixContentSnapshot,
+    observed_at_unix: u64,
+}
+
+fn empty_evidence_cache(root: &Path, pnpm_version: &str) -> PnpmEvidenceCache {
+    PnpmEvidenceCache {
+        cache_version: PNPM_EVIDENCE_CACHE_VERSION,
+        store_files: root.to_path_buf(),
+        pnpm_version: pnpm_version.to_owned(),
+        prefixes: BTreeMap::new(),
+    }
+}
+
+fn load_evidence_cache(path: &Path, root: &Path, pnpm_version: &str) -> Result<PnpmEvidenceCache> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(empty_evidence_cache(root, pnpm_version));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read pnpm evidence cache {}", path.display()));
+        }
+    };
+    let Ok(cache) = serde_json::from_slice::<PnpmEvidenceCache>(&bytes) else {
+        return Ok(empty_evidence_cache(root, pnpm_version));
+    };
+    if cache.cache_version != PNPM_EVIDENCE_CACHE_VERSION
+        || cache.store_files != root
+        || cache.pnpm_version != pnpm_version
+    {
+        return Ok(empty_evidence_cache(root, pnpm_version));
+    }
+    Ok(cache)
+}
+
+fn write_evidence_cache(path: &Path, cache: &PnpmEvidenceCache) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = AtomicWriteFile::open(path)
+        .with_context(|| format!("open atomic pnpm evidence cache {}", path.display()))?;
+    file.write_all(&serde_json::to_vec_pretty(cache)?)?;
+    file.commit()
+        .with_context(|| format!("commit pnpm evidence cache {}", path.display()))
+}
+
+fn acquire_evidence_cache_lock(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open pnpm evidence cache lock {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("lock pnpm evidence cache {}", lock_path.display()))?;
+    Ok(lock)
+}
+
+fn prefix_fingerprint(path: &Path) -> Result<PrefixFingerprint> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("read pnpm prefix metadata {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "pnpm prefix is not a contained directory: {}",
+        path.display()
+    );
+    Ok(prefix_fingerprint_from_metadata(&metadata))
+}
+
+#[cfg(unix)]
+fn prefix_fingerprint_from_metadata(metadata: &fs::Metadata) -> PrefixFingerprint {
+    use std::os::unix::fs::MetadataExt;
+    PrefixFingerprint {
+        device: Some(metadata.dev()),
+        inode: Some(metadata.ino()),
+        modified_seconds: Some(metadata.mtime()),
+        modified_nanoseconds: Some(metadata.mtime_nsec()),
+        changed_seconds: Some(metadata.ctime()),
+        changed_nanoseconds: Some(metadata.ctime_nsec()),
+    }
+}
+
+#[cfg(not(unix))]
+fn prefix_fingerprint_from_metadata(metadata: &fs::Metadata) -> PrefixFingerprint {
+    let modified = metadata.modified().ok().and_then(|time| {
+        time.duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| (duration.as_secs() as i64, duration.subsec_nanos() as i64))
+    });
+    PrefixFingerprint {
+        device: None,
+        inode: None,
+        modified_seconds: modified.map(|(seconds, _)| seconds),
+        modified_nanoseconds: modified.map(|(_, nanoseconds)| nanoseconds),
+        changed_seconds: None,
+        changed_nanoseconds: None,
+    }
+}
+
+fn cached_prefix_snapshot(
+    prefix: std::ffi::OsString,
+    cached: &CachedPrefixSnapshot,
+) -> PrefixContentSnapshot {
+    PrefixContentSnapshot {
+        prefix,
+        visited_entries: 0,
+        complete: true,
+        link_counts_complete: true,
+        digest: cached.digest.clone(),
+        files: cached.files,
+        alien_directories: cached.alien_directories,
+        unsupported_entries: cached.unsupported_entries,
+        metrics: InventoryMetrics::from(&cached.metrics),
+    }
 }
 
 #[derive(Debug)]
@@ -1384,6 +1816,17 @@ fn state_directory() -> Result<PathBuf> {
     )
 }
 
+fn pnpm_evidence_cache_path(identity: &PnpmIdentity) -> Result<PathBuf> {
+    let mut hasher = Sha256::new();
+    hasher.update(identity.store_path.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(identity.version.as_bytes());
+    let key = format!("{:x}", hasher.finalize());
+    Ok(state_directory()?
+        .join("collectors")
+        .join(format!("pnpm-store-evidence-{}.json", &key[..16])))
+}
+
 fn write_pnpm_manifest(manifest: &PnpmCollectManifest) -> Result<PathBuf> {
     let directory = state_directory()?.join("collectors");
     fs::create_dir_all(&directory)?;
@@ -1462,7 +1905,7 @@ mod tests {
         fs::hard_link(&linked, temp.path().join("consumer"))?;
 
         let mut remaining = 100;
-        let snapshot = snapshot_content(&files, &mut remaining, 1)?;
+        let snapshot = snapshot_content(&files, &mut remaining, 1, None, "test", 1)?;
         assert!(snapshot.complete);
         assert_eq!(snapshot.files, 1);
         assert_eq!(snapshot.metrics.logical_bytes, 8);
@@ -1482,9 +1925,9 @@ mod tests {
         }
 
         let mut serial_remaining = 100;
-        let serial = snapshot_content(&files, &mut serial_remaining, 1)?;
+        let serial = snapshot_content(&files, &mut serial_remaining, 1, None, "test", 1)?;
         let mut parallel_remaining = 100;
-        let parallel = snapshot_content(&files, &mut parallel_remaining, 4)?;
+        let parallel = snapshot_content(&files, &mut parallel_remaining, 4, None, "test", 1)?;
 
         assert!(serial.complete);
         assert!(parallel.complete);
@@ -1508,10 +1951,122 @@ mod tests {
         }
 
         let mut remaining = 6;
-        let snapshot = snapshot_content(&files, &mut remaining, 2)?;
+        let snapshot = snapshot_content(&files, &mut remaining, 2, None, "test", 1)?;
         assert!(!snapshot.complete);
         assert_eq!(remaining, 0);
         assert_eq!(snapshot.files, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_content_evidence_converges_without_becoming_execution_proof() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let files = temp.path().join("files");
+        let cache_path = temp.path().join("evidence.json");
+        for prefix in ["00", "01", "02"] {
+            let directory = files.join(prefix);
+            fs::create_dir_all(&directory)?;
+            for index in 0..3 {
+                fs::write(directory.join(index.to_string()), b"candidate")?;
+            }
+        }
+
+        let mut first_remaining = 7;
+        let first = snapshot_content(
+            &files,
+            &mut first_remaining,
+            1,
+            Some(&cache_path),
+            "test",
+            10,
+        )?;
+        assert_eq!(first.evidence.covered_prefixes, 1);
+        assert_eq!(first.evidence.pending_prefixes, 2);
+        assert!(!first.complete);
+
+        let mut second_remaining = 7;
+        let second = snapshot_content(
+            &files,
+            &mut second_remaining,
+            1,
+            Some(&cache_path),
+            "test",
+            20,
+        )?;
+        assert_eq!(second.evidence.cached_prefixes, 1);
+        assert_eq!(second.evidence.covered_prefixes, 2);
+        assert_eq!(second.evidence.pending_prefixes, 1);
+
+        let mut third_remaining = 7;
+        let third = snapshot_content(
+            &files,
+            &mut third_remaining,
+            1,
+            Some(&cache_path),
+            "test",
+            30,
+        )?;
+        assert!(third.evidence.coverage_complete);
+        assert!(!third.evidence.point_in_time_complete);
+        assert!(!third.complete);
+        assert_eq!(third.files, 9);
+
+        // A changed prefix is rescanned, while unchanged historical evidence
+        // remains reusable for advisory coverage.
+        fs::write(files.join("01/new"), b"new candidate")?;
+        let mut fourth_remaining = 100;
+        let fourth = snapshot_content(
+            &files,
+            &mut fourth_remaining,
+            1,
+            Some(&cache_path),
+            "test",
+            40,
+        )?;
+        assert_eq!(fourth.evidence.cached_prefixes, 2);
+        assert_eq!(fourth.evidence.freshly_scanned_prefixes, 1);
+        assert!(fourth.evidence.coverage_complete);
+        assert!(!fourth.complete);
+        assert_eq!(fourth.files, 10);
+
+        let mut expired_remaining = 100;
+        let expired = snapshot_content(
+            &files,
+            &mut expired_remaining,
+            1,
+            Some(&cache_path),
+            "test",
+            PNPM_EVIDENCE_MAX_AGE_SECONDS + 100,
+        )?;
+        assert_eq!(expired.evidence.cached_prefixes, 0);
+        assert_eq!(expired.evidence.freshly_scanned_prefixes, 3);
+        assert!(expired.evidence.point_in_time_complete);
+        assert!(expired.complete);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_content_evidence_cache_is_rebuilt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let files = temp.path().join("files/00");
+        let cache_path = temp.path().join("evidence.json");
+        fs::create_dir_all(&files)?;
+        fs::write(files.join("candidate"), b"candidate")?;
+        fs::write(&cache_path, b"not json")?;
+
+        let mut remaining = 100;
+        let snapshot = snapshot_content(
+            &temp.path().join("files"),
+            &mut remaining,
+            1,
+            Some(&cache_path),
+            "test",
+            1,
+        )?;
+        assert!(snapshot.evidence.coverage_complete);
+        let rebuilt: PnpmEvidenceCache = serde_json::from_slice(&fs::read(cache_path)?)?;
+        assert_eq!(rebuilt.cache_version, PNPM_EVIDENCE_CACHE_VERSION);
+        assert_eq!(rebuilt.prefixes.len(), 1);
         Ok(())
     }
 

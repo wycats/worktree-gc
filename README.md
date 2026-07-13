@@ -244,8 +244,22 @@ observations, protections, and active pnpm owners.
 Content prefixes are independent and support bounded parallelism. One scan
 thread is the deliberately low-load default; increase `--scan-threads` only
 when inventory latency matters more than interactive machine load. The global
-entry budget is divided deterministically across prefixes, so concurrency
-cannot expand the scan.
+entry budget is divided deterministically across the active prefix batch, so
+concurrency cannot expand the scan. Completed prefixes are retained in an
+atomic evidence cache under the collector state directory. Later bounded runs
+reuse unchanged prefix observations and spend their budget on the remaining
+prefixes, allowing a low-load schedule to converge on store-wide advisory
+coverage. Prefix evidence expires after 24 hours so a recurring run refreshes
+hard-link liveness instead of retaining an indefinitely old estimate.
+
+Cached coverage is deliberately not current deletion proof. A project can add
+or remove a hard link to a content file without changing the store prefix
+directory, so a manifest records cached and fresh prefix counts plus the
+observation window and remains incomplete for execution whenever any cached
+evidence contributes. Explicit execution performs a fully fresh snapshot and
+then repeats it under the collector/protection guard before pnpm remains the
+final deletion authority. Corrupt or identity-mismatched evidence caches are
+ignored and rebuilt.
 
 Execution remains explicit:
 
