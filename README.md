@@ -185,17 +185,21 @@ before deciding which domain-specific cleanup policy should own them:
 ```sh
 worktree-gc inventory ~/Code ~/.codex --depth 2 --top 20
 worktree-gc inventory ~/Library/Application\ Support --depth 1 --json > inventory.json
+worktree-gc inventory ~/Library/Application\ Support/local-sandbox/vfkit/base.img --json
 ```
 
-The scanner visits each directory once and retains only the requested shallow
+Directory roots are visited once and retain only the requested shallow
 aggregates, so `--depth` controls report detail rather than making totals
-partial. `--top` keeps the largest children beneath each displayed directory.
+partial. Exact file roots are measured directly without enumerating their
+parent directory, which makes indexed large-file results cheap to verify.
+`--top` keeps the largest children beneath each displayed directory.
 `--max-entries` (default 2,000,000 across all requested roots) is a hard work
 bound; a report says `incomplete` if it reaches that limit. Traversal stays on
 each root's filesystem unless `--cross-filesystems` is explicit, never follows
 symlinks, and deduplicates hard-linked files.
 
-On macOS, directory enumeration and file accounting use `getattrlistbulk`.
+On macOS, directory enumeration and file accounting use `getattrlistbulk`;
+exact file roots use `getattrlist`.
 Alongside logical and allocated size, APFS reports
 `ATTR_CMNEXT_PRIVATESIZE` as `private_reclaimable_bytes`: a conservative floor
 for space immediately private to the visited files. APFS clones can share

@@ -33,7 +33,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Measure disk usage with bounded, clone-aware directory aggregation
+    /// Measure files or directories with bounded, clone-aware accounting
     Inventory {
         #[arg(value_name = "PATH", required = true)]
         paths: Vec<PathBuf>,
@@ -55,7 +55,7 @@ enum Command {
         #[arg(
             long,
             default_value_t = 2_000_000,
-            help = "Maximum directory entries to visit across all roots"
+            help = "Maximum file or directory entries to visit across all roots"
         )]
         max_entries: u64,
 

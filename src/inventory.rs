@@ -279,14 +279,21 @@ fn scan_root(
     options: &InventoryOptions,
     remaining_entries: &mut u64,
 ) -> Result<InventoryRoot> {
+    let requested_metadata = fs::symlink_metadata(requested)
+        .with_context(|| format!("read inventory root metadata for {}", requested.display()))?;
+    anyhow::ensure!(
+        !requested_metadata.file_type().is_symlink(),
+        "inventory root is a symlink: {}",
+        requested.display()
+    );
     let root = requested
         .canonicalize()
         .with_context(|| format!("canonicalize inventory root {}", requested.display()))?;
     let metadata = fs::metadata(&root)
         .with_context(|| format!("read inventory root metadata for {}", root.display()))?;
     anyhow::ensure!(
-        metadata.is_dir(),
-        "inventory root is not a directory: {}",
+        metadata.is_dir() || metadata.is_file(),
+        "inventory root is not a regular file or directory: {}",
         root.display()
     );
 
@@ -294,6 +301,10 @@ fn scan_root(
     let filesystem = root_device
         .map(|device| format!("device:{device}"))
         .unwrap_or_else(|| "unknown".to_string());
+    if metadata.is_file() {
+        return scan_file_root(root, filesystem, &metadata, remaining_entries);
+    }
+
     let mut queue = VecDeque::from([PendingDirectory::new(root.clone())]);
     let mut seen_files = HashSet::new();
     let mut pending_hardlinks: HashMap<(u64, u64), PendingHardlink> = HashMap::new();
@@ -458,6 +469,54 @@ fn scan_root(
         metrics: root_metrics,
         entries,
         errors,
+    })
+}
+
+fn scan_file_root(
+    root: PathBuf,
+    filesystem: String,
+    metadata: &fs::Metadata,
+    remaining_entries: &mut u64,
+) -> Result<InventoryRoot> {
+    if *remaining_entries == 0 {
+        return Ok(InventoryRoot {
+            path: root,
+            filesystem,
+            complete: false,
+            visited_entries: 0,
+            metrics: MetricsAccumulator::default().finish(),
+            entries: Vec::new(),
+            errors: Vec::new(),
+        });
+    }
+
+    let mut metrics = MetricsAccumulator::default();
+    let link_count = metadata_link_count(metadata).unwrap_or(1);
+    let private_reclaimable_bytes = if link_count > 1 {
+        // An exact file root cannot prove that removing this one directory
+        // entry will release the inode's extents.
+        Some(0)
+    } else {
+        private_reclaimable_bytes(&root)?
+    };
+    metrics.logical_bytes = metadata.len();
+    metrics.allocated_bytes = metadata_allocated_bytes(metadata);
+    metrics.files = 1;
+    if let Some(private) = private_reclaimable_bytes {
+        metrics.private_reclaimable_bytes = private;
+    } else {
+        metrics.private_unknown_files = 1;
+    }
+    *remaining_entries -= 1;
+
+    Ok(InventoryRoot {
+        path: root,
+        filesystem,
+        complete: true,
+        visited_entries: 1,
+        metrics: metrics.finish(),
+        entries: Vec::new(),
+        errors: Vec::new(),
     })
 }
 
@@ -665,6 +724,38 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 #[cfg(unix)]
+fn metadata_link_count(metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.nlink())
+}
+
+#[cfg(not(unix))]
+fn metadata_link_count(_metadata: &fs::Metadata) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn metadata_allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn metadata_allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
+}
+
+#[cfg(target_os = "macos")]
+fn private_reclaimable_bytes(path: &Path) -> io::Result<Option<u64>> {
+    macos::private_reclaimable_bytes(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn private_reclaimable_bytes(_path: &Path) -> io::Result<Option<u64>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
 fn metadata_device(metadata: &fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     Some(metadata.dev())
@@ -787,12 +878,12 @@ mod portable {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use std::ffi::OsString;
+    use std::ffi::{CString, OsString};
     use std::fs::File;
     use std::mem::size_of;
     use std::os::fd::AsRawFd;
-    use std::os::raw::{c_int, c_void};
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     #[repr(C)]
     #[derive(Debug, Default)]
@@ -824,6 +915,13 @@ mod macos {
     }
 
     unsafe extern "C" {
+        fn getattrlist(
+            path: *const c_char,
+            attr_list: *mut AttrList,
+            attr_buf: *mut c_void,
+            attr_buf_size: usize,
+            options: u64,
+        ) -> c_int;
         fn getattrlistbulk(
             dirfd: c_int,
             attr_list: *mut AttrList,
@@ -846,6 +944,54 @@ mod macos {
     const FSOPT_ATTR_CMN_EXTENDED: u64 = 0x0000_0020;
     const VREG: u32 = 1;
     const VDIR: u32 = 2;
+
+    pub(super) fn private_reclaimable_bytes(path: &Path) -> io::Result<Option<u64>> {
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inventory path contains an interior NUL byte",
+            )
+        })?;
+        let mut attrs = AttrList {
+            bitmapcount: ATTR_BIT_MAP_COUNT,
+            commonattr: ATTR_CMN_RETURNED_ATTRS,
+            forkattr: ATTR_CMNEXT_PRIVATESIZE,
+            ..AttrList::default()
+        };
+        let mut buffer = [0u8; 128];
+        let result = unsafe {
+            getattrlist(
+                path.as_ptr(),
+                &mut attrs,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                FSOPT_ATTR_CMN_EXTENDED,
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(22 | 45 | 78)) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+
+        let mut offset = 0usize;
+        let length = read_value::<u32>(&buffer, &mut offset)? as usize;
+        if length > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated getattrlist result",
+            ));
+        }
+        let returned = read_value::<AttributeSet>(&buffer[..length], &mut offset)?;
+        if returned.forkattr & ATTR_CMNEXT_PRIVATESIZE == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            read_value::<i64>(&buffer[..length], &mut offset)?.max(0) as u64,
+        ))
+    }
 
     #[derive(Debug)]
     pub(super) struct DirectoryReader {
@@ -1101,6 +1247,62 @@ mod tests {
     }
 
     #[test]
+    fn inventory_measures_an_exact_file_without_scanning_its_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("selected");
+        write_bytes(&file, 4096);
+        write_bytes(&temp.path().join("unselected"), 8192);
+
+        let report = inventory(std::slice::from_ref(&file), InventoryOptions::default()).unwrap();
+        let root = &report.roots[0];
+        assert_eq!(root.path, file.canonicalize().unwrap());
+        assert!(root.complete);
+        assert_eq!(root.visited_entries, 1);
+        assert_eq!(root.metrics.files, 1);
+        assert_eq!(root.metrics.directories, 0);
+        assert_eq!(root.metrics.logical_bytes, 4096);
+        assert!(root.entries.is_empty());
+    }
+
+    #[test]
+    fn exact_file_roots_share_the_global_entry_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        write_bytes(&first, 1);
+        write_bytes(&second, 1);
+
+        let report = inventory(
+            &[first, second],
+            InventoryOptions {
+                max_entries: 1,
+                ..InventoryOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.roots[0].visited_entries, 1);
+        assert!(report.roots[0].complete);
+        assert_eq!(report.roots[1].visited_entries, 0);
+        assert!(!report.roots[1].complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_rejects_a_symlink_file_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        let link = temp.path().join("link");
+        write_bytes(&file, 1);
+        symlink(file, &link).unwrap();
+
+        let error = inventory(&[link], InventoryOptions::default()).unwrap_err();
+        assert!(error.to_string().contains("inventory root is a symlink"));
+    }
+
+    #[test]
     fn inventory_shares_the_global_budget_across_roots() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
@@ -1254,6 +1456,20 @@ mod tests {
         write_bytes(&temp.path().join("data"), 4096);
 
         let report = inventory(&[temp.path().to_path_buf()], InventoryOptions::default()).unwrap();
+        let metrics = &report.roots[0].metrics;
+        assert!(metrics.private_reclaimable_complete);
+        assert!(metrics.private_reclaimable_bytes >= 4096);
+        assert_eq!(metrics.private_reclaimable_bytes, metrics.allocated_bytes);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exact_file_root_reports_apfs_private_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("data");
+        write_bytes(&file, 4096);
+
+        let report = inventory(&[file], InventoryOptions::default()).unwrap();
         let metrics = &report.roots[0].metrics;
         assert!(metrics.private_reclaimable_complete);
         assert!(metrics.private_reclaimable_bytes >= 4096);
