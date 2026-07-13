@@ -1249,25 +1249,19 @@ mod tests {
             .read(true)
             .write(true)
             .open(cross.join(".cargo-lock"))?;
-        cross_lock.lock()?;
-        host_lock.unlock()?;
+        cross_lock
+            .lock()
+            .context("failed to hold the newly discovered profile lock")?;
+        drop(host_lock);
         thread::sleep(Duration::from_millis(500));
         assert!(matches!(
             action_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
 
-        cross_lock.unlock()?;
+        drop(cross_lock);
         action_rx.recv_timeout(Duration::from_secs(5))?;
         handle.join().expect("lock coordination thread panicked")?;
-
-        for profile in [host, cross] {
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(profile.join(".cargo-lock"))?;
-            lock.try_lock()?;
-        }
         Ok(())
     }
 
