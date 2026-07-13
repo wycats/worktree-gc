@@ -5,12 +5,12 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories,
-    list_protections, print_cleanup, print_root_cleanup, print_root_triage, print_triage,
-    remove_protection, renew_protection, triage, triage_roots, CleanupOptions, GeneratedDirConfig,
-    PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
-    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
-    MAX_PROTECTION_TTL_DAYS,
+    add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories, inventory,
+    list_protections, print_cleanup, print_inventory, print_root_cleanup, print_root_triage,
+    print_triage, remove_protection, renew_protection, triage, triage_roots, CleanupOptions,
+    GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit, SweepStrategy, SweepTool,
+    TriageOptions, DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
+    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -33,6 +33,38 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Measure disk usage with bounded, clone-aware directory aggregation
+    Inventory {
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<PathBuf>,
+
+        #[arg(
+            long,
+            default_value_t = 2,
+            help = "Directory levels to retain while still measuring all descendants"
+        )]
+        depth: usize,
+
+        #[arg(
+            long,
+            default_value_t = 20,
+            help = "Largest children to retain beneath each displayed directory"
+        )]
+        top: usize,
+
+        #[arg(
+            long,
+            default_value_t = 2_000_000,
+            help = "Maximum directory entries to visit across all roots"
+        )]
+        max_entries: u64,
+
+        #[arg(long, help = "Allow traversal into mounted filesystems below a root")]
+        cross_filesystems: bool,
+
+        #[arg(long, help = "Write the complete structured report as JSON")]
+        json: bool,
+    },
     #[command(visible_alias = "audit")]
     Triage {
         #[arg(long, default_value_t = DEFAULT_STALE_DAYS)]
@@ -385,6 +417,34 @@ fn main() -> Result<()> {
     let roots = cli.root;
 
     match cli.command {
+        Command::Inventory {
+            paths,
+            depth,
+            top,
+            max_entries,
+            cross_filesystems,
+            json,
+        } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "inventory takes paths as positional arguments; do not pass --repo or --root"
+            );
+            let report = inventory(
+                &paths,
+                InventoryOptions {
+                    display_depth: depth,
+                    top,
+                    max_entries,
+                    one_filesystem: !cross_filesystems,
+                },
+            )?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+                println!();
+            } else {
+                print_inventory(&report);
+            }
+        }
         Command::Triage {
             stale_days,
             generated_days,
@@ -776,6 +836,45 @@ mod tests {
         .expect("CLI should parse");
         match cli.command {
             Command::Cleanup { generated, .. } => generated.config(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn inventory_cli_accepts_bounded_multi_root_options() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "inventory",
+            "/tmp/one",
+            "/tmp/two",
+            "--depth",
+            "3",
+            "--top",
+            "7",
+            "--max-entries",
+            "99",
+            "--json",
+        ])
+        .expect("inventory CLI should parse");
+        match cli.command {
+            Command::Inventory {
+                paths,
+                depth,
+                top,
+                max_entries,
+                cross_filesystems,
+                json,
+            } => {
+                assert_eq!(
+                    paths,
+                    [PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
+                );
+                assert_eq!(depth, 3);
+                assert_eq!(top, 7);
+                assert_eq!(max_entries, 99);
+                assert!(!cross_filesystems);
+                assert!(json);
+            }
             _ => unreachable!(),
         }
     }

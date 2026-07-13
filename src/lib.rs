@@ -1,5 +1,6 @@
 mod cargo_incremental;
 mod cargo_profiles;
+mod inventory;
 mod protection;
 
 use anyhow::{bail, Context, Result};
@@ -24,6 +25,10 @@ use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
+pub use inventory::{
+    inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
+    InventoryReport, InventoryReportOptions, InventoryRoot, InventoryScanError, INVENTORY_VERSION,
+};
 pub use protection::{
     active_protections, add_protection, list_protections, protection_for_path,
     protection_registry_path, remove_protection, renew_protection, with_protection_guard,
