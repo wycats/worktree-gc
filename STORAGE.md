@@ -90,6 +90,17 @@ The controller continues to check live free space after each operation. APFS
 private bytes improve ordering and planning; realized filesystem availability
 remains the stop condition.
 
+Generated-directory cleanup applies the inventory primitive only after safety
+classification. Delete candidates share one sequential global entry budget
+and a smaller per-candidate slice; their complete or partial measurements are
+persisted in manifest version 5. When the evidence budget cannot cover every
+candidate, pressure candidates and lower rebuild-cost classes are measured
+first.
+Pressure execution preserves rebuild-cost classes, orders exact candidates
+machine-wide by private reclaim and observed allocation, refreshes safety, and
+executes one candidate before checking free space again. Routine TTL order
+remains age-based.
+
 ## Incremental delivery
 
 The implementation order is intentionally useful after every merge:

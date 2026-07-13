@@ -158,6 +158,14 @@ struct DirectoryVisit {
 }
 
 pub fn inventory(paths: &[PathBuf], options: InventoryOptions) -> Result<InventoryReport> {
+    inventory_with_root_limit(paths, options, None)
+}
+
+pub(crate) fn inventory_with_root_limit(
+    paths: &[PathBuf],
+    options: InventoryOptions,
+    max_entries_per_root: Option<u64>,
+) -> Result<InventoryReport> {
     anyhow::ensure!(!paths.is_empty(), "inventory requires at least one path");
     anyhow::ensure!(options.top > 0, "inventory top must be at least 1");
     anyhow::ensure!(
@@ -178,7 +186,12 @@ pub fn inventory(paths: &[PathBuf], options: InventoryOptions) -> Result<Invento
     let mut remaining_entries = options.max_entries;
     let mut roots = Vec::with_capacity(paths.len());
     for path in paths {
-        roots.push(scan_root(path, &options, &mut remaining_entries)?);
+        let root_budget = max_entries_per_root
+            .unwrap_or(remaining_entries)
+            .min(remaining_entries);
+        let mut root_remaining = root_budget;
+        roots.push(scan_root(path, &options, &mut root_remaining)?);
+        remaining_entries = remaining_entries.saturating_sub(root_budget - root_remaining);
     }
 
     Ok(InventoryReport {
@@ -977,6 +990,35 @@ mod tests {
         .unwrap();
         assert!(!report.roots[0].complete);
         assert_eq!(report.roots[0].visited_entries, 3);
+    }
+
+    #[test]
+    fn inventory_root_limit_shares_the_global_budget_fairly() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        for root in [&first, &second] {
+            for index in 0..4 {
+                write_bytes(&root.join(format!("file-{index}")), 1);
+            }
+        }
+
+        let report = inventory_with_root_limit(
+            &[first, second],
+            InventoryOptions {
+                max_entries: 4,
+                ..InventoryOptions::default()
+            },
+            Some(2),
+        )
+        .unwrap();
+
+        assert_eq!(report.roots.len(), 2);
+        assert_eq!(report.roots[0].visited_entries, 2);
+        assert_eq!(report.roots[1].visited_entries, 2);
+        assert!(report.roots.iter().all(|root| !root.complete));
     }
 
     #[cfg(unix)]
