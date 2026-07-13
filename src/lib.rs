@@ -1,5 +1,6 @@
 mod cargo_incremental;
 mod cargo_profiles;
+mod codex;
 mod docker;
 mod inventory;
 mod lima;
@@ -30,6 +31,11 @@ use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
+pub use codex::{
+    collect_codex, print_codex_collect, CodexCollectManifest, CodexCollectOptions, CodexCollectRun,
+    CodexIdentity, CodexPolicy, CodexProcessOwner, CodexTaskState, CodexWorktreeAction,
+    CodexWorktreeObservation, CodexWorktreePlan,
+};
 pub use docker::{
     collect_docker, print_docker_collect, DockerBuildCacheCandidate, DockerBuilderIdentity,
     DockerBuilderNodeIdentity, DockerCollectManifest, DockerCollectOptions, DockerCollectRun,

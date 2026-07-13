@@ -5,15 +5,16 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories_with_parallelism, cleanup_roots, collect_docker,
-    collect_lima, collect_parallels, collect_pnpm, discover_repositories_bounded, inventory,
-    list_protections, print_cleanup, print_docker_collect, print_inventory, print_lima_collect,
-    print_parallels_collect, print_pnpm_collect, print_root_cleanup, print_root_triage,
-    print_triage, remove_protection, renew_protection, triage, triage_roots, CleanupOptions,
-    DockerCollectOptions, GeneratedDirConfig, InventoryOptions, LimaCollectOptions,
-    ParallelsCollectOptions, PnpmCollectOptions, PressurePolicy, SweepLimit, SweepStrategy,
-    SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
-    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    add_protection, cleanup, cleanup_repositories_with_parallelism, cleanup_roots, collect_codex,
+    collect_docker, collect_lima, collect_parallels, collect_pnpm, discover_repositories_bounded,
+    inventory, list_protections, print_cleanup, print_codex_collect, print_docker_collect,
+    print_inventory, print_lima_collect, print_parallels_collect, print_pnpm_collect,
+    print_root_cleanup, print_root_triage, print_triage, remove_protection, renew_protection,
+    triage, triage_roots, CleanupOptions, CodexCollectOptions, DockerCollectOptions,
+    GeneratedDirConfig, InventoryOptions, LimaCollectOptions, ParallelsCollectOptions,
+    PnpmCollectOptions, PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions,
+    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS,
+    DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -151,6 +152,26 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CollectorCommand {
+    /// Correlate Codex-managed worktrees with task, Git, process, and APFS state
+    Codex {
+        #[arg(long, value_name = "PATH", help = "Override CODEX_HOME for inspection")]
+        codex_home: Option<PathBuf>,
+
+        #[arg(
+            long,
+            default_value_t = 7,
+            help = "Require this many inactive days before human review"
+        )]
+        review_days: u64,
+
+        #[arg(
+            long,
+            default_value_t = 500_000,
+            help = "Maximum entries to inspect across Codex worktrees"
+        )]
+        max_entries: u64,
+    },
+
     /// Plan or delegate cleanup of pnpm's shared store and cache
     Pnpm {
         #[arg(
@@ -520,6 +541,19 @@ fn main() -> Result<()> {
                 "collect discovers domain roots through the owning tool; do not pass --repo or --root"
             );
             match command {
+                CollectorCommand::Codex {
+                    codex_home,
+                    review_days,
+                    max_entries,
+                } => {
+                    let run = collect_codex(CodexCollectOptions {
+                        codex_home,
+                        review_days,
+                        max_entries,
+                        now,
+                    })?;
+                    print_codex_collect(&run);
+                }
                 CollectorCommand::Pnpm {
                     execute,
                     dlx_days,
@@ -1034,6 +1068,35 @@ mod tests {
                 assert_eq!(dlx_days, 14);
                 assert_eq!(max_entries, 99);
                 assert_eq!(scan_threads, 2);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn codex_collector_cli_is_report_only_and_accepts_policy() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "codex",
+            "--review-days",
+            "14",
+            "--max-entries",
+            "99",
+        ])
+        .expect("Codex collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Codex {
+                        codex_home,
+                        review_days,
+                        max_entries,
+                    },
+            } => {
+                assert!(codex_home.is_none());
+                assert_eq!(review_days, 14);
+                assert_eq!(max_entries, 99);
             }
             _ => unreachable!(),
         }

@@ -221,6 +221,37 @@ incomplete instead of hiding every later sibling.
 The durable collector contract and incremental delivery order are documented
 in [`STORAGE.md`](STORAGE.md).
 
+## Codex worktree inventory
+
+Codex-managed worktrees combine source, generated build state, and task intent.
+The report-only collector correlates those sources before suggesting that a
+whole worktree deserves human review:
+
+```sh
+worktree-gc collect codex
+worktree-gc collect codex --review-days 7 --max-entries 500000
+```
+
+It enumerates only the shallow worktree layout beneath `~/.codex/worktrees`,
+reads `~/.codex/state_5.sqlite` through `sqlite3 -readonly`, and matches task
+ownership by exact recorded working directory. It then combines unarchived and
+archived task counts and exact task IDs with Git cleanliness/upstream state,
+live process cwd and argv ownership, recursive worktree-gc protections, and
+bounded APFS-private measurement. Unarchived is a conservative persisted-state
+signal rather than proof that a task is currently executing. The resulting
+manifest distinguishes worktrees that are in use, protected, dirty, or recent
+from clean inactive worktrees whose tasks are all archived or which have no
+exact task match.
+
+An unmatched worktree is only a review lead. Missing task history, an
+incomplete scan, Git errors, or unavailable Codex state fails closed, and the
+collector has no execute mode. Whole worktree removal remains a deliberate
+human decision because a clean checkout can still contain valuable generated
+state or belong to a task recorded outside the current local database. The
+manifest lives with the other collector evidence under
+`$XDG_STATE_HOME/worktree-gc/collectors` (or
+`~/.local/state/worktree-gc/collectors`).
+
 ## pnpm shared-store collection
 
 The first machine-wide collector wraps pnpm's maintained prune operation. A
