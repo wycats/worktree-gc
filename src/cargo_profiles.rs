@@ -423,12 +423,17 @@ fn sampled_activity(profile_dir: &Path) -> Result<Option<i64>> {
         .follow_links(false)
         .max_depth(PROFILE_ACTIVITY_SAMPLE_DEPTH)
     {
-        let entry = entry?;
-        let modified = entry
-            .metadata()?
-            .modified()
-            .ok()
-            .and_then(system_time_to_unix);
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if walkdir_not_found(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if walkdir_not_found(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let modified = metadata.modified().ok().and_then(system_time_to_unix);
         newest = match (newest, modified) {
             (Some(left), Some(right)) => Some(left.max(right)),
             (None, right) => right,
@@ -436,6 +441,12 @@ fn sampled_activity(profile_dir: &Path) -> Result<Option<i64>> {
         };
     }
     Ok(newest)
+}
+
+fn walkdir_not_found(error: &walkdir::Error) -> bool {
+    error
+        .io_error()
+        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
 }
 
 fn skipped_candidate(
@@ -621,6 +632,13 @@ mod tests {
             .find(|candidate| candidate.path == fs::canonicalize(&profile).unwrap())
             .context("missing debug profile")?;
         assert_eq!(candidate.action, SweepCandidateAction::Keep);
+        Ok(())
+    }
+
+    #[test]
+    fn vanished_profile_activity_is_transient() -> Result<()> {
+        let temp = TempDir::new()?;
+        assert_eq!(sampled_activity(&temp.path().join("vanished"))?, None);
         Ok(())
     }
 

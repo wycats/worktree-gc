@@ -374,6 +374,7 @@ fn scheduled_pressure_policy(
         generated_days: pressure.generated_days,
         stale_days: pressure.stale_days,
         active: false,
+        entered_filesystems: Vec::new(),
     }))
 }
 

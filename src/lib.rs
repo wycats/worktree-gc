@@ -84,11 +84,13 @@ pub struct PressurePolicy {
     pub generated_days: u64,
     pub stale_days: u64,
     pub active: bool,
+    pub entered_filesystems: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PressureObservation {
     pub path: PathBuf,
+    pub filesystem: String,
     pub available_bytes: u64,
     pub total_bytes: u64,
 }
@@ -732,9 +734,12 @@ pub fn cleanup_repositories(
                 );
             }
         }
-        policy.active = observations
+        policy.entered_filesystems = observations
             .iter()
-            .any(|observation| observation.available_bytes < policy.enter_bytes);
+            .filter(|observation| observation.available_bytes < policy.enter_bytes)
+            .map(|observation| observation.filesystem.clone())
+            .collect();
+        policy.active = !policy.entered_filesystems.is_empty();
         Some(PressureRunDecision {
             policy: policy.clone(),
             observations,
@@ -840,11 +845,13 @@ fn observe_free_space(paths: &[PathBuf]) -> Result<Vec<PressureObservation>> {
         if !path.exists() {
             continue;
         }
-        if !seen_filesystems.insert(filesystem_key(path)?) {
+        let filesystem = filesystem_key(path)?;
+        if !seen_filesystems.insert(filesystem.clone()) {
             continue;
         }
         observations.push(PressureObservation {
             path: path.clone(),
+            filesystem,
             available_bytes: fs4::available_space(path)
                 .with_context(|| format!("failed to read free space for {}", path.display()))?,
             total_bytes: fs4::total_space(path).with_context(|| {
@@ -1644,6 +1651,10 @@ fn pressure_applies(path: &Path, pressure: Option<&PressurePolicy>) -> Result<bo
     let Some(pressure) = pressure.filter(|pressure| pressure.active) else {
         return Ok(false);
     };
+    let filesystem = filesystem_key(path)?;
+    if !pressure_filesystem_entered(pressure, &filesystem) {
+        return Ok(false);
+    }
     let available = fs4::available_space(path)
         .with_context(|| format!("failed to read free space for {}", path.display()))?;
     Ok(available < pressure.target_bytes)
@@ -2455,6 +2466,9 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
         if nested_in_planned_removal(&decision.path) {
             continue;
         }
+        if !decision.path.exists() {
+            continue;
+        }
         if pass != ExecutionPass::Routine
             && !pressure_should_continue(manifest, &decision.path, &mut satisfied_filesystems)?
         {
@@ -2552,6 +2566,9 @@ fn execute_worktree_removals(
     satisfied_filesystems: &mut HashSet<String>,
 ) -> Result<()> {
     for (index, decision) in worktree_removals.iter().enumerate() {
+        if !decision.path.exists() {
+            continue;
+        }
         if pass != ExecutionPass::Routine
             && !pressure_should_continue(manifest, &decision.path, satisfied_filesystems)?
         {
@@ -2604,6 +2621,9 @@ fn pressure_should_continue(
         .as_ref()
         .context("pressure candidate has no pressure policy")?;
     let filesystem = filesystem_key(path)?;
+    if !pressure_filesystem_entered(policy, &filesystem) {
+        return Ok(false);
+    }
     if satisfied_filesystems.contains(&filesystem) {
         return Ok(false);
     }
@@ -2619,6 +2639,16 @@ fn pressure_should_continue(
         return Ok(false);
     }
     Ok(true)
+}
+
+fn pressure_filesystem_entered(policy: &PressurePolicy, filesystem: &str) -> bool {
+    if policy.entered_filesystems.is_empty() {
+        return policy.active;
+    }
+    policy
+        .entered_filesystems
+        .iter()
+        .any(|entered| entered == filesystem)
 }
 
 fn filesystem_key(path: &Path) -> Result<String> {
@@ -4593,6 +4623,7 @@ mod tests {
                     generated_days: 1,
                     stale_days: 7,
                     active: false,
+                    entered_filesystems: Vec::new(),
                 }),
                 now: now(),
             },
@@ -4629,6 +4660,61 @@ mod tests {
             .collect::<Result<HashSet<_>>>()?
             .len();
         assert_eq!(observations.len(), device_count);
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_candidates_are_gated_by_entered_filesystem() -> Result<()> {
+        let temp = TempDir::new()?;
+        let filesystem = filesystem_key(temp.path())?;
+        let mut policy = PressurePolicy {
+            enter_bytes: u64::MAX - 1,
+            target_bytes: u64::MAX,
+            generated_days: 1,
+            stale_days: 7,
+            active: true,
+            entered_filesystems: vec!["different-filesystem".to_string()],
+        };
+        assert!(!pressure_applies(temp.path(), Some(&policy))?);
+        policy.entered_filesystems = vec![filesystem];
+        assert!(pressure_applies(temp.path(), Some(&policy))?);
+        Ok(())
+    }
+
+    #[test]
+    fn vanished_pressure_candidate_is_already_reclaimed() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let cache = repo.join("node_modules/pkg");
+        fs::create_dir_all(&cache)?;
+        fs::write(cache.join("index.js"), "fixture")?;
+        let old = unix_days_before_now(3);
+        set_mtime(&cache.join("index.js"), old)?;
+        set_mtime(&cache, old)?;
+        set_mtime(&repo.join("node_modules"), old)?;
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+        )?;
+        fs::remove_dir_all(repo.join("node_modules"))?;
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::PressureGenerated(3))?;
         Ok(())
     }
 
@@ -4863,6 +4949,7 @@ mod tests {
                     generated_days: 1,
                     stale_days: 7,
                     active: true,
+                    entered_filesystems: Vec::new(),
                 }),
                 now: now(),
             },
@@ -4881,6 +4968,7 @@ mod tests {
             generated_days: 1,
             stale_days: 7,
             active: true,
+            entered_filesystems: Vec::new(),
         };
         let dry_run = cleanup(
             Some(&repo),
@@ -4975,6 +5063,7 @@ mod tests {
                     generated_days: 1,
                     stale_days: 7,
                     active: true,
+                    entered_filesystems: Vec::new(),
                 }),
                 now: now(),
             },
