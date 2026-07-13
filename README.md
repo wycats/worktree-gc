@@ -200,6 +200,9 @@ Inventory is read-only and deliberately separate from scheduled cleanup in
 this first version. Its structured output is the evidence surface for adding
 domain collectors and, later, cached physical-reclaim estimates to pressure
 ordering without turning scheduled runs into broad recursive scans.
+For multi-root scans, the global entry budget is divided fairly across the
+remaining roots and unused shares flow forward, so one large tree cannot hide
+every later storage domain.
 The durable collector contract and incremental delivery order are documented
 in [`STORAGE.md`](STORAGE.md).
 

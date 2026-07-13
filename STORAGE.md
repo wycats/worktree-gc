@@ -18,6 +18,8 @@ An inventory scan visits each requested root once and aggregates descendants
 into a shallow report tree. `display_depth` and `top` bound retained report
 state; `max_entries` bounds filesystem work. The scanner stays on one
 filesystem by default, does not follow symlinks, and deduplicates hard links.
+Multi-root scans divide the remaining global budget across the remaining roots;
+small roots return unused entries to the pool for later roots.
 
 Each aggregate reports:
 
