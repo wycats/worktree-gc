@@ -749,6 +749,21 @@ fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()>
             // classification and measurement. Execution already treats a
             // vanished candidate as reclaimed, so it should not abort the
             // read-only evidence pass either.
+            let metadata = match fs::symlink_metadata(&decision.path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect generated measurement candidate {}",
+                            decision.path.display()
+                        )
+                    });
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
             let canonical = match fs::canonicalize(&decision.path) {
                 Ok(path) => path,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -761,6 +776,19 @@ fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()>
                     });
                 }
             };
+            let canonical_worktree =
+                fs::canonicalize(&decision.worktree_path).with_context(|| {
+                    format!(
+                        "failed to resolve generated candidate worktree {}",
+                        decision.worktree_path.display()
+                    )
+                })?;
+            anyhow::ensure!(
+                canonical.starts_with(&canonical_worktree),
+                "generated measurement candidate {} escaped worktree {}",
+                canonical.display(),
+                canonical_worktree.display()
+            );
             let priority = (
                 u8::from(decision.cleanup_class != CleanupClass::Pressure),
                 generated_rebuild_rank(&decision.name),
@@ -5382,6 +5410,54 @@ mod tests {
             1
         );
         assert!(measurements.iter().any(|measurement| !measurement.complete));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_measurement_does_not_follow_a_replaced_candidate_symlink() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules");
+        fs::create_dir_all(&candidate)?;
+        fs::write(candidate.join("artifact"), "fixture")?;
+        let old = unix_days_before_now(10);
+        set_mtime(&candidate.join("artifact"), old)?;
+        set_mtime(&candidate, old)?;
+
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+            &[],
+        )?;
+        let external = repo
+            .parent()
+            .context("repository has no parent")?
+            .join("external");
+        fs::create_dir_all(&external)?;
+        fs::write(external.join("durable"), "keep")?;
+        fs::remove_dir_all(&candidate)?;
+        std::os::unix::fs::symlink(&external, &candidate)?;
+
+        measure_cleanup_runs(std::slice::from_mut(&mut run), 100)?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert!(decision.measurement.is_none());
+        assert!(external.join("durable").exists());
         Ok(())
     }
 
