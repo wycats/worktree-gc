@@ -157,6 +157,13 @@ The implementation order is intentionally useful after every merge:
    immutable image IDs/digests. The collector verifies both Docker-internal
    reclaim and host free space so sparse VM storage cannot hide whether bytes
    actually returned to APFS.
+   Lima delivery uses `limactl prune --keep-referred` as the ownership rule.
+   Since Lima has no structured dry run, worktree-gc simulates the owner command
+   against an APFS clone containing the real download cache and small instance
+   metadata but no VM disks. Removed clone entries become exact advisory
+   candidates, and their original paths are measured for private reclaim.
+   Execution remains manual because Lima exposes no prune/download handoff lock;
+   VM instance deletion and archival stay outside the collector.
 7. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
    and application stores begin report-only. Activity must come from the
    owning application's task/database model rather than generic file mtimes

@@ -324,6 +324,37 @@ collector revalidates the server and exact cache digest before delegation, then
 records both Docker's remaining reclaim estimate and realized host filesystem
 availability. It is manual and not part of scheduled cleanup in this version.
 
+## Lima download-cache collection
+
+The Lima collector asks Lima itself which cached downloads are unreferenced.
+Because `limactl prune` does not expose a dry run, planning uses an APFS clone
+of the download cache plus only the small instance metadata required by Lima;
+it then runs `limactl prune --keep-referred` against that isolated home and
+maps the clone's removals back to exact real cache entries. VM disks and
+instance data are never copied or selected for cleanup; only small instance
+configuration and user-template metadata are reproduced in the isolated home.
+
+```sh
+worktree-gc collect lima
+```
+
+Each candidate is measured at its real path so the manifest distinguishes
+logical allocation from APFS-private reclaim. Running instances, Lima owner
+processes, incomplete clone simulation, and active protections keep the plan
+non-executable. On platforms without APFS clonefile support the collector is
+report-only rather than copying the cache in order to simulate a plan.
+
+Explicit execution revalidates the Lima identity and exact candidate digest,
+then delegates to the official owner operation:
+
+```sh
+worktree-gc collect lima --execute
+```
+
+Execution remains manual and outside scheduled cleanup because Lima does not
+provide an interprocess prune lock that spans its download activity and prune.
+Instance deletion or archival is always report-only and outside this collector.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but

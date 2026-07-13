@@ -6,11 +6,12 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup, cleanup_repositories_with_parallelism, cleanup_roots, collect_docker,
-    collect_pnpm, discover_repositories_bounded, inventory, list_protections, print_cleanup,
-    print_docker_collect, print_inventory, print_pnpm_collect, print_root_cleanup,
-    print_root_triage, print_triage, remove_protection, renew_protection, triage, triage_roots,
-    CleanupOptions, DockerCollectOptions, GeneratedDirConfig, InventoryOptions, PnpmCollectOptions,
-    PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
+    collect_lima, collect_pnpm, discover_repositories_bounded, inventory, list_protections,
+    print_cleanup, print_docker_collect, print_inventory, print_lima_collect, print_pnpm_collect,
+    print_root_cleanup, print_root_triage, print_triage, remove_protection, renew_protection,
+    triage, triage_roots, CleanupOptions, DockerCollectOptions, GeneratedDirConfig,
+    InventoryOptions, LimaCollectOptions, PnpmCollectOptions, PressurePolicy, SweepLimit,
+    SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
     DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
     MAX_PROTECTION_TTL_DAYS,
 };
@@ -194,6 +195,15 @@ enum CollectorCommand {
             help = "Retain BuildKit cache used within this many days"
         )]
         build_cache_days: u64,
+    },
+
+    /// Plan or delegate cleanup of Lima's download cache
+    Lima {
+        #[arg(
+            long,
+            help = "Revalidate the manifest and run official Lima prune --keep-referred"
+        )]
+        execute: bool,
     },
 }
 
@@ -532,6 +542,10 @@ fn main() -> Result<()> {
                         now,
                     })?;
                     print_docker_collect(&run);
+                }
+                CollectorCommand::Lima { execute } => {
+                    let run = collect_lima(LimaCollectOptions { execute, now })?;
+                    print_lima_collect(&run);
                 }
             }
         }
@@ -1039,6 +1053,18 @@ mod tests {
                 assert!(!execute);
                 assert_eq!(build_cache_days, 14);
             }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn lima_collector_cli_is_dry_run_by_default() {
+        let cli = Cli::try_parse_from(["worktree-gc", "collect", "lima"])
+            .expect("Lima collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command: CollectorCommand::Lima { execute },
+            } => assert!(!execute),
             _ => unreachable!(),
         }
     }
