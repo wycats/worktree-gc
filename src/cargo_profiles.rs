@@ -216,6 +216,7 @@ pub(crate) fn execute_cargo_profile_reset(
         }
         remove_quarantine_entry(&candidate.path)?;
     }
+    remove_empty_trash_root(&trash_root)?;
 
     for candidate in candidates
         .iter()
@@ -316,6 +317,10 @@ fn remove_empty_ancestors(path: &Path, trash_root: &Path) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
+    remove_empty_trash_root(trash_root)
+}
+
+fn remove_empty_trash_root(trash_root: &Path) -> Result<()> {
     match fs::remove_dir(trash_root) {
         Ok(()) => Ok(()),
         Err(error)
@@ -724,7 +729,7 @@ mod tests {
             "test-run",
             Some(Duration::from_secs(10)),
         )?;
-        assert!(!repo.join("target/.worktree-gc-trash/interrupted").exists());
+        assert!(!repo.join("target/.worktree-gc-trash").exists());
         Ok(())
     }
 
