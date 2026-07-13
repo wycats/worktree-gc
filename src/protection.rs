@@ -308,14 +308,49 @@ fn read_active_protections(registry_path: &Path, now: SystemTime) -> Result<Vec<
         );
     }
     for lease in &registry.leases {
-        let canonical = fs::canonicalize(&lease.path).with_context(|| {
-            format!(
-                "failed to resolve active protection path {} for lease {} in {}",
+        let metadata = match fs::symlink_metadata(&lease.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect active protection path {} for lease {} in {}",
+                        lease.path.display(),
+                        lease.id,
+                        registry_path.display()
+                    )
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "active protection path {} for lease {} in {} is not canonical",
                 lease.path.display(),
                 lease.id,
                 registry_path.display()
-            )
-        })?;
+            );
+        }
+        let canonical = match fs::canonicalize(&lease.path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Keep a lease whose path was removed. There is nothing at the
+                // path to mutate now, and retaining the stored canonical path
+                // protects it again if it is recreated before the lease
+                // expires. Mutation guards reload and revalidate the registry
+                // under lock once a candidate exists.
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve active protection path {} for lease {} in {}",
+                        lease.path.display(),
+                        lease.id,
+                        registry_path.display()
+                    )
+                });
+            }
+        };
         if canonical != lease.path {
             bail!(
                 "active protection path {} for lease {} in {} is not canonical",
@@ -687,18 +722,19 @@ mod tests {
     }
 
     #[test]
-    fn active_reads_reject_missing_paths() -> Result<()> {
+    fn active_reads_retain_missing_paths_as_dormant_leases() -> Result<()> {
         let temp = TempDir::new()?;
         let registry = temp.path().join("state/protections.json");
         let protected = temp.path().join("protected");
         fs::create_dir_all(&protected)?;
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        let lease = add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
         fs::remove_dir(&protected)?;
 
-        let error = active_protections_at(&registry, now)
-            .expect_err("missing active paths should fail closed");
-        assert!(error.to_string().contains("failed to resolve"));
+        assert_eq!(active_protections_at(&registry, now)?, vec![lease.clone()]);
+
+        fs::create_dir(&protected)?;
+        assert_eq!(active_protections_at(&registry, now)?, vec![lease]);
         Ok(())
     }
 
@@ -724,6 +760,24 @@ mod tests {
 
         let error = active_protections_at(&registry, now)
             .expect_err("symlinked active paths should fail closed");
+        assert!(error.to_string().contains("is not canonical"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_reads_reject_dangling_symlink_replacements() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        fs::remove_dir(&protected)?;
+        std::os::unix::fs::symlink(temp.path().join("missing"), &protected)?;
+
+        let error = active_protections_at(&registry, now)
+            .expect_err("a dangling symlink replacement must fail closed");
         assert!(error.to_string().contains("is not canonical"));
         Ok(())
     }
