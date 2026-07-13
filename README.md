@@ -283,6 +283,47 @@ its owner checks. Its manifests live under
 `$XDG_STATE_HOME/worktree-gc/collectors` (or
 `~/.local/state/worktree-gc/collectors`).
 
+## Docker and BuildKit collection
+
+The Docker collector treats the engine, BuildKit cache, and image store as one
+owner-reported storage domain. Its default invocation is read-only:
+
+```sh
+worktree-gc collect docker
+worktree-gc collect docker --build-cache-days 7
+```
+
+The manifest records the exact Docker client, Buildx, context, endpoint, server
+identity, and current builder/worker identities,
+BuildKit cache IDs beyond the TTL, unused image IDs, owner-reported shared and
+unique sizes, active containers/builds, and host free space. BuildKit record
+sizes overlap through parent/shared snapshots, so their sum is labeled as
+overlapping evidence rather than expected physical reclaim; Docker's aggregate
+reclaimable total and the post-operation host delta remain separate. With
+OrbStack on macOS it also reports the sparse Docker disk's host allocation when
+the standard app-container path is present.
+
+The first executable class is old, reclaimable, private regular/source cache.
+Cache records shared with images (and internal/frontend records) remain
+report-only, so their bytes are visible without being mistaken for independent
+physical reclaim or requiring the more aggressive `buildx prune --all` policy.
+
+Execution is deliberately incremental:
+
+```sh
+worktree-gc collect docker --build-cache-days 7 --execute
+```
+
+This delegates only the reviewed BuildKit cache subset to `docker buildx
+prune`. Images remain report-only until worktree-gc can protect immutable image
+IDs or digests; repository tags alone are not a durable protection identity.
+Only a single-node integrated local Buildx builder whose worker matches the
+Docker server is executable; remote, multi-node, and separately hosted builders
+remain report-only. Active containers/builds are never executable. The
+collector revalidates the server and exact cache digest before delegation, then
+records both Docker's remaining reclaim estimate and realized host filesystem
+availability. It is manual and not part of scheduled cleanup in this version.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but
