@@ -93,11 +93,14 @@ cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-u
 ```
 
 Active Rust `target` directories receive a built-in incremental-cache sweep
-during ordinary cleanup planning. Rustc incremental roots with no session
-activity for 14 days are selected for in-place pruning, while a whole `target`
-directory that has been inactive for 3 days remains a wholesale deletion
-candidate. The dry run records every root's path, newest activity, age, and
-logical size in the manifest.
+during ordinary cleanup planning. They also receive an atomic profile-reset
+pass. Rustc incremental roots with no session activity for 14 days are
+selected for in-place pruning; host Cargo profiles such as `debug` and
+`release` that have been inactive for 7 days are reset as a unit while holding
+their Cargo profile locks. A whole `target` directory that has been inactive for
+3 days remains a wholesale deletion candidate. The dry run records every
+incremental root and Cargo profile, including its path, newest activity, age,
+and planned action.
 
 Override the built-in incremental window with an explicit strategy:
 
@@ -105,9 +108,22 @@ Override the built-in incremental window with an explicit strategy:
 cargo run -- cleanup --repo /path/to/repo --sweep target=rustc-incremental:7 --execute
 ```
 
+Override the Cargo profile window independently:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-profile-reset:14 --execute
+```
+
+Profile reset deliberately works at Cargo's profile boundary instead
+of interpreting private fingerprint JSON or reconstructing artifact hashes.
+This reclaims the profile's `deps`, `.fingerprint`, `build`, and incremental
+outputs together while preserving other profiles. Cross-target profiles are
+reported and retained until Cargo exposes enough stable invocation metadata to
+map their output directory back to the exact target specification.
+
 Before pruning, `worktree-gc` verifies the directory against `cargo metadata`
 and leaves shared or external build directories untouched. Execution waits for
-Cargo's profile lock, rechecks activity, atomically moves stale roots into a
+Cargo's profile lock, rechecks activity, atomically moves the stale profile into a
 tool-owned quarantine, releases the lock, and then deletes the quarantine. A
 later execution recovers quarantine left by an interrupted run.
 
@@ -120,8 +136,9 @@ cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-sweep:3 --execute
 cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-sweep:max-size=50GB --execute
 ```
 
-When both strategies are configured, the built-in incremental sweep runs
-first. `cargo-sweep` intentionally leaves rustc's `incremental/` cache
+When multiple strategies are configured, the built-in incremental sweep runs
+first, followed by Cargo profile reset and then the legacy backend.
+`cargo-sweep` intentionally leaves rustc's `incremental/` cache
 directories alone and requires `cargo-sweep` on `PATH`
 (`cargo install cargo-sweep`). Before invoking it, `worktree-gc` verifies the
 Cargo build directory and waits until it holds every existing host and
@@ -138,6 +155,7 @@ Generated directory defaults are:
 - delete candidates: `node_modules`, `.next`, `.turbo`, `target`
 - report-only candidates: `dist`
 - in-place sweeps: `target=rustc-incremental:14`
+- Atomic Cargo profile reset: `target=cargo-profile-reset:7`
 
 You can add repo-specific generated directory names:
 
@@ -200,8 +218,15 @@ generated_windows = { ".next" = 7, ".turbo" = 7, target = 7, node_modules = 7 }
 generated_activity_only = true
 check_in_use = true
 cargo_lock_timeout_minutes = 30
-# Requires cargo-sweep; omit to use only the built-in incremental sweep.
+# Requires cargo-sweep; omit to use only the built-in Cargo sweeps.
 cargo_sweep_max_size = "50GB"
+
+[pressure]
+# Optional hysteresis controller. Routine TTL cleanup still runs above this.
+enter_free_space = "100GiB"
+target_free_space = "150GiB"
+generated_days = 1
+stale_days = 7
 
 [history]
 retention_days = 90
@@ -218,6 +243,24 @@ contended target is deferred to a later run, recorded under
 `$XDG_STATE_HOME/worktree-gc/inbox` (or
 `~/.local/state/worktree-gc/inbox`), and does not prevent the remaining
 worktrees from being cleaned.
+
+When `[pressure]` is configured, a scheduled run enters pressure mode when any
+configured root has less than `enter_free_space` available. It continues
+reclaiming pressure-only candidates until their filesystem reaches
+`target_free_space`, which provides hysteresis instead of repeatedly crossing a
+single threshold. Routine TTL candidates still run regardless of free space.
+
+Pressure mode lowers generated-directory and clean-worktree windows to the
+configured values. Dirty, detached, current, tracked, open, and explicitly
+protected content keeps the same safety rules. Rebuildable directories are
+ordered by expected rebuild cost (`.turbo`, `.next`, `target`, then
+`node_modules`) across all repositories, oldest first within each repository;
+clean worktrees come last.
+The aggregate manifest records the policy, initial free-space observations,
+which decisions exist only because of pressure, and final free space after an
+executing run. This ordering does not recursively size every candidate: the
+controller checks live filesystem availability after each deletion and stops
+once the target is reached.
 
 Each scheduled run writes the normal per-repository manifests and a structured
 aggregate manifest. Aggregate manifests are retained for the configured

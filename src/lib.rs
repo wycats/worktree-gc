@@ -1,4 +1,5 @@
 mod cargo_incremental;
+mod cargo_profiles;
 mod protection;
 
 use anyhow::{bail, Context, Result};
@@ -6,6 +7,7 @@ use cargo_incremental::{
     cargo_profile_locks_present, cargo_project_dir, execute_incremental_sweep_with_timeout,
     is_cargo_lock_timeout, plan_incremental_sweep, with_cargo_profile_locks_timeout,
 };
+use cargo_profiles::{execute_cargo_profile_reset, plan_cargo_profile_sweep};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -21,6 +23,7 @@ use time::OffsetDateTime;
 use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
+pub use cargo_profiles::CargoProfileCandidateDecision;
 pub use protection::{
     active_protections, add_protection, list_protections, protection_for_path,
     protection_registry_path, remove_protection, renew_protection, with_protection_guard,
@@ -33,7 +36,8 @@ pub const DEFAULT_GENERATED_DAYS: u64 = 7;
 pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", ".turbo", "target"];
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
-pub const MANIFEST_VERSION: u64 = 3;
+pub const DEFAULT_CARGO_PROFILE_SWEEP_DAYS: u64 = 7;
+pub const MANIFEST_VERSION: u64 = 4;
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -69,7 +73,33 @@ pub struct CleanupOptions {
     pub generated_config: GeneratedDirConfig,
     pub cargo_lock_timeout: Option<Duration>,
     pub defer_lock_timeouts: bool,
+    pub pressure: Option<PressurePolicy>,
     pub now: SystemTime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PressurePolicy {
+    pub enter_bytes: u64,
+    pub target_bytes: u64,
+    pub generated_days: u64,
+    pub stale_days: u64,
+    pub active: bool,
+    pub entered_filesystems: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PressureObservation {
+    pub path: PathBuf,
+    pub filesystem: String,
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PressureRunDecision {
+    pub policy: PressurePolicy,
+    pub observations: Vec<PressureObservation>,
+    pub final_observations: Option<Vec<PressureObservation>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,6 +145,7 @@ pub struct RootCleanupManifest {
     pub mode: CleanupMode,
     pub generated_at: String,
     pub roots: Vec<PathBuf>,
+    pub pressure: Option<PressureRunDecision>,
     pub repositories: Vec<CleanupRun>,
 }
 
@@ -132,6 +163,7 @@ pub struct CleanupManifest {
     pub check_in_use: bool,
     pub cargo_lock_timeout_secs: Option<u64>,
     pub defer_lock_timeouts: bool,
+    pub pressure: Option<PressurePolicy>,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
     pub protections: Vec<ProtectionLease>,
@@ -178,6 +210,7 @@ pub struct GeneratedDirInfo {
     pub effective_days: u64,
     pub in_use: bool,
     pub protection: Option<ProtectionMatch>,
+    pub cleanup_class: CleanupClass,
     pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
@@ -198,6 +231,7 @@ pub struct WorktreeDecision {
     pub branch: Option<String>,
     pub metadata_prunable: bool,
     pub action: WorktreeAction,
+    pub cleanup_class: CleanupClass,
     pub reason: String,
     pub protection: Option<ProtectionMatch>,
     pub dirty_count: Option<usize>,
@@ -213,15 +247,24 @@ pub enum WorktreeAction {
     PruneMetadata,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupClass {
+    Routine,
+    Pressure,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GeneratedDirDecision {
     pub path: PathBuf,
     pub worktree_path: PathBuf,
     pub name: String,
     pub mtime: Option<String>,
+    pub mtime_unix: Option<i64>,
     pub effective_days: u64,
     pub in_use: bool,
     pub protection: Option<ProtectionMatch>,
+    pub cleanup_class: CleanupClass,
     pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
@@ -250,6 +293,7 @@ pub struct SweepStrategy {
 #[serde(rename_all = "kebab-case")]
 pub enum SweepTool {
     RustcIncremental,
+    CargoProfileReset,
     CargoSweep,
 }
 
@@ -277,12 +321,19 @@ pub struct SweepDecision {
     pub project_dir: Option<PathBuf>,
     pub reason: String,
     pub candidates: Vec<SweepCandidateDecision>,
+    pub profile_candidates: Vec<CargoProfileCandidateDecision>,
 }
 
 impl SweepDecision {
     fn has_work(&self) -> bool {
         self.delegated
             || self.candidates.iter().any(|candidate| {
+                matches!(
+                    candidate.action,
+                    SweepCandidateAction::Delete | SweepCandidateAction::RecoverTrash
+                )
+            })
+            || self.profile_candidates.iter().any(|candidate| {
                 matches!(
                     candidate.action,
                     SweepCandidateAction::Delete | SweepCandidateAction::RecoverTrash
@@ -368,6 +419,13 @@ impl GeneratedDirConfig {
                 tool: SweepTool::RustcIncremental,
                 limit: SweepLimit::AgeDays {
                     days: DEFAULT_INCREMENTAL_SWEEP_DAYS,
+                },
+            });
+            sweeps.push(SweepStrategy {
+                name: "target".to_string(),
+                tool: SweepTool::CargoProfileReset,
+                limit: SweepLimit::AgeDays {
+                    days: DEFAULT_CARGO_PROFILE_SWEEP_DAYS,
                 },
             });
         }
@@ -458,6 +516,15 @@ enum GeneratedCandidateAction {
     SweepOnly,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GeneratedScanPolicy<'a> {
+    generated_days: u64,
+    generated_activity_only: bool,
+    check_in_use: bool,
+    now: SystemTime,
+    pressure: Option<&'a PressurePolicy>,
+}
+
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
     let protections = active_protections(options.now)?;
     triage_with_protections(repo, options, &protections)
@@ -470,16 +537,24 @@ fn triage_with_protections(
 ) -> Result<TriageReport> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
-    let worktree_decisions =
-        plan_worktree_cleanup(&worktrees, options.stale_days, options.now, protections);
+    let worktree_decisions = plan_worktree_cleanup(
+        &worktrees,
+        options.stale_days,
+        options.now,
+        protections,
+        None,
+    )?;
     let generated_dirs = scan_generated_dirs(
         &worktrees,
-        options.generated_days,
-        options.generated_activity_only,
-        options.check_in_use,
-        options.now,
         &options.generated_config,
         protections,
+        GeneratedScanPolicy {
+            generated_days: options.generated_days,
+            generated_activity_only: options.generated_activity_only,
+            check_in_use: options.check_in_use,
+            now: options.now,
+            pressure: None,
+        },
     )?;
 
     Ok(TriageReport {
@@ -518,7 +593,18 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
     let protections = active_protections(options.now)?;
     let run = plan_cleanup_with_protections(repo, options, &protections)?;
     if execute {
-        execute_cleanup_manifest(&run.manifest)?;
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
+        if run
+            .manifest
+            .pressure
+            .as_ref()
+            .is_some_and(|pressure| pressure.active)
+        {
+            for rank in 0..=4 {
+                execute_cleanup_manifest(&run.manifest, ExecutionPass::PressureGenerated(rank))?;
+            }
+            execute_cleanup_manifest(&run.manifest, ExecutionPass::PressureWorktrees)?;
+        }
     }
     Ok(run)
 }
@@ -532,17 +618,25 @@ fn plan_cleanup_with_protections(
     let worktrees = inspect_worktrees(&context, options.now)?;
     let generated_dirs = scan_generated_dirs(
         &worktrees,
-        options.generated_days,
-        options.generated_activity_only,
-        options.check_in_use,
-        options.now,
         &options.generated_config,
         protections,
+        GeneratedScanPolicy {
+            generated_days: options.generated_days,
+            generated_activity_only: options.generated_activity_only,
+            check_in_use: options.check_in_use,
+            now: options.now,
+            pressure: options.pressure.as_ref(),
+        },
     )?;
     let prune_output = run_worktree_prune(&context.current_worktree, false)?;
 
-    let worktree_decisions =
-        plan_worktree_cleanup(&worktrees, options.stale_days, options.now, protections);
+    let worktree_decisions = plan_worktree_cleanup(
+        &worktrees,
+        options.stale_days,
+        options.now,
+        protections,
+        options.pressure.as_ref(),
+    )?;
     let generated_decisions = generated_dirs
         .iter()
         .map(|dir| GeneratedDirDecision {
@@ -550,9 +644,11 @@ fn plan_cleanup_with_protections(
             worktree_path: dir.worktree_path.clone(),
             name: dir.name.clone(),
             mtime: dir.mtime.clone(),
+            mtime_unix: dir.mtime_unix,
             effective_days: dir.effective_days,
             in_use: dir.in_use,
             protection: dir.protection.clone(),
+            cleanup_class: dir.cleanup_class,
             sweeps: dir.sweeps.clone(),
             action: dir.action.clone(),
             reason: dir.reason.clone(),
@@ -576,6 +672,7 @@ fn plan_cleanup_with_protections(
         check_in_use: options.check_in_use,
         cargo_lock_timeout_secs: options.cargo_lock_timeout.map(|timeout| timeout.as_secs()),
         defer_lock_timeouts: options.defer_lock_timeouts,
+        pressure: options.pressure,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
         protections: protections.to_vec(),
@@ -616,9 +713,26 @@ pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootC
 pub fn cleanup_repositories(
     roots: &[PathBuf],
     repositories: &[PathBuf],
-    options: CleanupOptions,
+    mut options: CleanupOptions,
 ) -> Result<RootCleanupRun> {
     let roots = canonicalize_roots(roots)?;
+    let pressure = if let Some(policy) = options.pressure.as_mut() {
+        let observation_paths = pressure_observation_paths(
+            &roots,
+            repositories,
+            &options.generated_config,
+            options.now,
+        )?;
+        let observations = observe_free_space(&observation_paths)?;
+        activate_pressure_policy(policy, &observations)?;
+        Some(PressureRunDecision {
+            policy: policy.clone(),
+            observations,
+            final_observations: None,
+        })
+    } else {
+        None
+    };
     let generated_at = format_system_time(options.now);
     let mode = if options.execute {
         CleanupMode::Execute
@@ -635,6 +749,7 @@ pub fn cleanup_repositories(
         mode,
         generated_at,
         roots,
+        pressure,
         repositories,
     };
     let manifest_path = write_root_manifest(&manifest)?;
@@ -652,7 +767,53 @@ pub fn cleanup_repositories(
             )?;
             manifest.repositories[index] = refreshed;
             write_root_manifest(&manifest)?;
-            execute_cleanup_manifest(&manifest.repositories[index].manifest)?;
+            execute_cleanup_manifest(
+                &manifest.repositories[index].manifest,
+                ExecutionPass::Routine,
+            )?;
+        }
+
+        if options
+            .pressure
+            .as_ref()
+            .is_some_and(|pressure| pressure.active)
+        {
+            for rank in 0..=4 {
+                for index in
+                    pressure_repository_order(&manifest, ExecutionPass::PressureGenerated(rank))
+                {
+                    refresh_and_execute_repository(
+                        &mut manifest,
+                        index,
+                        &options,
+                        ExecutionPass::PressureGenerated(rank),
+                    )?;
+                }
+            }
+            for index in pressure_repository_order(&manifest, ExecutionPass::PressureWorktrees) {
+                refresh_and_execute_repository(
+                    &mut manifest,
+                    index,
+                    &options,
+                    ExecutionPass::PressureWorktrees,
+                )?;
+            }
+        }
+        let final_paths = manifest
+            .pressure
+            .as_ref()
+            .map(|pressure| {
+                pressure
+                    .observations
+                    .iter()
+                    .map(|observation| observation.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| manifest.roots.clone());
+        let final_observations = observe_free_space(&final_paths)?;
+        if let Some(pressure) = &mut manifest.pressure {
+            pressure.final_observations = Some(final_observations);
+            write_root_manifest(&manifest)?;
         }
     }
 
@@ -662,7 +823,165 @@ pub fn cleanup_repositories(
     })
 }
 
-fn execute_cleanup_manifest(manifest: &CleanupManifest) -> Result<()> {
+fn activate_pressure_policy(
+    policy: &mut PressurePolicy,
+    observations: &[PressureObservation],
+) -> Result<()> {
+    policy.entered_filesystems = observations
+        .iter()
+        .filter(|observation| observation.available_bytes < policy.enter_bytes)
+        .map(|observation| observation.filesystem.clone())
+        .collect();
+    for observation in observations.iter().filter(|observation| {
+        policy
+            .entered_filesystems
+            .iter()
+            .any(|filesystem| filesystem == &observation.filesystem)
+    }) {
+        if policy.target_bytes > observation.total_bytes {
+            bail!(
+                "pressure target {} exceeds total filesystem capacity {} at {}",
+                format_bytes(policy.target_bytes),
+                format_bytes(observation.total_bytes),
+                observation.path.display()
+            );
+        }
+    }
+    policy.active = !policy.entered_filesystems.is_empty();
+    Ok(())
+}
+
+fn observe_free_space(paths: &[PathBuf]) -> Result<Vec<PressureObservation>> {
+    let mut seen_filesystems = HashSet::new();
+    let mut observations = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let filesystem = filesystem_key(path)?;
+        if !seen_filesystems.insert(filesystem.clone()) {
+            continue;
+        }
+        observations.push(PressureObservation {
+            path: path.clone(),
+            filesystem,
+            available_bytes: fs4::available_space(path)
+                .with_context(|| format!("failed to read free space for {}", path.display()))?,
+            total_bytes: fs4::total_space(path).with_context(|| {
+                format!("failed to read filesystem capacity for {}", path.display())
+            })?,
+        });
+    }
+    Ok(observations)
+}
+
+fn pressure_observation_paths(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    generated_config: &GeneratedDirConfig,
+    now: SystemTime,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = roots.to_vec();
+    for repository in repositories {
+        let context = repo_context(Some(repository))?;
+        let worktrees = inspect_worktrees(&context, now)?;
+        for worktree in worktrees
+            .iter()
+            .filter(|worktree| worktree.exists && worktree.prunable.is_none())
+        {
+            paths.push(worktree.path.clone());
+            paths.extend(
+                generated_candidates(worktree, generated_config)?
+                    .into_iter()
+                    .map(|candidate| candidate.path),
+            );
+        }
+    }
+    Ok(paths)
+}
+
+fn refresh_and_execute_repository(
+    manifest: &mut RootCleanupManifest,
+    index: usize,
+    options: &CleanupOptions,
+    pass: ExecutionPass,
+) -> Result<()> {
+    let repo_root = manifest.repositories[index].manifest.repo_root.clone();
+    let mut refreshed_options = options.clone();
+    refreshed_options.now = SystemTime::now();
+    let refreshed_protections = active_protections(refreshed_options.now)?;
+    let refreshed =
+        plan_cleanup_with_protections(Some(&repo_root), refreshed_options, &refreshed_protections)?;
+    manifest.repositories[index] = refreshed;
+    write_root_manifest(manifest)?;
+    execute_cleanup_manifest(&manifest.repositories[index].manifest, pass)
+}
+
+fn pressure_repository_order(manifest: &RootCleanupManifest, pass: ExecutionPass) -> Vec<usize> {
+    let mut order = (0..manifest.repositories.len())
+        .filter(|index| {
+            let repository = &manifest.repositories[*index].manifest;
+            match pass {
+                ExecutionPass::PressureGenerated(rank) => {
+                    repository.generated_dirs.iter().any(|decision| {
+                        decision.action == GeneratedDirAction::Delete
+                            && decision.cleanup_class == CleanupClass::Pressure
+                            && generated_rebuild_rank(&decision.name) == rank
+                    })
+                }
+                ExecutionPass::PressureWorktrees => repository.worktrees.iter().any(|decision| {
+                    decision.action == WorktreeAction::Remove
+                        && decision.cleanup_class == CleanupClass::Pressure
+                }),
+                ExecutionPass::Routine => false,
+            }
+        })
+        .collect::<Vec<_>>();
+    order.sort_by_key(|index| {
+        let manifest = &manifest.repositories[*index].manifest;
+        let oldest_generated = manifest
+            .generated_dirs
+            .iter()
+            .filter(|decision| {
+                decision.action == GeneratedDirAction::Delete
+                    && decision.cleanup_class == CleanupClass::Pressure
+                    && match pass {
+                        ExecutionPass::PressureGenerated(rank) => {
+                            generated_rebuild_rank(&decision.name) == rank
+                        }
+                        _ => false,
+                    }
+            })
+            .filter_map(|decision| decision.mtime_unix)
+            .min()
+            .unwrap_or(i64::MAX);
+        let oldest_worktree = manifest
+            .worktrees
+            .iter()
+            .filter(|decision| decision.cleanup_class == CleanupClass::Pressure)
+            .filter_map(|decision| decision.activity_age_days)
+            .max()
+            .unwrap_or_default();
+        (
+            oldest_generated,
+            std::cmp::Reverse(oldest_worktree),
+            manifest.repo_root.clone(),
+        )
+    });
+    order
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionPass {
+    Routine,
+    PressureGenerated(u8),
+    PressureWorktrees,
+}
+
+fn execute_cleanup_manifest(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()> {
+    if pass != ExecutionPass::Routine {
+        return execute_cleanup(manifest, pass);
+    }
     let worktree_paths = prunable_worktree_paths(&manifest.worktrees);
     match with_protection_guard_for_paths(&worktree_paths, SystemTime::now(), || {
         run_worktree_prune(&manifest.current_worktree, true)
@@ -680,7 +999,7 @@ fn execute_cleanup_manifest(manifest: &CleanupManifest) -> Result<()> {
             result?;
         }
     }
-    execute_cleanup(manifest)
+    execute_cleanup(manifest, pass)
 }
 
 fn prunable_worktree_paths(worktrees: &[WorktreeDecision]) -> Vec<PathBuf> {
@@ -1066,6 +1385,34 @@ pub fn print_root_cleanup(run: &RootCleanupRun) {
         "aggregate plan: {} worktrees, {} generated dirs, {} in-place sweeps",
         removed_worktrees, deleted_dirs, swept_dirs
     );
+    if let Some(pressure) = &run.manifest.pressure {
+        println!(
+            "pressure: {} (enter below {}, reclaim toward {})",
+            if pressure.policy.active {
+                "active"
+            } else {
+                "inactive"
+            },
+            format_bytes(pressure.policy.enter_bytes),
+            format_bytes(pressure.policy.target_bytes)
+        );
+        for observation in &pressure.observations {
+            println!(
+                "- initial {} available at {}",
+                format_bytes(observation.available_bytes),
+                observation.path.display()
+            );
+        }
+        if let Some(final_observations) = &pressure.final_observations {
+            for observation in final_observations {
+                println!(
+                    "- final {} available at {}",
+                    format_bytes(observation.available_bytes),
+                    observation.path.display()
+                );
+            }
+        }
+    }
     for repository in &run.manifest.repositories {
         println!();
         println!("=== {} ===", repository.manifest.repo_root.display());
@@ -1273,26 +1620,13 @@ fn ahead_behind(path: &Path, upstream: &str) -> Result<(Option<u64>, Option<u64>
 
 fn scan_generated_dirs(
     worktrees: &[WorktreeInfo],
-    generated_days: u64,
-    generated_activity_only: bool,
-    check_in_use: bool,
-    now: SystemTime,
     config: &GeneratedDirConfig,
     protections: &[ProtectionLease],
+    policy: GeneratedScanPolicy<'_>,
 ) -> Result<Vec<GeneratedDirInfo>> {
     let mut dirs: Vec<GeneratedDirInfo> = worktrees
         .par_iter()
-        .map(|worktree| {
-            scan_generated_dirs_for_worktree(
-                worktree,
-                generated_days,
-                generated_activity_only,
-                check_in_use,
-                now,
-                config,
-                protections,
-            )
-        })
+        .map(|worktree| scan_generated_dirs_for_worktree(worktree, config, protections, policy))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
@@ -1326,14 +1660,24 @@ fn scan_generated_dirs(
     Ok(dirs)
 }
 
+fn pressure_applies(path: &Path, pressure: Option<&PressurePolicy>) -> Result<bool> {
+    let Some(pressure) = pressure.filter(|pressure| pressure.active) else {
+        return Ok(false);
+    };
+    let filesystem = filesystem_key(path)?;
+    if !pressure_filesystem_entered(pressure, &filesystem) {
+        return Ok(false);
+    }
+    let available = fs4::available_space(path)
+        .with_context(|| format!("failed to read free space for {}", path.display()))?;
+    Ok(available < pressure.target_bytes)
+}
+
 fn scan_generated_dirs_for_worktree(
     worktree: &WorktreeInfo,
-    generated_days: u64,
-    generated_activity_only: bool,
-    check_in_use: bool,
-    now: SystemTime,
     config: &GeneratedDirConfig,
     protections: &[ProtectionLease],
+    policy: GeneratedScanPolicy<'_>,
 ) -> Result<Vec<GeneratedDirInfo>> {
     let mut dirs = Vec::new();
 
@@ -1344,7 +1688,7 @@ fn scan_generated_dirs_for_worktree(
     let candidates = generated_candidates(worktree, config)?;
     let ignored_paths = git_ignored_paths(&worktree.path, &candidates)?;
     let tracked_paths = git_tracked_paths(&worktree.path, &candidates)?;
-    let open_generated_dirs = if check_in_use {
+    let open_generated_dirs = if policy.check_in_use {
         dirs_with_open_handles(candidates.iter().map(|candidate| candidate.path.as_path()))
     } else {
         HashSet::new()
@@ -1352,8 +1696,19 @@ fn scan_generated_dirs_for_worktree(
 
     for candidate in candidates {
         let protection = protection_for_path(&candidate.path, protections);
-        let effective_days = config.effective_days(&candidate.name, generated_days);
-        let worktree_recent = !generated_activity_only
+        let routine_days = config.effective_days(&candidate.name, policy.generated_days);
+        let pressure_applies = pressure_applies(&candidate.path, policy.pressure)?;
+        let effective_days = if pressure_applies {
+            routine_days.min(
+                policy
+                    .pressure
+                    .expect("pressure applies only with a policy")
+                    .generated_days,
+            )
+        } else {
+            routine_days
+        };
+        let worktree_recent = !policy.generated_activity_only
             && (worktree.is_current
                 || worktree
                     .activity_age_days
@@ -1365,8 +1720,17 @@ fn scan_generated_dirs_for_worktree(
             .any(|tracked| path_is_under(tracked, &relative_key));
         let mtime_unix = sampled_mtime_unix(&candidate.path, GENERATED_MTIME_SAMPLE_DEPTH);
         let dir_recent = mtime_unix
-            .and_then(|unix| age_days(now, unix))
+            .and_then(|unix| age_days(policy.now, unix))
             .is_some_and(|days| days < effective_days);
+        let routine_worktree_recent = !policy.generated_activity_only
+            && (worktree.is_current
+                || worktree
+                    .activity_age_days
+                    .is_some_and(|days| days < routine_days));
+        let routine_dir_recent = mtime_unix
+            .and_then(|unix| age_days(policy.now, unix))
+            .is_some_and(|days| days < routine_days);
+        let routine_active = routine_worktree_recent || routine_dir_recent;
 
         // Only pay for the open-handle probe when the directory would
         // otherwise be deleted.
@@ -1379,11 +1743,16 @@ fn scan_generated_dirs_for_worktree(
         let active = worktree_recent || dir_recent;
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
             && protection.is_none()
-            && (active || candidate.action == GeneratedCandidateAction::SweepOnly)
+            && (routine_active || candidate.action == GeneratedCandidateAction::SweepOnly)
             && !has_tracked_files
             && !sweep_strategies.is_empty()
         {
-            plan_sweep_decisions(&candidate.path, &worktree.path, sweep_strategies, now)?
+            plan_sweep_decisions(
+                &candidate.path,
+                &worktree.path,
+                sweep_strategies,
+                policy.now,
+            )?
         } else {
             Vec::new()
         };
@@ -1463,7 +1832,7 @@ fn scan_generated_dirs_for_worktree(
                     GeneratedDirAction::Skip,
                     if !planned_reason.is_empty() {
                         planned_reason
-                    } else if generated_activity_only {
+                    } else if policy.generated_activity_only {
                         format!("generated directory activity is newer than {effective_days} days")
                     } else {
                         format!(
@@ -1488,6 +1857,20 @@ fn scan_generated_dirs_for_worktree(
                 "untracked generated directory".to_string(),
             )
         };
+        let cleanup_class = if action == GeneratedDirAction::Delete
+            && pressure_applies
+            && effective_days < routine_days
+            && routine_active
+        {
+            CleanupClass::Pressure
+        } else {
+            CleanupClass::Routine
+        };
+        let reason = if cleanup_class == CleanupClass::Pressure {
+            format!("pressure cleanup below the {routine_days}-day routine window: {reason}")
+        } else {
+            reason
+        };
 
         dirs.push(GeneratedDirInfo {
             path: candidate.path,
@@ -1500,6 +1883,7 @@ fn scan_generated_dirs_for_worktree(
             effective_days,
             in_use,
             protection,
+            cleanup_class,
             sweeps,
             action,
             reason,
@@ -1532,6 +1916,23 @@ fn plan_sweep_decisions(
                     project_dir: cargo_project_dir(target_dir, worktree),
                     reason: plan.reason,
                     candidates: plan.candidates,
+                    profile_candidates: Vec::new(),
+                })
+            }
+            SweepTool::CargoProfileReset => {
+                let days = strategy
+                    .limit
+                    .age_days()
+                    .context("cargo-profile-reset requires an age-days limit")?;
+                let plan = plan_cargo_profile_sweep(target_dir, worktree, days, now)?;
+                Ok(SweepDecision {
+                    tool: SweepTool::CargoProfileReset,
+                    limit: strategy.limit.clone(),
+                    delegated: false,
+                    project_dir: cargo_project_dir(target_dir, worktree),
+                    reason: plan.reason,
+                    candidates: Vec::new(),
+                    profile_candidates: plan.candidates,
                 })
             }
             SweepTool::CargoSweep => Ok(SweepDecision {
@@ -1549,6 +1950,7 @@ fn plan_sweep_decisions(
                     ),
                 },
                 candidates: Vec::new(),
+                profile_candidates: Vec::new(),
             }),
         })
         .collect()
@@ -1903,11 +2305,25 @@ fn plan_worktree_cleanup(
     stale_days: u64,
     now: SystemTime,
     protections: &[ProtectionLease],
-) -> Vec<WorktreeDecision> {
+    pressure: Option<&PressurePolicy>,
+) -> Result<Vec<WorktreeDecision>> {
     worktrees
         .iter()
-        .map(|worktree| {
+        .map(|worktree| -> Result<WorktreeDecision> {
             let protection = protection_for_path(&worktree.path, protections);
+            let pressure_applies = worktree.exists && pressure_applies(&worktree.path, pressure)?;
+            let effective_days = if pressure_applies {
+                stale_days.min(
+                    pressure
+                        .expect("pressure applies only with a policy")
+                        .stale_days,
+                )
+            } else {
+                stale_days
+            };
+            let age = worktree
+                .last_commit_unix
+                .and_then(|unix| age_days(now, unix));
             let (action, reason) = if let Some(lease) = &protection {
                 (
                     WorktreeAction::Keep,
@@ -1941,53 +2357,103 @@ fn plan_worktree_cleanup(
                     WorktreeAction::Keep,
                     "detached worktree is kept to preserve commit reachability".to_string(),
                 )
-            } else if worktree
-                .last_commit_unix
-                .and_then(|unix| age_days(now, unix))
-                .is_some_and(|days| days >= stale_days)
-            {
+            } else if age.is_some_and(|days| days >= effective_days) {
                 (
                     WorktreeAction::Remove,
-                    format!("clean worktree last committed at least {stale_days} days ago"),
+                    format!("clean worktree last committed at least {effective_days} days ago"),
                 )
             } else {
                 (
                     WorktreeAction::Keep,
-                    format!("not older than {stale_days} days"),
+                    format!("not older than {effective_days} days"),
                 )
             };
+            let cleanup_class = if action == WorktreeAction::Remove
+                && pressure_applies
+                && effective_days < stale_days
+                && age.is_some_and(|days| days < stale_days)
+            {
+                CleanupClass::Pressure
+            } else {
+                CleanupClass::Routine
+            };
+            let reason = if cleanup_class == CleanupClass::Pressure {
+                format!("pressure cleanup below the {stale_days}-day routine window: {reason}")
+            } else {
+                reason
+            };
 
-            WorktreeDecision {
+            Ok(WorktreeDecision {
                 path: worktree.path.clone(),
                 branch: worktree.branch.clone(),
                 metadata_prunable: worktree.prunable.is_some() || !worktree.exists,
                 action,
+                cleanup_class,
                 reason,
                 protection,
                 dirty_count: worktree.dirty_count,
                 last_commit: worktree.last_commit.clone(),
                 activity_age_days: worktree.activity_age_days,
-            }
+            })
         })
         .collect()
 }
 
-fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
-    let worktree_removals = manifest
+fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()> {
+    let mut worktree_removals = manifest
         .worktrees
         .iter()
-        .filter(|decision| decision.action == WorktreeAction::Remove)
+        .filter(|decision| {
+            decision.action == WorktreeAction::Remove
+                && execution_matches(decision.cleanup_class, pass)
+                && matches!(
+                    pass,
+                    ExecutionPass::Routine | ExecutionPass::PressureWorktrees
+                )
+        })
         .collect::<Vec<_>>();
-    let generated_deletions = manifest
+    worktree_removals.sort_by_key(|decision| {
+        (
+            std::cmp::Reverse(decision.activity_age_days.unwrap_or_default()),
+            decision.path.clone(),
+        )
+    });
+    let mut generated_deletions = manifest
         .generated_dirs
         .iter()
-        .filter(|decision| decision.action == GeneratedDirAction::Delete)
+        .filter(|decision| {
+            decision.action == GeneratedDirAction::Delete
+                && execution_matches(decision.cleanup_class, pass)
+                && match pass {
+                    ExecutionPass::Routine => true,
+                    ExecutionPass::PressureGenerated(rank) => {
+                        generated_rebuild_rank(&decision.name) == rank
+                    }
+                    ExecutionPass::PressureWorktrees => false,
+                }
+        })
         .collect::<Vec<_>>();
-    let generated_sweeps = manifest
-        .generated_dirs
-        .iter()
-        .filter(|decision| decision.action == GeneratedDirAction::Sweep)
-        .collect::<Vec<_>>();
+    generated_deletions.sort_by_key(|decision| {
+        (
+            generated_rebuild_rank(&decision.name),
+            decision.mtime_unix.unwrap_or(i64::MAX),
+            decision.path.clone(),
+        )
+    });
+    let generated_sweeps = if pass == ExecutionPass::Routine {
+        manifest
+            .generated_dirs
+            .iter()
+            .filter(|decision| {
+                decision.sweeps.iter().any(SweepDecision::has_work)
+                    && (decision.action == GeneratedDirAction::Sweep
+                        || (decision.action == GeneratedDirAction::Delete
+                            && decision.cleanup_class == CleanupClass::Pressure))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let run_id = format!(
         "{}-{}",
         manifest.generated_at.replace([':', '.'], "-"),
@@ -1995,42 +2461,32 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
     );
 
     eprintln!(
-        "executing cleanup: {} worktrees, {} generated dirs, {} sweeps",
+        "executing {pass:?} cleanup: {} worktrees, {} generated dirs, {} sweeps",
         worktree_removals.len(),
         generated_deletions.len(),
         generated_sweeps.len()
     );
 
-    for (index, decision) in worktree_removals.iter().enumerate() {
-        eprintln!(
-            "[worktree {}/{}] removing {}",
-            index + 1,
-            worktree_removals.len(),
-            decision.path.display()
-        );
-        flush_stderr();
-        if decision.action != WorktreeAction::Remove {
-            continue;
-        }
-        match with_protection_guard(&decision.path, SystemTime::now(), || {
-            git_status_command(
-                &manifest.current_worktree,
-                [
-                    "worktree".as_ref(),
-                    "remove".as_ref(),
-                    decision.path.as_os_str(),
-                ],
-            )
-            .with_context(|| format!("failed to remove {}", decision.path.display()))
-        })? {
-            ProtectionGuardOutcome::Protected(lease) => {
-                print_execution_protection(&decision.path, &lease);
-            }
-            ProtectionGuardOutcome::Executed(result) => result?,
-        }
-    }
+    let nested_in_planned_removal = |path: &Path| {
+        pass == ExecutionPass::Routine
+            && worktree_removals
+                .iter()
+                .any(|worktree| path.starts_with(&worktree.path))
+    };
+    let mut satisfied_filesystems = HashSet::new();
 
     for (index, decision) in generated_deletions.iter().enumerate() {
+        if nested_in_planned_removal(&decision.path) {
+            continue;
+        }
+        if !decision.path.exists() {
+            continue;
+        }
+        if pass != ExecutionPass::Routine
+            && !pressure_should_continue(manifest, &decision.path, &mut satisfied_filesystems)?
+        {
+            continue;
+        }
         if index == 0 || index % 25 == 0 {
             eprintln!(
                 "[generated {}/{}] deleting {}",
@@ -2070,6 +2526,9 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
     }
 
     for (index, decision) in generated_sweeps.iter().enumerate() {
+        if !decision.path.exists() || nested_in_planned_removal(&decision.path) {
+            continue;
+        }
         eprintln!(
             "[sweep {}/{}] sweeping {}",
             index + 1,
@@ -2103,7 +2562,136 @@ fn execute_cleanup(manifest: &CleanupManifest) -> Result<()> {
         }
     }
 
+    execute_worktree_removals(
+        manifest,
+        pass,
+        &worktree_removals,
+        &mut satisfied_filesystems,
+    )?;
+
     Ok(())
+}
+
+fn execute_worktree_removals(
+    manifest: &CleanupManifest,
+    pass: ExecutionPass,
+    worktree_removals: &[&WorktreeDecision],
+    satisfied_filesystems: &mut HashSet<String>,
+) -> Result<()> {
+    for (index, decision) in worktree_removals.iter().enumerate() {
+        if !decision.path.exists() {
+            continue;
+        }
+        if pass != ExecutionPass::Routine
+            && !pressure_should_continue(manifest, &decision.path, satisfied_filesystems)?
+        {
+            continue;
+        }
+        eprintln!(
+            "[worktree {}/{}] removing {}",
+            index + 1,
+            worktree_removals.len(),
+            decision.path.display()
+        );
+        flush_stderr();
+        match with_protection_guard(&decision.path, SystemTime::now(), || {
+            git_status_command(
+                &manifest.current_worktree,
+                [
+                    "worktree".as_ref(),
+                    "remove".as_ref(),
+                    decision.path.as_os_str(),
+                ],
+            )
+            .with_context(|| format!("failed to remove {}", decision.path.display()))
+        })? {
+            ProtectionGuardOutcome::Protected(lease) => {
+                print_execution_protection(&decision.path, &lease);
+            }
+            ProtectionGuardOutcome::Executed(result) => result?,
+        }
+    }
+
+    Ok(())
+}
+
+fn execution_matches(class: CleanupClass, pass: ExecutionPass) -> bool {
+    matches!(
+        (class, pass),
+        (CleanupClass::Routine, ExecutionPass::Routine)
+            | (CleanupClass::Pressure, ExecutionPass::PressureGenerated(_))
+            | (CleanupClass::Pressure, ExecutionPass::PressureWorktrees)
+    )
+}
+
+fn pressure_should_continue(
+    manifest: &CleanupManifest,
+    path: &Path,
+    satisfied_filesystems: &mut HashSet<String>,
+) -> Result<bool> {
+    let policy = manifest
+        .pressure
+        .as_ref()
+        .context("pressure candidate has no pressure policy")?;
+    let filesystem = filesystem_key(path)?;
+    if !pressure_filesystem_entered(policy, &filesystem) {
+        return Ok(false);
+    }
+    if satisfied_filesystems.contains(&filesystem) {
+        return Ok(false);
+    }
+    let available = fs4::available_space(path)
+        .with_context(|| format!("failed to read free space for {}", path.display()))?;
+    if available >= policy.target_bytes {
+        eprintln!(
+            "  pressure target reached on {}: {} available; keeping remaining pressure candidates",
+            path.display(),
+            format_bytes(available)
+        );
+        satisfied_filesystems.insert(filesystem);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn pressure_filesystem_entered(policy: &PressurePolicy, filesystem: &str) -> bool {
+    if policy.entered_filesystems.is_empty() {
+        return policy.active;
+    }
+    policy
+        .entered_filesystems
+        .iter()
+        .any(|entered| entered == filesystem)
+}
+
+fn filesystem_key(path: &Path) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("failed to inspect filesystem for {}", path.display()))?;
+        Ok(format!("device:{}", metadata.dev()))
+    }
+    #[cfg(not(unix))]
+    {
+        let root = path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve filesystem for {}", path.display()))?
+            .components()
+            .next()
+            .context("path has no filesystem component")?;
+        Ok(format!("root:{root:?}"))
+    }
+}
+
+fn generated_rebuild_rank(name: &str) -> u8 {
+    match name {
+        ".turbo" => 0,
+        ".next" => 1,
+        "target" => 2,
+        "node_modules" => 3,
+        _ => 4,
+    }
 }
 
 fn print_execution_protection(path: &Path, lease: &ProtectionMatch) {
@@ -2186,6 +2774,20 @@ fn run_sweeps(
                     .context("rustc-incremental requires an age-days limit")?;
                 execute_incremental_sweep_with_timeout(
                     &sweep.candidates,
+                    days,
+                    run_id,
+                    cargo_lock_timeout,
+                )?;
+            }
+            SweepTool::CargoProfileReset => {
+                let days = sweep
+                    .limit
+                    .age_days()
+                    .context("cargo-profile-reset requires an age-days limit")?;
+                execute_cargo_profile_reset(
+                    &decision.path,
+                    &decision.worktree_path,
+                    &sweep.profile_candidates,
                     days,
                     run_id,
                     cargo_lock_timeout,
@@ -2433,8 +3035,10 @@ fn print_generated(generated_dirs: &[GeneratedDirInfo]) {
 }
 
 fn print_sweep_candidates<'a>(dirs: impl IntoIterator<Item = (&'a Path, &'a [SweepDecision])>) {
+    let dirs = dirs.into_iter().collect::<Vec<_>>();
     let candidates = dirs
-        .into_iter()
+        .iter()
+        .copied()
         .flat_map(|(target, sweeps)| {
             sweeps.iter().flat_map(move |sweep| {
                 sweep
@@ -2450,42 +3054,76 @@ fn print_sweep_candidates<'a>(dirs: impl IntoIterator<Item = (&'a Path, &'a [Swe
             })
         })
         .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return;
+    if !candidates.is_empty() {
+        let bytes = candidates
+            .iter()
+            .map(|(_, _, candidate)| candidate.logical_bytes)
+            .sum::<u64>();
+        println!();
+        println!(
+            "generated sweep artifacts: {} entries, {} logical",
+            candidates.len(),
+            format_bytes(bytes)
+        );
+        for (target, sweep, candidate) in candidates.iter().take(50) {
+            let activity = candidate
+                .activity_age_days
+                .map(|days| format!("{days}d old"))
+                .unwrap_or_else(|| "interrupted-run quarantine".to_string());
+            println!(
+                "- {} [{} in {}; {}, {}]",
+                candidate.path.display(),
+                sweep_tool_name(&sweep.tool),
+                target.display(),
+                activity,
+                format_bytes(candidate.logical_bytes)
+            );
+        }
+        if candidates.len() > 50 {
+            println!("- ... and {} more (see manifest)", candidates.len() - 50);
+        }
     }
 
-    let bytes = candidates
+    let profiles = dirs
         .iter()
-        .map(|(_, _, candidate)| candidate.logical_bytes)
-        .sum::<u64>();
+        .copied()
+        .flat_map(|(target, sweeps)| {
+            sweeps.iter().flat_map(move |sweep| {
+                sweep
+                    .profile_candidates
+                    .iter()
+                    .filter(|candidate| candidate.action == SweepCandidateAction::Delete)
+                    .map(move |candidate| (target, sweep, candidate))
+            })
+        })
+        .collect::<Vec<_>>();
+    if profiles.is_empty() {
+        return;
+    }
     println!();
-    println!(
-        "generated sweep artifacts: {} entries, {} logical",
-        candidates.len(),
-        format_bytes(bytes)
-    );
-    for (target, sweep, candidate) in candidates.iter().take(50) {
+    println!("Cargo profile reset candidates: {}", profiles.len());
+    for (target, sweep, candidate) in profiles.iter().take(50) {
         let activity = candidate
             .activity_age_days
             .map(|days| format!("{days}d old"))
-            .unwrap_or_else(|| "interrupted-run quarantine".to_string());
+            .unwrap_or_else(|| "unknown activity".to_string());
         println!(
-            "- {} [{} in {}; {}, {}]",
+            "- {} [{} in {}; {}]",
             candidate.path.display(),
             sweep_tool_name(&sweep.tool),
             target.display(),
-            activity,
-            format_bytes(candidate.logical_bytes)
+            activity
         );
     }
-    if candidates.len() > 50 {
-        println!("- ... and {} more (see manifest)", candidates.len() - 50);
+    if profiles.len() > 50 {
+        println!("- ... and {} more (see manifest)", profiles.len() - 50);
     }
 }
 
 fn sweep_tool_name(tool: &SweepTool) -> &'static str {
     match tool {
         SweepTool::RustcIncremental => "rustc-incremental",
+        SweepTool::CargoProfileReset => "cargo-profile-reset",
         SweepTool::CargoSweep => "cargo-sweep",
     }
 }
@@ -2842,7 +3480,16 @@ mod tests {
         );
 
         let target_sweeps = config.sweep_strategies("target");
-        assert_eq!(target_sweeps.len(), 2);
+        assert_eq!(target_sweeps.len(), 3);
+        assert_eq!(
+            target_sweeps
+                .iter()
+                .find(|strategy| strategy.tool == SweepTool::CargoProfileReset)
+                .map(|strategy| &strategy.limit),
+            Some(&SweepLimit::AgeDays {
+                days: DEFAULT_CARGO_PROFILE_SWEEP_DAYS
+            })
+        );
         assert_eq!(
             target_sweeps
                 .iter()
@@ -2974,7 +3621,7 @@ mod tests {
     }
 
     #[test]
-    fn default_incremental_sweep_activates_and_manifest_is_v3() -> Result<()> {
+    fn default_incremental_and_profile_sweeps_activate_in_manifest() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         fs::create_dir_all(repo.join("src"))?;
         fs::write(
@@ -2986,13 +3633,17 @@ mod tests {
         let root = profile.join("incremental/fixture-old");
         let session = root.join("s-session-hash");
         fs::create_dir_all(&session)?;
-        fs::write(profile.join(".cargo-lock"), "")?;
+        let profile_lock = profile.join(".cargo-lock");
+        fs::write(&profile_lock, "")?;
         let dep_graph = session.join("dep-graph.bin");
         fs::write(&dep_graph, "old")?;
         let old = unix_days_before_now(20);
         set_mtime(&dep_graph, old)?;
         set_mtime(&session, old)?;
         set_mtime(&root, old)?;
+        set_mtime(&profile_lock, old)?;
+        set_mtime(&profile.join("incremental"), old)?;
+        set_mtime(&profile, old)?;
 
         let run = cleanup(
             Some(&repo),
@@ -3005,6 +3656,7 @@ mod tests {
                 generated_config: GeneratedDirConfig::default(),
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
+                pressure: None,
                 now: now(),
             },
         )?;
@@ -3030,6 +3682,21 @@ mod tests {
         );
         assert!(sweep
             .candidates
+            .iter()
+            .any(|candidate| candidate.action == SweepCandidateAction::Delete));
+        let profile_sweep = target
+            .sweeps
+            .iter()
+            .find(|sweep| sweep.tool == SweepTool::CargoProfileReset)
+            .context("missing default Cargo profile sweep")?;
+        assert_eq!(
+            profile_sweep.limit,
+            SweepLimit::AgeDays {
+                days: DEFAULT_CARGO_PROFILE_SWEEP_DAYS
+            }
+        );
+        assert!(profile_sweep
+            .profile_candidates
             .iter()
             .any(|candidate| candidate.action == SweepCandidateAction::Delete));
 
@@ -3061,6 +3728,7 @@ mod tests {
                 ),
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
+                pressure: None,
                 now: now(),
             },
         )?;
@@ -3467,9 +4135,11 @@ mod tests {
             worktree_path: fs::canonicalize(&repo)?,
             name: "target".to_string(),
             mtime: None,
+            mtime_unix: None,
             effective_days: 3,
             in_use: false,
             protection: None,
+            cleanup_class: CleanupClass::Routine,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
             reason: "stale target".to_string(),
@@ -3498,9 +4168,11 @@ mod tests {
             worktree_path: fs::canonicalize(repo)?,
             name: "target".to_string(),
             mtime: None,
+            mtime_unix: None,
             effective_days: 3,
             in_use: false,
             protection: None,
+            cleanup_class: CleanupClass::Routine,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
             reason: "stale target".to_string(),
@@ -3727,9 +4399,11 @@ mod tests {
             worktree_path: repo.clone(),
             name: "target".to_string(),
             mtime: None,
+            mtime_unix: None,
             effective_days: 3,
             in_use: false,
             protection: None,
+            cleanup_class: CleanupClass::Routine,
             sweeps: vec![SweepDecision {
                 tool: SweepTool::CargoSweep,
                 limit: SweepLimit::MaxSize { bytes: 1_000_000 },
@@ -3737,6 +4411,7 @@ mod tests {
                 project_dir: Some(repo),
                 reason: "test delegated sweep".to_string(),
                 candidates: Vec::new(),
+                profile_candidates: Vec::new(),
             }],
             action: GeneratedDirAction::Sweep,
             reason: "test sweep".to_string(),
@@ -3768,6 +4443,7 @@ mod tests {
             generated_config: GeneratedDirConfig::default(),
             cargo_lock_timeout: None,
             defer_lock_timeouts: false,
+            pressure: None,
             now: now(),
         };
         let run = cleanup(Some(&repo), options)?;
@@ -3791,7 +4467,7 @@ mod tests {
         let expected_worktree = fs::canonicalize(&worktree)?;
 
         let report = audit(Some(&repo), 7, now())?;
-        let decisions = plan_worktree_cleanup(&report.worktrees, 30, now(), &[]);
+        let decisions = plan_worktree_cleanup(&report.worktrees, 30, now(), &[], None)?;
         let decision = decisions
             .iter()
             .find(|decision| decision.path == expected_worktree)
@@ -3817,7 +4493,7 @@ mod tests {
             expires_at_unix: u64::MAX,
         };
 
-        let decisions = plan_worktree_cleanup(&report.worktrees, 0, now(), &[lease]);
+        let decisions = plan_worktree_cleanup(&report.worktrees, 0, now(), &[lease], None)?;
         let decision = decisions
             .iter()
             .find(|decision| decision.path == protected_path)
@@ -3838,6 +4514,7 @@ mod tests {
             branch: None,
             metadata_prunable,
             action,
+            cleanup_class: CleanupClass::Routine,
             reason: "fixture".to_string(),
             protection: None,
             dirty_count: None,
@@ -3861,6 +4538,231 @@ mod tests {
     }
 
     #[test]
+    fn pressure_order_enforces_rebuild_classes_across_repositories() {
+        let generated = |repo: &str, name: &str, mtime_unix: i64| GeneratedDirDecision {
+            path: PathBuf::from(repo).join(name),
+            worktree_path: PathBuf::from(repo),
+            name: name.to_string(),
+            mtime: None,
+            mtime_unix: Some(mtime_unix),
+            effective_days: 1,
+            in_use: false,
+            protection: None,
+            cleanup_class: CleanupClass::Pressure,
+            sweeps: Vec::new(),
+            action: GeneratedDirAction::Delete,
+            reason: "pressure fixture".to_string(),
+        };
+        let repository = |repo: &str, generated_dirs: Vec<GeneratedDirDecision>| CleanupRun {
+            manifest_path: PathBuf::from(repo).join("manifest.json"),
+            manifest: CleanupManifest {
+                manifest_version: MANIFEST_VERSION,
+                mode: CleanupMode::DryRun,
+                generated_at: "fixture".to_string(),
+                repo_root: PathBuf::from(repo),
+                current_worktree: PathBuf::from(repo),
+                git_common_dir: PathBuf::from(repo).join(".git"),
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                cargo_lock_timeout_secs: Some(1800),
+                defer_lock_timeouts: true,
+                pressure: None,
+                generated_delete_names: Vec::new(),
+                generated_report_only_names: Vec::new(),
+                protections: Vec::new(),
+                prune_output: String::new(),
+                worktrees: Vec::new(),
+                generated_dirs,
+            },
+        };
+        let manifest = RootCleanupManifest {
+            manifest_version: MANIFEST_VERSION,
+            mode: CleanupMode::DryRun,
+            generated_at: "fixture".to_string(),
+            roots: vec![PathBuf::from("/code")],
+            pressure: None,
+            repositories: vec![
+                repository(
+                    "/code/a",
+                    vec![
+                        generated("/code/a", "node_modules", 10),
+                        generated("/code/a", ".turbo", 20),
+                    ],
+                ),
+                repository(
+                    "/code/b",
+                    vec![
+                        generated("/code/b", ".next", 5),
+                        generated("/code/b", ".turbo", 10),
+                    ],
+                ),
+            ],
+        };
+
+        assert_eq!(
+            pressure_repository_order(&manifest, ExecutionPass::PressureGenerated(0)),
+            vec![1, 0]
+        );
+        assert_eq!(
+            pressure_repository_order(&manifest, ExecutionPass::PressureGenerated(1)),
+            vec![1]
+        );
+        assert_eq!(
+            pressure_repository_order(&manifest, ExecutionPass::PressureGenerated(3)),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn pressure_target_must_fit_the_configured_filesystem() -> Result<()> {
+        let temp = TempDir::new()?;
+        let error = cleanup_repositories(
+            &[temp.path().to_path_buf()],
+            &[],
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    active: false,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+        )
+        .expect_err("impossible pressure target should fail before planning");
+        assert!(error
+            .to_string()
+            .contains("exceeds total filesystem capacity"));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_capacity_validation_ignores_filesystems_that_did_not_enter() -> Result<()> {
+        let mut policy = PressurePolicy {
+            enter_bytes: 100,
+            target_bytes: 150,
+            generated_days: 1,
+            stale_days: 7,
+            active: false,
+            entered_filesystems: Vec::new(),
+        };
+        let observations = vec![
+            PressureObservation {
+                path: PathBuf::from("/pressured"),
+                filesystem: "pressured".to_string(),
+                available_bytes: 50,
+                total_bytes: 200,
+            },
+            PressureObservation {
+                path: PathBuf::from("/healthy-small"),
+                filesystem: "healthy-small".to_string(),
+                available_bytes: 120,
+                total_bytes: 120,
+            },
+        ];
+
+        activate_pressure_policy(&mut policy, &observations)?;
+        assert_eq!(policy.entered_filesystems, vec!["pressured"]);
+        assert!(policy.active);
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_observes_repository_worktrees_and_generated_candidates() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let linked = temp.path().join("pressure-linked");
+        add_worktree(&repo, &linked, "pressure-linked-branch")?;
+        fs::create_dir_all(linked.join("target/debug"))?;
+        fs::write(linked.join("target/debug/.cargo-lock"), "")?;
+
+        let paths = pressure_observation_paths(
+            &[temp.path().to_path_buf()],
+            std::slice::from_ref(&repo),
+            &GeneratedDirConfig::default(),
+            now(),
+        )?;
+        let linked = fs::canonicalize(linked)?;
+        assert!(paths.contains(&linked));
+        assert!(paths.contains(&linked.join("target")));
+
+        let observations = observe_free_space(&paths)?;
+        let device_count = paths
+            .iter()
+            .map(|path| filesystem_key(path))
+            .collect::<Result<HashSet<_>>>()?
+            .len();
+        assert_eq!(observations.len(), device_count);
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_candidates_are_gated_by_entered_filesystem() -> Result<()> {
+        let temp = TempDir::new()?;
+        let filesystem = filesystem_key(temp.path())?;
+        let mut policy = PressurePolicy {
+            enter_bytes: u64::MAX - 1,
+            target_bytes: u64::MAX,
+            generated_days: 1,
+            stale_days: 7,
+            active: true,
+            entered_filesystems: vec!["different-filesystem".to_string()],
+        };
+        assert!(!pressure_applies(temp.path(), Some(&policy))?);
+        policy.entered_filesystems = vec![filesystem];
+        assert!(pressure_applies(temp.path(), Some(&policy))?);
+        Ok(())
+    }
+
+    #[test]
+    fn vanished_pressure_candidate_is_already_reclaimed() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let cache = repo.join("node_modules/pkg");
+        fs::create_dir_all(&cache)?;
+        fs::write(cache.join("index.js"), "fixture")?;
+        let old = unix_days_before_now(3);
+        set_mtime(&cache.join("index.js"), old)?;
+        set_mtime(&cache, old)?;
+        set_mtime(&repo.join("node_modules"), old)?;
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+        )?;
+        fs::remove_dir_all(repo.join("node_modules"))?;
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::PressureGenerated(3))?;
+        Ok(())
+    }
+
+    #[test]
     fn explicit_worktree_protection_suppresses_generated_deletes_and_sweeps() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         fs::create_dir_all(repo.join("target/debug"))?;
@@ -3879,12 +4781,15 @@ mod tests {
 
         let generated = scan_generated_dirs(
             &worktrees,
-            0,
-            true,
-            false,
-            now(),
             &GeneratedDirConfig::default(),
             &[lease],
+            GeneratedScanPolicy {
+                generated_days: 0,
+                generated_activity_only: true,
+                check_in_use: false,
+                now: now(),
+                pressure: None,
+            },
         )?;
         let target = generated
             .iter()
@@ -3914,6 +4819,7 @@ mod tests {
             generated_config: GeneratedDirConfig::default(),
             cargo_lock_timeout: None,
             defer_lock_timeouts: false,
+            pressure: None,
             now: now(),
         };
         cleanup(Some(&repo), options)?;
@@ -3921,6 +4827,42 @@ mod tests {
         assert!(!worktree.exists());
         let refs = git_output(&repo, ["show-ref", "--heads", "remove-me-branch"])?;
         assert!(refs.contains("refs/heads/remove-me-branch"));
+        Ok(())
+    }
+
+    #[test]
+    fn routine_worktree_removal_precedes_nested_cargo_cleanup() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("remove-before-target");
+        add_worktree(&repo, &worktree, "remove-before-target-branch")?;
+        let profile = worktree.join("target/debug");
+        fs::create_dir_all(&profile)?;
+        let lock = fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(profile.join(".cargo-lock"))?;
+        lock.lock()?;
+
+        cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 0,
+                generated_days: 0,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: Some(Duration::from_millis(20)),
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+
+        assert!(!worktree.exists());
+        lock.unlock()?;
         Ok(())
     }
 
@@ -3951,6 +4893,7 @@ mod tests {
             generated_config: GeneratedDirConfig::default(),
             cargo_lock_timeout: None,
             defer_lock_timeouts: false,
+            pressure: None,
             now: now(),
         };
         cleanup(Some(&repo), options)?;
@@ -4012,11 +4955,178 @@ mod tests {
             generated_config: GeneratedDirConfig::default(),
             cargo_lock_timeout: None,
             defer_lock_timeouts: false,
+            pressure: None,
             now: now(),
         };
         cleanup(Some(&repo), options)?;
 
         assert!(!repo.join("node_modules").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_cleanup_uses_shorter_window_and_stops_at_target() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let package = repo.join("node_modules/pkg");
+        fs::create_dir_all(&package)?;
+        let artifact = package.join("index.js");
+        fs::write(&artifact, "module.exports = 1\n")?;
+        let old = unix_days_before_now(3);
+        set_mtime(&artifact, old)?;
+        set_mtime(&package, old)?;
+        set_mtime(&repo.join("node_modules"), old)?;
+
+        let satisfied = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: 0,
+                    target_bytes: 1,
+                    generated_days: 1,
+                    stale_days: 7,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+        )?;
+        let satisfied_candidate = satisfied
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing satisfied pressure candidate")?;
+        assert_eq!(satisfied_candidate.action, GeneratedDirAction::Skip);
+
+        let policy = PressurePolicy {
+            enter_bytes: u64::MAX - 1,
+            target_bytes: u64::MAX,
+            generated_days: 1,
+            stale_days: 7,
+            active: true,
+            entered_filesystems: Vec::new(),
+        };
+        let dry_run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(policy.clone()),
+                now: now(),
+            },
+        )?;
+        let candidate = dry_run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules pressure candidate")?;
+        assert_eq!(candidate.action, GeneratedDirAction::Delete);
+        assert_eq!(candidate.cleanup_class, CleanupClass::Pressure);
+        assert_eq!(candidate.effective_days, 1);
+        assert!(repo.join("node_modules").is_dir());
+
+        cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(policy),
+                now: now(),
+            },
+        )?;
+        assert!(!repo.join("node_modules").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_only_target_retains_routine_sweep_work() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"pressure-sweep-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let target = repo.join("target");
+        let profile = target.join("debug");
+        let root = profile.join("incremental/fixture-old");
+        let session = root.join("s-session-hash");
+        fs::create_dir_all(&session)?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        let dep_graph = session.join("dep-graph.bin");
+        fs::write(&dep_graph, "old")?;
+        let stale = unix_days_before_now(20);
+        for path in [&dep_graph, &session, &root] {
+            set_mtime(path, stale)?;
+        }
+        let pressure_only = unix_days_before_now(2);
+        for path in [
+            profile.join("incremental"),
+            profile.join(".cargo-lock"),
+            profile.clone(),
+            target.clone(),
+        ] {
+            set_mtime(&path, pressure_only)?;
+        }
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+        )?;
+        let target = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "target")
+            .context("missing target pressure candidate")?;
+        assert_eq!(target.action, GeneratedDirAction::Delete);
+        assert_eq!(target.cleanup_class, CleanupClass::Pressure);
+        assert!(target.sweeps.iter().any(|sweep| {
+            sweep.tool == SweepTool::RustcIncremental
+                && sweep
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.action == SweepCandidateAction::Delete)
+        }));
         Ok(())
     }
 

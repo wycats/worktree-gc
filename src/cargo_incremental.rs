@@ -452,23 +452,25 @@ pub(crate) fn execute_incremental_sweep_with_timeout(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn with_cargo_profile_locks<T>(
-    target_dir: &Path,
-    worktree: &Path,
-    action: impl FnOnce() -> T,
-) -> Result<T> {
-    with_cargo_profile_locks_timeout(target_dir, worktree, None, action)
-}
-
 pub(crate) fn with_cargo_profile_locks_timeout<T>(
     target_dir: &Path,
     worktree: &Path,
     lock_timeout: Option<Duration>,
     action: impl FnOnce() -> T,
 ) -> Result<T> {
+    with_cargo_profile_locks_timeout_observed(target_dir, worktree, lock_timeout, |_| {}, action)
+}
+
+fn with_cargo_profile_locks_timeout_observed<T>(
+    target_dir: &Path,
+    worktree: &Path,
+    lock_timeout: Option<Duration>,
+    mut observed: impl FnMut(&[PathBuf]),
+    action: impl FnOnce() -> T,
+) -> Result<T> {
     loop {
         let lock_paths = cargo_profile_lock_paths(target_dir, worktree)?;
+        observed(&lock_paths);
         let locks = wait_for_profile_locks(&lock_paths, lock_timeout)?;
         let refreshed_lock_paths = cargo_profile_lock_paths(target_dir, worktree)?;
         if refreshed_lock_paths != lock_paths {
@@ -1224,36 +1226,42 @@ mod tests {
         host_lock.lock()?;
 
         let (action_tx, action_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
         let thread_target = target.clone();
         let thread_repo = repo.clone();
         let handle = thread::spawn(move || {
-            with_cargo_profile_locks(&thread_target, &thread_repo, || action_tx.send(()).unwrap())
+            let mut observed_tx = Some(observed_tx);
+            with_cargo_profile_locks_timeout_observed(
+                &thread_target,
+                &thread_repo,
+                None,
+                move |_| {
+                    if let Some(sender) = observed_tx.take() {
+                        sender.send(()).unwrap();
+                    }
+                },
+                || action_tx.send(()).unwrap(),
+            )
         });
-        thread::sleep(Duration::from_millis(500));
+        observed_rx.recv_timeout(Duration::from_secs(5))?;
         let cross = profile(&target, "aarch64-unknown-linux-musl/debug")?;
         let cross_lock = OpenOptions::new()
             .read(true)
             .write(true)
             .open(cross.join(".cargo-lock"))?;
-        cross_lock.lock()?;
-        host_lock.unlock()?;
+        cross_lock
+            .lock()
+            .context("failed to hold the newly discovered profile lock")?;
+        drop(host_lock);
         thread::sleep(Duration::from_millis(500));
         assert!(matches!(
             action_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
 
-        cross_lock.unlock()?;
+        drop(cross_lock);
         action_rx.recv_timeout(Duration::from_secs(5))?;
         handle.join().expect("lock coordination thread panicked")?;
-
-        for profile in [host, cross] {
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(profile.join(".cargo-lock"))?;
-            lock.try_lock()?;
-        }
         Ok(())
     }
 
