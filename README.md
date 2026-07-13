@@ -355,6 +355,26 @@ Execution remains manual and outside scheduled cleanup because Lima does not
 provide an interprocess prune lock that spans its download activity and prune.
 Instance deletion or archival is always report-only and outside this collector.
 
+## Parallels VM storage inventory
+
+The Parallels collector reconciles host APFS allocation with Parallels' own VM
+and virtual-disk state:
+
+```sh
+worktree-gc collect parallels
+```
+
+It discovers registered VMs through `prlctl --json`, measures each VM home and
+disk on APFS, and asks `prl_disk_tool compact --info` for the owner's used-block
+estimate. This keeps three different numbers separate: the VM's virtual
+capacity, its host allocation, and the smaller amount Parallels believes disk
+compaction could return. Projected host reclaim is capped by the disk file's
+APFS-private bytes so clones cannot inflate the promise.
+
+The collector is always report-only. Running, paused, and suspended VMs are
+reported as in use. Stopped VMs remain a human retention decision, and neither
+VM deletion nor disk compaction is delegated by worktree-gc.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but

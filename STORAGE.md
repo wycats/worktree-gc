@@ -164,6 +164,12 @@ The implementation order is intentionally useful after every merge:
    candidates, and their original paths are measured for private reclaim.
    Execution remains manual because Lima exposes no prune/download handoff lock;
    VM instance deletion and archival stay outside the collector.
+   Parallels delivery reconciles APFS-private VM-home allocation with
+   `prl_disk_tool compact --info`. Its virtual capacity, host allocation, and
+   owner-estimated compactable bytes are distinct evidence. Suspended and
+   running VMs remain in use; stopped VM retention, deletion, and compaction
+   stay report-only and require an explicit human decision. Expected host
+   reclaim is capped by APFS-private bytes for cloned disk images.
 7. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
    and application stores begin report-only. Activity must come from the
    owning application's task/database model rather than generic file mtimes

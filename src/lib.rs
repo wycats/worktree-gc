@@ -3,6 +3,7 @@ mod cargo_profiles;
 mod docker;
 mod inventory;
 mod lima;
+mod parallels;
 mod pnpm;
 mod protection;
 
@@ -44,6 +45,12 @@ pub use lima::{
     collect_lima, print_lima_collect, LimaCollectManifest, LimaCollectOptions, LimaCollectRun,
     LimaDownloadCandidate, LimaIdentity, LimaInstance, LimaPolicy, LimaPruneAction,
     LimaPruneOutcome, LimaPrunePlan,
+};
+pub use parallels::{
+    collect_parallels, print_parallels_collect, ParallelsAction, ParallelsCollectManifest,
+    ParallelsCollectOptions, ParallelsCollectRun, ParallelsCompactionEstimate,
+    ParallelsDiskObservation, ParallelsIdentity, ParallelsPlan, ParallelsPolicy,
+    ParallelsVmObservation,
 };
 pub use pnpm::{
     collect_pnpm, print_pnpm_collect, PnpmCollectManifest, PnpmCollectOptions, PnpmCollectRun,
