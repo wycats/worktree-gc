@@ -154,7 +154,76 @@ enum EntryKind {
 #[derive(Debug)]
 struct DirectoryVisit {
     visited_entries: u64,
-    truncated: bool,
+    exhausted: bool,
+}
+
+#[derive(Debug)]
+struct PendingDirectory {
+    path: PathBuf,
+    reader: Option<DirectoryReader>,
+    device: Option<u64>,
+}
+
+impl PendingDirectory {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            reader: None,
+            device: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DirectoryReader {
+    Portable(portable::DirectoryReader),
+    #[cfg(target_os = "macos")]
+    Macos(macos::DirectoryReader),
+}
+
+impl DirectoryReader {
+    fn open(path: &Path) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::DirectoryReader::open(path).map(Self::Macos)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            portable::DirectoryReader::open(path).map(Self::Portable)
+        }
+    }
+
+    fn visit<F>(
+        &mut self,
+        _path: &Path,
+        max_entries: u64,
+        visitor: &mut F,
+    ) -> io::Result<DirectoryVisit>
+    where
+        F: FnMut(io::Result<DirectoryEntryMeasurement>),
+    {
+        match self {
+            Self::Portable(reader) => reader.visit(max_entries, visitor),
+            #[cfg(target_os = "macos")]
+            Self::Macos(reader) => match reader.visit(max_entries, visitor) {
+                Ok(visit) => Ok(visit),
+                // EINVAL, ENOTSUP, and ENOSYS cover filesystems or older
+                // kernels that cannot vend the extended common attributes.
+                // Fall back only before the APFS reader has yielded entries,
+                // avoiding duplicate accounting after a mid-scan failure.
+                Err(error)
+                    if !reader.has_yielded_entries()
+                        && matches!(error.raw_os_error(), Some(22 | 45 | 78)) =>
+                {
+                    let mut fallback = portable::DirectoryReader::open(_path)?;
+                    let visit = fallback.visit(max_entries, visitor)?;
+                    *self = Self::Portable(fallback);
+                    Ok(visit)
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
 }
 
 pub fn inventory(paths: &[PathBuf], options: InventoryOptions) -> Result<InventoryReport> {
@@ -225,7 +294,7 @@ fn scan_root(
     let filesystem = root_device
         .map(|device| format!("device:{device}"))
         .unwrap_or_else(|| "unknown".to_string());
-    let mut queue = VecDeque::from([root.clone()]);
+    let mut queue = VecDeque::from([PendingDirectory::new(root.clone())]);
     let mut seen_files = HashSet::new();
     let mut pending_hardlinks: HashMap<(u64, u64), PendingHardlink> = HashMap::new();
     let mut aggregates = BTreeMap::new();
@@ -235,115 +304,136 @@ fn scan_root(
     let mut complete = true;
     let mut errors = Vec::new();
 
-    while let Some(directory) = queue.pop_front() {
+    while let Some(mut pending) = queue.pop_front() {
         if *remaining_entries == 0 {
             complete = false;
             break;
         }
+        let directory = &pending.path;
 
-        let directory_metadata = match fs::metadata(&directory) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                record_error(&mut aggregates, &directory, &error.to_string());
-                push_error(&mut errors, &directory, error.to_string());
-                complete = false;
-                continue;
-            }
-        };
-        let directory_device = metadata_device(&directory_metadata);
-        if options.one_filesystem && directory_device != root_device {
-            continue;
-        }
-
-        let visit = visit_directory(&directory, *remaining_entries, &mut |result: io::Result<
-            DirectoryEntryMeasurement,
-        >| {
-            let entry = match result {
-                Ok(entry) => entry,
+        if pending.reader.is_none() {
+            let directory_metadata = match fs::metadata(directory) {
+                Ok(metadata) => metadata,
                 Err(error) => {
-                    record_error(&mut aggregates, &directory, &error.to_string());
-                    push_error(&mut errors, &directory, error.to_string());
+                    record_error(&mut aggregates, directory, &error.to_string());
+                    push_error(&mut errors, directory, error.to_string());
                     complete = false;
-                    return;
+                    continue;
                 }
             };
-            let path = directory.join(&entry.name);
-            match entry.kind {
-                EntryKind::Directory => {
-                    let depth = relative_depth(&root, &path);
-                    if depth <= options.display_depth {
-                        aggregates.entry(path.clone()).or_default();
-                    }
-                    add_directory(&mut aggregates, &path);
-                    queue.push_back(path);
+            pending.device = metadata_device(&directory_metadata);
+            if options.one_filesystem && pending.device != root_device {
+                continue;
+            }
+            pending.reader = match DirectoryReader::open(directory) {
+                Ok(reader) => Some(reader),
+                Err(error) => {
+                    record_error(&mut aggregates, directory, &error.to_string());
+                    push_error(&mut errors, directory, error.to_string());
+                    complete = false;
+                    continue;
                 }
-                EntryKind::File => {
-                    let file_key = entry
-                        .file_id
-                        .map(|file_id| (directory_device.unwrap_or(0), file_id));
-                    let duplicate = file_key
-                        .map(|file_key| !seen_files.insert(file_key))
-                        .unwrap_or(false);
-                    if duplicate {
-                        add_hardlink_duplicate(&mut aggregates, &path);
-                        if let Some(pending) =
-                            file_key.and_then(|key| pending_hardlinks.get_mut(&key))
-                        {
-                            pending.observed_links += 1;
-                            narrow_common_parent(&mut pending.common_parent, &path);
+            };
+        }
+
+        let queued_directories = u64::try_from(queue.len().saturating_add(1)).unwrap_or(u64::MAX);
+        let directory_budget = remaining_entries
+            .saturating_add(queued_directories.saturating_sub(1))
+            / queued_directories;
+        let directory_device = pending.device;
+        let visit = pending
+            .reader
+            .as_mut()
+            .expect("directory reader was initialized")
+            .visit(directory, directory_budget, &mut |result: io::Result<
+                DirectoryEntryMeasurement,
+            >| {
+                let entry = match result {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        record_error(&mut aggregates, directory, &error.to_string());
+                        push_error(&mut errors, directory, error.to_string());
+                        complete = false;
+                        return;
+                    }
+                };
+                let path = directory.join(&entry.name);
+                match entry.kind {
+                    EntryKind::Directory => {
+                        let depth = relative_depth(&root, &path);
+                        if depth <= options.display_depth {
+                            aggregates.entry(path.clone()).or_default();
                         }
-                    } else if let Some(file) = entry.file {
-                        if entry.link_count.unwrap_or(1) > 1 {
-                            let private_reclaimable_bytes = file.private_reclaimable_bytes;
-                            add_file(
-                                &mut aggregates,
-                                &path,
-                                &FileMeasurement {
-                                    private_reclaimable_bytes: private_reclaimable_bytes.map(|_| 0),
-                                    ..file
-                                },
-                            );
-                            if let Some(file_key) = file_key {
-                                pending_hardlinks.insert(
-                                    file_key,
-                                    PendingHardlink {
-                                        expected_links: entry.link_count.unwrap_or(1),
-                                        observed_links: 1,
-                                        common_parent: path
-                                            .parent()
-                                            .expect("file has a parent")
-                                            .to_path_buf(),
-                                        private_reclaimable_bytes,
+                        add_directory(&mut aggregates, &path);
+                        queue.push_back(PendingDirectory::new(path));
+                    }
+                    EntryKind::File => {
+                        let file_key = entry
+                            .file_id
+                            .map(|file_id| (directory_device.unwrap_or(0), file_id));
+                        let duplicate = file_key
+                            .map(|file_key| !seen_files.insert(file_key))
+                            .unwrap_or(false);
+                        if duplicate {
+                            add_hardlink_duplicate(&mut aggregates, &path);
+                            if let Some(pending) =
+                                file_key.and_then(|key| pending_hardlinks.get_mut(&key))
+                            {
+                                pending.observed_links += 1;
+                                narrow_common_parent(&mut pending.common_parent, &path);
+                            }
+                        } else if let Some(file) = entry.file {
+                            if entry.link_count.unwrap_or(1) > 1 {
+                                let private_reclaimable_bytes = file.private_reclaimable_bytes;
+                                add_file(
+                                    &mut aggregates,
+                                    &path,
+                                    &FileMeasurement {
+                                        private_reclaimable_bytes: private_reclaimable_bytes
+                                            .map(|_| 0),
+                                        ..file
                                     },
                                 );
+                                if let Some(file_key) = file_key {
+                                    pending_hardlinks.insert(
+                                        file_key,
+                                        PendingHardlink {
+                                            expected_links: entry.link_count.unwrap_or(1),
+                                            observed_links: 1,
+                                            common_parent: path
+                                                .parent()
+                                                .expect("file has a parent")
+                                                .to_path_buf(),
+                                            private_reclaimable_bytes,
+                                        },
+                                    );
+                                }
+                            } else {
+                                add_file(&mut aggregates, &path, &file);
                             }
                         } else {
-                            add_file(&mut aggregates, &path, &file);
+                            let message = "file attributes were unavailable";
+                            record_error(&mut aggregates, &path, message);
+                            push_error(&mut errors, &path, message.to_string());
+                            complete = false;
                         }
-                    } else {
-                        let message = "file attributes were unavailable";
-                        record_error(&mut aggregates, &path, message);
-                        push_error(&mut errors, &path, message.to_string());
-                        complete = false;
                     }
+                    EntryKind::Other => {}
                 }
-                EntryKind::Other => {}
-            }
-        });
+            });
         let visit = match visit {
             Ok(visit) => visit,
             Err(error) => {
-                record_error(&mut aggregates, &directory, &error.to_string());
-                push_error(&mut errors, &directory, error.to_string());
+                record_error(&mut aggregates, directory, &error.to_string());
+                push_error(&mut errors, directory, error.to_string());
                 complete = false;
                 continue;
             }
         };
         visited_entries = visited_entries.saturating_add(visit.visited_entries);
         *remaining_entries = remaining_entries.saturating_sub(visit.visited_entries);
-        if visit.truncated {
-            complete = false;
-            queue.clear();
+        if !visit.exhausted {
+            queue.push_back(pending);
         }
     }
 
@@ -585,90 +675,79 @@ fn metadata_device(_metadata: &fs::Metadata) -> Option<u64> {
     None
 }
 
-#[cfg(target_os = "macos")]
-fn visit_directory<F>(path: &Path, max_entries: u64, visitor: &mut F) -> io::Result<DirectoryVisit>
-where
-    F: FnMut(io::Result<DirectoryEntryMeasurement>),
-{
-    match macos::visit_directory(path, max_entries, visitor) {
-        Ok(visit) => Ok(visit),
-        // EINVAL, ENOTSUP, and ENOSYS cover filesystems or older kernels that
-        // cannot vend the extended common attributes. Preserve inventory
-        // coverage and mark private-byte accounting incomplete via fallback.
-        Err(error) if matches!(error.raw_os_error(), Some(22 | 45 | 78)) => {
-            portable::visit_directory(path, max_entries, visitor)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn visit_directory<F>(path: &Path, max_entries: u64, visitor: &mut F) -> io::Result<DirectoryVisit>
-where
-    F: FnMut(io::Result<DirectoryEntryMeasurement>),
-{
-    portable::visit_directory(path, max_entries, visitor)
-}
-
 mod portable {
     use super::*;
 
-    pub(super) fn visit_directory<F>(
-        path: &Path,
-        max_entries: u64,
-        visitor: &mut F,
-    ) -> io::Result<DirectoryVisit>
-    where
-        F: FnMut(io::Result<DirectoryEntryMeasurement>),
-    {
-        let mut visited_entries = 0;
-        let mut truncated = false;
-        for result in fs::read_dir(path)? {
-            if visited_entries == max_entries {
-                truncated = true;
-                break;
-            }
-            visited_entries += 1;
-            let entry = match result {
-                Ok(entry) => entry,
-                Err(error) => {
-                    visitor(Err(error));
-                    continue;
-                }
-            };
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    visitor(Err(io::Error::new(
-                        error.kind(),
-                        format!("{}: {error}", entry.path().display()),
-                    )));
-                    continue;
-                }
-            };
-            let kind = if metadata.is_dir() {
-                EntryKind::Directory
-            } else if metadata.is_file() {
-                EntryKind::File
-            } else {
-                EntryKind::Other
-            };
-            visitor(Ok(DirectoryEntryMeasurement {
-                name: entry.file_name(),
-                kind,
-                file_id: metadata_file_id(&metadata),
-                link_count: metadata_link_count(&metadata),
-                file: (kind == EntryKind::File).then(|| FileMeasurement {
-                    logical_bytes: metadata.len(),
-                    allocated_bytes: metadata_allocated_bytes(&metadata),
-                    private_reclaimable_bytes: None,
-                }),
-            }));
+    #[derive(Debug)]
+    pub(super) struct DirectoryReader {
+        entries: fs::ReadDir,
+        exhausted: bool,
+    }
+
+    impl DirectoryReader {
+        pub(super) fn open(path: &Path) -> io::Result<Self> {
+            Ok(Self {
+                entries: fs::read_dir(path)?,
+                exhausted: false,
+            })
         }
-        Ok(DirectoryVisit {
-            visited_entries,
-            truncated,
-        })
+
+        pub(super) fn visit<F>(
+            &mut self,
+            max_entries: u64,
+            visitor: &mut F,
+        ) -> io::Result<DirectoryVisit>
+        where
+            F: FnMut(io::Result<DirectoryEntryMeasurement>),
+        {
+            let mut visited_entries = 0;
+            while visited_entries < max_entries {
+                let Some(result) = self.entries.next() else {
+                    self.exhausted = true;
+                    break;
+                };
+                visited_entries += 1;
+                let entry = match result {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        visitor(Err(error));
+                        continue;
+                    }
+                };
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        visitor(Err(io::Error::new(
+                            error.kind(),
+                            format!("{}: {error}", entry.path().display()),
+                        )));
+                        continue;
+                    }
+                };
+                let kind = if metadata.is_dir() {
+                    EntryKind::Directory
+                } else if metadata.is_file() {
+                    EntryKind::File
+                } else {
+                    EntryKind::Other
+                };
+                visitor(Ok(DirectoryEntryMeasurement {
+                    name: entry.file_name(),
+                    kind,
+                    file_id: metadata_file_id(&metadata),
+                    link_count: metadata_link_count(&metadata),
+                    file: (kind == EntryKind::File).then(|| FileMeasurement {
+                        logical_bytes: metadata.len(),
+                        allocated_bytes: metadata_allocated_bytes(&metadata),
+                        private_reclaimable_bytes: None,
+                    }),
+                }));
+            }
+            Ok(DirectoryVisit {
+                visited_entries,
+                exhausted: self.exhausted,
+            })
+        }
     }
 
     #[cfg(unix)]
@@ -716,7 +795,7 @@ mod macos {
     use std::os::unix::ffi::OsStringExt;
 
     #[repr(C)]
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     struct AttrList {
         bitmapcount: u16,
         reserved: u16,
@@ -768,41 +847,76 @@ mod macos {
     const VREG: u32 = 1;
     const VDIR: u32 = 2;
 
-    pub(super) fn visit_directory<F>(
-        path: &Path,
-        max_entries: u64,
-        visitor: &mut F,
-    ) -> io::Result<DirectoryVisit>
-    where
-        F: FnMut(io::Result<DirectoryEntryMeasurement>),
-    {
-        let directory = File::open(path)?;
-        let mut attrs = AttrList {
-            bitmapcount: ATTR_BIT_MAP_COUNT,
-            commonattr: ATTR_CMN_NAME
-                | ATTR_CMN_OBJTYPE
-                | ATTR_CMN_FILEID
-                | ATTR_CMN_ERROR
-                | ATTR_CMN_RETURNED_ATTRS,
-            fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
-            forkattr: ATTR_CMNEXT_PRIVATESIZE,
-            ..AttrList::default()
-        };
-        let mut buffer = vec![0u8; 64 * 1024];
-        let mut visited_entries = 0u64;
-        let mut truncated = false;
+    #[derive(Debug)]
+    pub(super) struct DirectoryReader {
+        directory: File,
+        attrs: AttrList,
+        buffer: Vec<u8>,
+        pending: VecDeque<io::Result<DirectoryEntryMeasurement>>,
+        exhausted: bool,
+        yielded_entries: bool,
+    }
 
-        loop {
-            if visited_entries == max_entries {
-                truncated = true;
-                break;
+    impl DirectoryReader {
+        pub(super) fn open(path: &Path) -> io::Result<Self> {
+            Ok(Self {
+                directory: File::open(path)?,
+                attrs: AttrList {
+                    bitmapcount: ATTR_BIT_MAP_COUNT,
+                    commonattr: ATTR_CMN_NAME
+                        | ATTR_CMN_OBJTYPE
+                        | ATTR_CMN_FILEID
+                        | ATTR_CMN_ERROR
+                        | ATTR_CMN_RETURNED_ATTRS,
+                    fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
+                    forkattr: ATTR_CMNEXT_PRIVATESIZE,
+                    ..AttrList::default()
+                },
+                buffer: vec![0u8; 64 * 1024],
+                pending: VecDeque::new(),
+                exhausted: false,
+                yielded_entries: false,
+            })
+        }
+
+        pub(super) fn has_yielded_entries(&self) -> bool {
+            self.yielded_entries
+        }
+
+        pub(super) fn visit<F>(
+            &mut self,
+            max_entries: u64,
+            visitor: &mut F,
+        ) -> io::Result<DirectoryVisit>
+        where
+            F: FnMut(io::Result<DirectoryEntryMeasurement>),
+        {
+            let mut visited_entries = 0u64;
+            while visited_entries < max_entries {
+                if let Some(result) = self.pending.pop_front() {
+                    visited_entries += 1;
+                    self.yielded_entries = true;
+                    visitor(result);
+                    continue;
+                }
+                if self.exhausted {
+                    break;
+                }
+                self.fill_pending()?;
             }
+            Ok(DirectoryVisit {
+                visited_entries,
+                exhausted: self.exhausted && self.pending.is_empty(),
+            })
+        }
+
+        fn fill_pending(&mut self) -> io::Result<()> {
             let count = unsafe {
                 getattrlistbulk(
-                    directory.as_raw_fd(),
-                    &mut attrs,
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
+                    self.directory.as_raw_fd(),
+                    &mut self.attrs,
+                    self.buffer.as_mut_ptr().cast(),
+                    self.buffer.len(),
                     FSOPT_ATTR_CMN_EXTENDED,
                 )
             };
@@ -810,14 +924,15 @@ mod macos {
                 return Err(io::Error::last_os_error());
             }
             if count == 0 {
-                break;
+                self.exhausted = true;
+                return Ok(());
             }
 
             let mut entry_offset = 0usize;
             for _ in 0..count {
-                let length = read_value::<u32>(&buffer, &mut entry_offset)? as usize;
+                let length = read_value::<u32>(&self.buffer, &mut entry_offset)? as usize;
                 if length < size_of::<u32>()
-                    || entry_offset - size_of::<u32>() + length > buffer.len()
+                    || entry_offset - size_of::<u32>() + length > self.buffer.len()
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -826,22 +941,12 @@ mod macos {
                 }
                 let start = entry_offset - size_of::<u32>();
                 let end = start + length;
-                if visited_entries < max_entries {
-                    visited_entries += 1;
-                    visitor(parse_entry(&buffer[start..end]));
-                } else {
-                    truncated = true;
-                }
+                self.pending
+                    .push_back(parse_entry(&self.buffer[start..end]));
                 entry_offset = end;
             }
-            if truncated {
-                break;
-            }
+            Ok(())
         }
-        Ok(DirectoryVisit {
-            visited_entries,
-            truncated,
-        })
     }
 
     fn parse_entry(buffer: &[u8]) -> io::Result<DirectoryEntryMeasurement> {
@@ -1047,6 +1152,65 @@ mod tests {
         assert!(report.roots[0].complete);
         assert_eq!(report.roots[1].visited_entries, 5);
         assert!(!report.roots[1].complete);
+    }
+
+    #[test]
+    fn inventory_shares_a_root_budget_across_queued_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let wide = temp.path().join("a-wide");
+        let small = temp.path().join("z-small");
+        fs::create_dir_all(&wide).unwrap();
+        fs::create_dir_all(&small).unwrap();
+        for index in 0..4 {
+            write_bytes(&wide.join(format!("file-{index}")), 1);
+        }
+        write_bytes(&small.join("only"), 1);
+
+        let report = inventory(
+            &[temp.path().to_path_buf()],
+            InventoryOptions {
+                max_entries: 5,
+                ..InventoryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let root = &report.roots[0];
+        assert!(!root.complete);
+        assert_eq!(root.visited_entries, 5);
+        let small = root
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == Path::new("z-small"))
+            .expect("later sibling is still sampled");
+        assert_eq!(small.metrics.files, 1);
+    }
+
+    #[test]
+    fn inventory_resumes_wide_siblings_until_the_root_is_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let wide = temp.path().join("a-wide");
+        let small = temp.path().join("z-small");
+        fs::create_dir_all(&wide).unwrap();
+        fs::create_dir_all(&small).unwrap();
+        for index in 0..4 {
+            write_bytes(&wide.join(format!("file-{index}")), 1);
+        }
+        write_bytes(&small.join("only"), 1);
+
+        let report = inventory(
+            &[temp.path().to_path_buf()],
+            InventoryOptions {
+                max_entries: 8,
+                ..InventoryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let root = &report.roots[0];
+        assert!(root.complete);
+        assert_eq!(root.visited_entries, 7);
+        assert_eq!(root.metrics.files, 5);
     }
 
     #[cfg(unix)]

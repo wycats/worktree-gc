@@ -19,7 +19,9 @@ into a shallow report tree. `display_depth` and `top` bound retained report
 state; `max_entries` bounds filesystem work. The scanner stays on one
 filesystem by default, does not follow symlinks, and deduplicates hard links.
 Multi-root scans divide the remaining global budget across the remaining roots;
-small roots return unused entries to the pool for later roots.
+small roots return unused entries to the pool for later roots. Queued sibling
+directories likewise share the remaining root budget, so a wide early subtree
+cannot consume all work before later siblings receive a sample.
 
 Each aggregate reports:
 
