@@ -307,13 +307,19 @@ Pressure mode lowers generated-directory and clean-worktree windows to the
 configured values. Dirty, detached, current, tracked, open, and explicitly
 protected content keeps the same safety rules. Rebuildable directories are
 ordered by expected rebuild cost (`.turbo`, `.next`, `target`, then
-`node_modules`) across all repositories, oldest first within each repository;
-clean worktrees come last.
+`node_modules`) across all repositories. Inside each rebuild-cost class, the
+controller prefers the largest conservative APFS-private reclaim, then the
+largest observed allocation, then the oldest activity. It refreshes and
+executes one exact candidate at a time; clean worktrees come last.
 The aggregate manifest records the policy, initial free-space observations,
 which decisions exist only because of pressure, and final free space after an
-executing run. This ordering does not recursively size every candidate: the
-controller checks live filesystem availability after each deletion and stops
-once the target is reached.
+executing run. Generated delete decisions also record logical, allocated, and
+APFS-private bytes, filesystem identity, evidence time, entries visited, and
+whether the measurement completed. One sequential two-million-entry budget is
+shared across the entire initial plan, with at most 250,000 entries spent on
+one candidate, so very large candidate sets remain bounded, fair, and visibly
+partial. The controller checks live filesystem
+availability after each deletion and stops once the target is reached.
 
 Each scheduled run writes the normal per-repository manifests and a structured
 aggregate manifest. Aggregate manifests are retained for the configured
