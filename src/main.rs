@@ -5,13 +5,14 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories, cleanup_roots, collect_pnpm,
-    discover_repositories, inventory, list_protections, print_cleanup, print_inventory,
-    print_pnpm_collect, print_root_cleanup, print_root_triage, print_triage, remove_protection,
-    renew_protection, triage, triage_roots, CleanupOptions, GeneratedDirConfig, InventoryOptions,
-    PnpmCollectOptions, PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions,
-    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS,
-    DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    add_protection, cleanup, cleanup_repositories, cleanup_roots, collect_docker, collect_pnpm,
+    discover_repositories, inventory, list_protections, print_cleanup, print_docker_collect,
+    print_inventory, print_pnpm_collect, print_root_cleanup, print_root_triage, print_triage,
+    remove_protection, renew_protection, triage, triage_roots, CleanupOptions,
+    DockerCollectOptions, GeneratedDirConfig, InventoryOptions, PnpmCollectOptions, PressurePolicy,
+    SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
+    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -177,6 +178,22 @@ enum CollectorCommand {
             help = "Maximum concurrent pnpm content-prefix scans"
         )]
         scan_threads: usize,
+    },
+
+    /// Plan or delegate cleanup of Docker/BuildKit storage
+    Docker {
+        #[arg(
+            long,
+            help = "Revalidate the manifest and run official BuildKit cache prune"
+        )]
+        execute: bool,
+
+        #[arg(
+            long,
+            default_value_t = 7,
+            help = "Retain BuildKit cache used within this many days"
+        )]
+        build_cache_days: u64,
     },
 }
 
@@ -504,6 +521,17 @@ fn main() -> Result<()> {
                         now,
                     })?;
                     print_pnpm_collect(&run);
+                }
+                CollectorCommand::Docker {
+                    execute,
+                    build_cache_days,
+                } => {
+                    let run = collect_docker(DockerCollectOptions {
+                        execute,
+                        build_cache_days,
+                        now,
+                    })?;
+                    print_docker_collect(&run);
                 }
             }
         }
@@ -969,6 +997,31 @@ mod tests {
                 assert_eq!(dlx_days, 14);
                 assert_eq!(max_entries, 99);
                 assert_eq!(scan_threads, 2);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn docker_collector_cli_is_dry_run_by_default_and_accepts_policy() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "docker",
+            "--build-cache-days",
+            "14",
+        ])
+        .expect("Docker collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Docker {
+                        execute,
+                        build_cache_days,
+                    },
+            } => {
+                assert!(!execute);
+                assert_eq!(build_cache_days, 14);
             }
             _ => unreachable!(),
         }

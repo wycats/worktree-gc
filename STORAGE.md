@@ -122,6 +122,12 @@ The implementation order is intentionally useful after every merge:
    domains. Use their public inventory/prune/compact interfaces and surface
    running or suspended state. VM deletion or archival remains an explicit
    user decision.
+   Docker delivery begins with TTL-qualified BuildKit cache records because
+   `docker buildx` exposes stable IDs, liveness, sharing, and an official prune
+   operation. Image candidates stay report-only until protections can name
+   immutable image IDs/digests. The collector verifies both Docker-internal
+   reclaim and host free space so sparse VM storage cannot hide whether bytes
+   actually returned to APFS.
 5. **Application-cache advisors and collectors.** Large IDE/browser/application
    stores begin report-only. A domain graduates to cleanup only after it has a
    stable ownership model and a recoverable-content boundary.

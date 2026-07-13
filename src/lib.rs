@@ -1,5 +1,6 @@
 mod cargo_incremental;
 mod cargo_profiles;
+mod docker;
 mod inventory;
 mod pnpm;
 mod protection;
@@ -26,6 +27,13 @@ use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
+pub use docker::{
+    collect_docker, print_docker_collect, DockerBuildCacheCandidate, DockerBuilderIdentity,
+    DockerBuilderNodeIdentity, DockerCollectManifest, DockerCollectOptions, DockerCollectRun,
+    DockerHostObservation, DockerIdentity, DockerImageCandidate, DockerImageReference,
+    DockerPolicy, DockerPruneAction, DockerPruneOutcome, DockerPrunePlan,
+    DockerSparseDiskObservation,
+};
 pub use inventory::{
     inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
     InventoryReport, InventoryReportOptions, InventoryRoot, InventoryScanError, INVENTORY_VERSION,
