@@ -256,6 +256,10 @@ roots = [
 [cleanup]
 # Total worker budget across repository, worktree, and generated scans.
 max_parallelism = 1
+# Whole worktrees and generated directories stay in the manifest for review by
+# default. Opt in to either unattended mutation class independently.
+execute_worktree_removals = false
+execute_generated_deletions = false
 stale_days = 14
 generated_days = 7
 # Per-directory entries override generated_days and any tighter built-in window.
@@ -289,6 +293,15 @@ passes the same limit to ripgrep. It defaults to `1` so an unattended run
 favors low background impact over elapsed time. This does not limit owning-tool
 subprocesses after they are started, so Cargo locks and the configured
 per-target timeout remain separate coordination boundaries.
+
+`execute_worktree_removals` and `execute_generated_deletions` are unattended
+execution capabilities, not discovery switches. Eligible worktrees and whole
+`.next`, `.turbo`, `target`, and `node_modules` directories remain visible and
+measured in dry-run and execute manifests when a capability is disabled, but
+the scheduled executor does not mutate them. Both capabilities default to
+`false`; interactive `cleanup --execute` remains the reviewed execution path.
+Built-in Cargo incremental and profile sweeps are unaffected because they use
+Cargo locks and artifact-specific recovery rather than whole-directory removal.
 
 The Cargo lock timeout applies to each generated `target` directory. A
 contended target is deferred to a later run, recorded under

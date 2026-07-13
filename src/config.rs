@@ -18,6 +18,8 @@ pub(crate) struct Config {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CleanupConfig {
     pub max_parallelism: usize,
+    pub execute_worktree_removals: bool,
+    pub execute_generated_deletions: bool,
     pub stale_days: u64,
     pub generated_days: u64,
     pub generated_windows: BTreeMap<String, u64>,
@@ -64,6 +66,8 @@ impl Default for CleanupConfig {
     fn default() -> Self {
         Self {
             max_parallelism: 1,
+            execute_worktree_removals: false,
+            execute_generated_deletions: false,
             stale_days: 14,
             generated_days: 7,
             generated_windows: BTreeMap::new(),
@@ -178,6 +182,8 @@ roots = ["/code", "/plugins"]
 
 [cleanup]
 max_parallelism = 3
+execute_worktree_removals = true
+execute_generated_deletions = true
 stale_days = 12
 generated_days = 9
 generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
@@ -197,6 +203,8 @@ retention_days = 120
 
         assert_eq!(config.roots.len(), 2);
         assert_eq!(config.cleanup.max_parallelism, 3);
+        assert!(config.cleanup.execute_worktree_removals);
+        assert!(config.cleanup.execute_generated_deletions);
         assert_eq!(config.cleanup.stale_days, 12);
         assert_eq!(config.cleanup.generated_days, 9);
         assert_eq!(config.cleanup.generated_windows[".next"], 7);
@@ -222,5 +230,12 @@ retention_days = 120
     #[test]
     fn scheduled_cleanup_defaults_to_one_worker() {
         assert_eq!(CleanupConfig::default().max_parallelism, 1);
+    }
+
+    #[test]
+    fn scheduled_cleanup_defaults_whole_removals_to_review_only() {
+        let cleanup = CleanupConfig::default();
+        assert!(!cleanup.execute_worktree_removals);
+        assert!(!cleanup.execute_generated_deletions);
     }
 }

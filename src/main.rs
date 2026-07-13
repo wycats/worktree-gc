@@ -479,6 +479,7 @@ fn main() -> Result<()> {
         } => {
             let options = CleanupOptions {
                 execute,
+                execution_permissions: worktree_gc::ExecutionPermissions::all(),
                 stale_days,
                 generated_days,
                 generated_activity_only,
@@ -519,6 +520,10 @@ fn main() -> Result<()> {
             );
             let options = CleanupOptions {
                 execute: !dry_run,
+                execution_permissions: worktree_gc::ExecutionPermissions {
+                    worktree_removals: scheduled.cleanup.execute_worktree_removals,
+                    generated_deletions: scheduled.cleanup.execute_generated_deletions,
+                },
                 stale_days: scheduled.cleanup.stale_days,
                 generated_days: scheduled.cleanup.generated_days,
                 generated_activity_only: scheduled.cleanup.generated_activity_only,

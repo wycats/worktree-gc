@@ -99,10 +99,10 @@ remains the stop condition.
 
 Generated-directory cleanup applies the inventory primitive only after safety
 classification. Delete candidates share one sequential global entry budget
-and a smaller per-candidate slice; their complete or partial measurements are
-persisted in manifest version 5. When the evidence budget cannot cover every
-candidate, pressure candidates and lower rebuild-cost classes are measured
-first.
+and a smaller per-candidate slice; their complete or partial measurements and
+unattended execution permissions are persisted in manifest version 6. When the
+evidence budget cannot cover every candidate, pressure candidates and lower
+rebuild-cost classes are measured first.
 Pressure execution preserves rebuild-cost classes, orders exact candidates
 machine-wide by private reclaim and observed allocation, refreshes safety, and
 executes one candidate before checking free space again. Routine TTL order
@@ -120,7 +120,9 @@ The implementation order is intentionally useful after every merge:
    benefit inside their rebuild-cost class.
 3. **Bounded scheduling and first activation.** Make repository concurrency an
    explicit scheduled-mode setting, retain hard inventory/measurement budgets,
-   and validate a complete dry-run manifest before enabling execution. Roots
+   keep whole-worktree and whole-generated-directory mutation review-only by
+   default, and validate a complete dry-run manifest before enabling either
+   unattended capability. Roots
    such as Codex-managed Git worktrees can then reuse the existing generated
    collectors; task metadata is advisory, while protections, Git state, open
    handles, Cargo locks, and execution-time revalidation remain authoritative.

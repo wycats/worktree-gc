@@ -43,7 +43,7 @@ pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", "
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
 pub const DEFAULT_CARGO_PROFILE_SWEEP_DAYS: u64 = 7;
-pub const MANIFEST_VERSION: u64 = 5;
+pub const MANIFEST_VERSION: u64 = 6;
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -79,6 +79,7 @@ pub struct TriageOptions {
 #[derive(Debug, Clone)]
 pub struct CleanupOptions {
     pub execute: bool,
+    pub execution_permissions: ExecutionPermissions,
     pub stale_days: u64,
     pub generated_days: u64,
     pub generated_activity_only: bool,
@@ -88,6 +89,21 @@ pub struct CleanupOptions {
     pub defer_lock_timeouts: bool,
     pub pressure: Option<PressurePolicy>,
     pub now: SystemTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ExecutionPermissions {
+    pub worktree_removals: bool,
+    pub generated_deletions: bool,
+}
+
+impl ExecutionPermissions {
+    pub const fn all() -> Self {
+        Self {
+            worktree_removals: true,
+            generated_deletions: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,6 +182,7 @@ pub struct RootCleanupManifest {
 pub struct CleanupManifest {
     pub manifest_version: u64,
     pub mode: CleanupMode,
+    pub execution_permissions: ExecutionPermissions,
     pub generated_at: String,
     pub repo_root: PathBuf,
     pub current_worktree: PathBuf,
@@ -672,22 +689,36 @@ fn plan_cleanup_with_protections(
     )?;
     let generated_decisions = generated_dirs
         .iter()
-        .map(|dir| GeneratedDirDecision {
-            path: dir.path.clone(),
-            worktree_path: dir.worktree_path.clone(),
-            name: dir.name.clone(),
-            mtime: dir.mtime.clone(),
-            mtime_unix: dir.mtime_unix,
-            effective_days: dir.effective_days,
-            in_use: dir.in_use,
-            protection: dir.protection.clone(),
-            cleanup_class: dir.cleanup_class,
-            measurement: None,
-            sweeps: dir.sweeps.clone(),
-            action: dir.action.clone(),
-            reason: dir.reason.clone(),
+        .map(|dir| -> Result<GeneratedDirDecision> {
+            let sweeps = if dir.action == GeneratedDirAction::Delete
+                && !options.execution_permissions.generated_deletions
+            {
+                plan_sweep_decisions(
+                    &dir.path,
+                    &dir.worktree_path,
+                    options.generated_config.sweep_strategies(&dir.name),
+                    options.now,
+                )?
+            } else {
+                dir.sweeps.clone()
+            };
+            Ok(GeneratedDirDecision {
+                path: dir.path.clone(),
+                worktree_path: dir.worktree_path.clone(),
+                name: dir.name.clone(),
+                mtime: dir.mtime.clone(),
+                mtime_unix: dir.mtime_unix,
+                effective_days: dir.effective_days,
+                in_use: dir.in_use,
+                protection: dir.protection.clone(),
+                cleanup_class: dir.cleanup_class,
+                measurement: None,
+                sweeps,
+                action: dir.action.clone(),
+                reason: dir.reason.clone(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
     let manifest = CleanupManifest {
         manifest_version: MANIFEST_VERSION,
@@ -696,6 +727,7 @@ fn plan_cleanup_with_protections(
         } else {
             CleanupMode::DryRun
         },
+        execution_permissions: options.execution_permissions,
         generated_at: format_system_time(options.now),
         repo_root: context.current_worktree.clone(),
         current_worktree: context.current_worktree.clone(),
@@ -1564,10 +1596,26 @@ pub fn print_cleanup(run: &CleanupRun) {
         CleanupMode::DryRun => println!("mode: dry-run"),
         CleanupMode::Execute => println!("mode: execute"),
     }
+    println!(
+        "execution permissions: worktree removals={}, generated deletions={}",
+        if run.manifest.execution_permissions.worktree_removals {
+            "enabled"
+        } else {
+            "review-only"
+        },
+        if run.manifest.execution_permissions.generated_deletions {
+            "enabled"
+        } else {
+            "review-only"
+        }
+    );
     println!("manifest: {}", run.manifest_path.display());
     println!("prunable metadata records: {}", prune);
-    println!("stale clean worktrees to remove: {}", remove);
-    println!("generated dirs to delete: {}", generated_delete);
+    println!("stale clean worktree removal candidates: {}", remove);
+    println!(
+        "generated directory deletion candidates: {}",
+        generated_delete
+    );
     println!("generated dirs to sweep in place: {}", generated_sweep);
     print_protections(&run.manifest.protections);
 
@@ -1585,7 +1633,7 @@ pub fn print_cleanup(run: &CleanupRun) {
         .collect::<Vec<_>>();
     if !removals.is_empty() {
         println!();
-        println!("worktree removals:");
+        println!("worktree removal candidates:");
         for decision in removals {
             println!(
                 "- {} ({})",
@@ -2753,7 +2801,8 @@ fn execute_cleanup(
         .worktrees
         .iter()
         .filter(|decision| {
-            decision.action == WorktreeAction::Remove
+            manifest.execution_permissions.worktree_removals
+                && decision.action == WorktreeAction::Remove
                 && execution_matches(decision.cleanup_class, pass)
                 && matches!(
                     pass,
@@ -2771,7 +2820,8 @@ fn execute_cleanup(
         .generated_dirs
         .iter()
         .filter(|decision| {
-            decision.action == GeneratedDirAction::Delete
+            manifest.execution_permissions.generated_deletions
+                && decision.action == GeneratedDirAction::Delete
                 && execution_matches(decision.cleanup_class, pass)
                 && only_generated_path.is_none_or(|path| decision.path == path)
                 && match pass {
@@ -2792,7 +2842,8 @@ fn execute_cleanup(
                 decision.sweeps.iter().any(SweepDecision::has_work)
                     && (decision.action == GeneratedDirAction::Sweep
                         || (decision.action == GeneratedDirAction::Delete
-                            && decision.cleanup_class == CleanupClass::Pressure))
+                            && (!manifest.execution_permissions.generated_deletions
+                                || decision.cleanup_class == CleanupClass::Pressure)))
             })
             .collect::<Vec<_>>()
     } else {
@@ -4022,6 +4073,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 10_000,
                 generated_days: 7,
                 generated_activity_only: false,
@@ -4075,6 +4127,8 @@ mod tests {
 
         let json = serde_json::to_value(&run.manifest)?;
         assert_eq!(json["manifest_version"], MANIFEST_VERSION);
+        assert_eq!(json["execution_permissions"]["worktree_removals"], true);
+        assert_eq!(json["execution_permissions"]["generated_deletions"], true);
         assert!(json["generated_dirs"][0].get("sweeps").is_some());
         assert!(json["generated_dirs"][0].get("sweep_tool").is_none());
         assert!(json["generated_dirs"][0].get("sweep_days").is_none());
@@ -4083,6 +4137,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 10_000,
                 generated_days: 7,
                 generated_activity_only: false,
@@ -4812,6 +4867,7 @@ mod tests {
 
         let options = CleanupOptions {
             execute: false,
+            execution_permissions: ExecutionPermissions::all(),
             stale_days: 30,
             generated_days: 7,
             generated_activity_only: false,
@@ -4949,6 +5005,7 @@ mod tests {
             manifest: CleanupManifest {
                 manifest_version: MANIFEST_VERSION,
                 mode: CleanupMode::DryRun,
+                execution_permissions: ExecutionPermissions::all(),
                 generated_at: "fixture".to_string(),
                 repo_root: PathBuf::from(repo),
                 current_worktree: PathBuf::from(repo),
@@ -5056,6 +5113,7 @@ mod tests {
         let manifest = CleanupManifest {
             manifest_version: MANIFEST_VERSION,
             mode: CleanupMode::Execute,
+            execution_permissions: ExecutionPermissions::all(),
             generated_at: "fixture".to_string(),
             repo_root: temp.path().to_path_buf(),
             current_worktree: temp.path().to_path_buf(),
@@ -5100,6 +5158,7 @@ mod tests {
             &[],
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 14,
                 generated_days: 7,
                 generated_activity_only: true,
@@ -5216,6 +5275,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 14,
                 generated_days: 7,
                 generated_activity_only: true,
@@ -5289,6 +5349,7 @@ mod tests {
 
         let options = CleanupOptions {
             execute: true,
+            execution_permissions: ExecutionPermissions::all(),
             stale_days: 30,
             generated_days: 7,
             generated_activity_only: false,
@@ -5304,6 +5365,60 @@ mod tests {
         assert!(!worktree.exists());
         let refs = git_output(&repo, ["show-ref", "--heads", "remove-me-branch"])?;
         assert!(refs.contains("refs/heads/remove-me-branch"));
+        Ok(())
+    }
+
+    #[test]
+    fn execution_permissions_keep_whole_candidates_for_review() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("review-only-removal");
+        add_worktree(&repo, &worktree, "review-only-removal-branch")?;
+        let worktree = fs::canonicalize(worktree)?;
+        fs::create_dir_all(worktree.join("node_modules/pkg"))?;
+        fs::write(worktree.join("node_modules/pkg/index.js"), "fixture\n")?;
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: true,
+                execution_permissions: ExecutionPermissions {
+                    worktree_removals: false,
+                    generated_deletions: false,
+                },
+                stale_days: 0,
+                generated_days: 0,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+
+        assert!(worktree.exists());
+        assert!(worktree.join("node_modules").exists());
+        assert!(
+            run.manifest
+                .worktrees
+                .iter()
+                .any(|decision| decision.path == worktree
+                    && decision.action == WorktreeAction::Remove),
+            "{:#?}",
+            run.manifest.worktrees
+        );
+        assert!(run.manifest.generated_dirs.iter().any(|decision| {
+            decision.path == worktree.join("node_modules")
+                && decision.action == GeneratedDirAction::Delete
+        }));
+        assert_eq!(
+            run.manifest.execution_permissions,
+            ExecutionPermissions {
+                worktree_removals: false,
+                generated_deletions: false,
+            }
+        );
         Ok(())
     }
 
@@ -5326,6 +5441,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: true,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 0,
                 generated_days: 0,
                 generated_activity_only: true,
@@ -5363,6 +5479,7 @@ mod tests {
 
         let options = CleanupOptions {
             execute: true,
+            execution_permissions: ExecutionPermissions::all(),
             stale_days: 10_000,
             generated_days: 7,
             generated_activity_only: false,
@@ -5396,6 +5513,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 30,
                 generated_days: 7,
                 generated_activity_only: true,
@@ -5453,6 +5571,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 30,
                 generated_days: 7,
                 generated_activity_only: true,
@@ -5507,6 +5626,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 30,
                 generated_days: 7,
                 generated_activity_only: true,
@@ -5584,6 +5704,7 @@ mod tests {
 
         let options = CleanupOptions {
             execute: true,
+            execution_permissions: ExecutionPermissions::all(),
             stale_days: 10_000,
             generated_days: 3,
             generated_activity_only: true,
@@ -5616,6 +5737,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 14,
                 generated_days: 7,
                 generated_activity_only: true,
@@ -5654,6 +5776,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 14,
                 generated_days: 7,
                 generated_activity_only: true,
@@ -5680,6 +5803,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: true,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 14,
                 generated_days: 7,
                 generated_activity_only: true,
@@ -5730,6 +5854,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: false,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 14,
                 generated_days: 7,
                 generated_activity_only: true,
@@ -5763,6 +5888,73 @@ mod tests {
                     .iter()
                     .any(|candidate| candidate.action == SweepCandidateAction::Delete)
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn review_only_target_deletion_falls_back_to_cargo_sweeps() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"review-only-sweep-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let target = repo.join("target");
+        let profile = target.join("debug");
+        let root = profile.join("incremental/fixture-old");
+        let session = root.join("s-session-hash");
+        fs::create_dir_all(&session)?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        let dep_graph = session.join("dep-graph.bin");
+        fs::write(&dep_graph, "old")?;
+        let stale = 1;
+        for path in [
+            &dep_graph,
+            &session,
+            &root,
+            &profile.join("incremental"),
+            &profile.join(".cargo-lock"),
+            &profile,
+            &target,
+        ] {
+            set_mtime(path, stale)?;
+        }
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: true,
+                execution_permissions: ExecutionPermissions {
+                    worktree_removals: false,
+                    generated_deletions: false,
+                },
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+
+        let target_decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "target")
+            .context("missing target candidate")?;
+        assert_eq!(target_decision.action, GeneratedDirAction::Delete);
+        assert_eq!(target_decision.cleanup_class, CleanupClass::Routine);
+        assert!(
+            target_decision.sweeps.iter().any(SweepDecision::has_work),
+            "{target_decision:#?}"
+        );
+        assert!(target.exists());
+        assert!(!root.exists());
         Ok(())
     }
 
