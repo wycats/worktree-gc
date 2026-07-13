@@ -342,11 +342,10 @@ fn read_active_protections(registry_path: &Path, now: SystemTime) -> Result<Vec<
         let canonical = match fs::canonicalize(&lease.path) {
             Ok(canonical) => canonical,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // Keep a lease whose path was removed. There is nothing at the
-                // path to mutate now, and retaining the stored canonical path
-                // protects it again if it is recreated before the lease
-                // expires. Mutation guards reload and revalidate the registry
-                // under lock once a candidate exists.
+                // A component disappeared after the prefix walk. Treat this
+                // TOCTOU window like an ordinary dormant path: there is no
+                // resolved candidate to mutate now, and the stored canonical
+                // path is protected again if it reappears before expiry.
                 continue;
             }
             Err(error) => {
