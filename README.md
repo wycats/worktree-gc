@@ -138,12 +138,21 @@ cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-sweep:max-size=50
 
 When multiple strategies are configured, the built-in incremental sweep runs
 first, followed by Cargo profile reset and then the legacy backend.
-`cargo-sweep` intentionally leaves rustc's `incremental/` cache
-directories alone and requires `cargo-sweep` on `PATH`
-(`cargo install cargo-sweep`). Before invoking it, `worktree-gc` verifies the
-Cargo build directory and waits until it holds every existing host and
-cross-target profile lock. If the external command cannot run, an error is
-reported for the directory and cleanup continues.
+`cargo-sweep` intentionally leaves rustc's `incremental/` cache directories
+alone. `worktree-gc` currently supports the reviewed dry-run semantics of
+`cargo-sweep` 0.8.0 on `PATH` (`cargo install cargo-sweep --version 0.8.0`).
+Planning asks that owner for an exact dry-run estimate and records its command,
+version, target, and logical reclaim in the manifest. When APFS measurement is
+complete, the report also caps that estimate by the target's private physical
+allocation. Under pressure, an age policy uses the shorter of its configured
+window and `pressure.generated_days`; a max-size policy is unchanged.
+
+Execution requires a complete, nonzero, version-supported preview. It verifies
+the Cargo build directory, waits until it holds every existing host and
+cross-target profile lock, then reruns the dry-run through the same canonical
+executable. Cleanup proceeds only when the refreshed preview exactly matches
+the reviewed plan. If discovery, preview, target validation, or revalidation
+fails, the external backend does not delete anything and records the reason.
 
 Use `--no-default-sweeps` to retain the generated-directory defaults without
 the built-in incremental sweep. `--no-default-generated` starts from an empty

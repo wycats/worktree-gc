@@ -43,7 +43,8 @@ pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", "
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
 pub const DEFAULT_CARGO_PROFILE_SWEEP_DAYS: u64 = 7;
-pub const MANIFEST_VERSION: u64 = 6;
+pub const MANIFEST_VERSION: u64 = 7;
+const SUPPORTED_CARGO_SWEEP_VERSION: &str = "cargo-sweep-sweep 0.8.0";
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -367,8 +368,22 @@ pub struct SweepDecision {
     pub delegated: bool,
     pub project_dir: Option<PathBuf>,
     pub reason: String,
+    pub delegated_preview: Option<DelegatedSweepPreview>,
     pub candidates: Vec<SweepCandidateDecision>,
     pub profile_candidates: Vec<CargoProfileCandidateDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DelegatedSweepPreview {
+    pub executable: Option<PathBuf>,
+    pub version: Option<String>,
+    pub supported: bool,
+    pub command: Vec<String>,
+    pub complete: bool,
+    pub owner_reported_reclaim_bytes: u64,
+    pub reported_target: Option<PathBuf>,
+    pub target_matches: bool,
+    pub error: Option<String>,
 }
 
 impl SweepDecision {
@@ -377,7 +392,11 @@ impl SweepDecision {
     }
 
     fn has_routine_work(&self) -> bool {
-        self.delegated
+        self.delegated_preview
+            .as_ref()
+            .map_or(self.delegated, |preview| {
+                preview.supported && preview.complete && preview.owner_reported_reclaim_bytes > 0
+            })
             || self.candidates.iter().any(|candidate| {
                 matches!(
                     candidate.action,
@@ -708,7 +727,7 @@ fn plan_cleanup_with_protections(
         protections,
         options.pressure.as_ref(),
     )?;
-    let generated_decisions = generated_dirs
+    let mut generated_decisions = generated_dirs
         .iter()
         .map(|dir| -> Result<GeneratedDirDecision> {
             let sweeps = if dir.action == GeneratedDirAction::Delete
@@ -747,6 +766,7 @@ fn plan_cleanup_with_protections(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    populate_delegated_sweep_previews(&mut generated_decisions);
 
     let manifest = CleanupManifest {
         manifest_version: MANIFEST_VERSION,
@@ -799,7 +819,12 @@ fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()>
             .collect::<Vec<_>>();
 
         for (decision_index, decision) in run.manifest.generated_dirs.iter().enumerate() {
-            if decision.action != GeneratedDirAction::Delete
+            let delegated_preview_work = decision.sweeps.iter().any(|sweep| {
+                sweep.delegated_preview.as_ref().is_some_and(|preview| {
+                    preview.complete && preview.owner_reported_reclaim_bytes > 0
+                })
+            });
+            if (decision.action != GeneratedDirAction::Delete && !delegated_preview_work)
                 || routine_worktree_removals
                     .iter()
                     .any(|worktree| decision.path.starts_with(worktree))
@@ -1923,41 +1948,85 @@ fn print_generated_measurements(generated_dirs: &[GeneratedDirDecision]) {
                 .map(|measurement| (decision, measurement))
         })
         .collect::<Vec<_>>();
-    if measured.is_empty() {
-        return;
+    if !measured.is_empty() {
+        let private = measured
+            .iter()
+            .map(|(_, measurement)| measurement.metrics.private_reclaimable_bytes)
+            .sum::<u64>();
+        let allocated = measured
+            .iter()
+            .map(|(_, measurement)| measurement.metrics.allocated_bytes)
+            .sum::<u64>();
+        println!();
+        println!(
+            "generated delete measurements: {} candidates, {} private, {} allocated observed",
+            measured.len(),
+            format_bytes(private),
+            format_bytes(allocated)
+        );
+        for (decision, measurement) in measured.iter().take(25) {
+            let completeness = if measurement.complete {
+                "complete"
+            } else {
+                "partial"
+            };
+            println!(
+                "- {} ({} private, {} allocated, {completeness}, {} entries)",
+                decision.path.display(),
+                format_bytes(measurement.metrics.private_reclaimable_bytes),
+                format_bytes(measurement.metrics.allocated_bytes),
+                measurement.visited_entries
+            );
+        }
+        if measured.len() > 25 {
+            println!("- ... and {} more (see manifest)", measured.len() - 25);
+        }
     }
 
-    let private = measured
+    let delegated = generated_dirs
         .iter()
-        .map(|(_, measurement)| measurement.metrics.private_reclaimable_bytes)
-        .sum::<u64>();
-    let allocated = measured
-        .iter()
-        .map(|(_, measurement)| measurement.metrics.allocated_bytes)
-        .sum::<u64>();
+        .flat_map(|decision| {
+            decision.sweeps.iter().filter_map(move |sweep| {
+                sweep
+                    .delegated_preview
+                    .as_ref()
+                    .filter(|preview| preview.complete && preview.owner_reported_reclaim_bytes > 0)
+                    .map(|preview| (decision, preview))
+            })
+        })
+        .collect::<Vec<_>>();
+    if delegated.is_empty() {
+        return;
+    }
     println!();
-    println!(
-        "generated delete measurements: {} candidates, {} private, {} allocated observed",
-        measured.len(),
-        format_bytes(private),
-        format_bytes(allocated)
-    );
-    for (decision, measurement) in measured.iter().take(25) {
-        let completeness = if measurement.complete {
-            "complete"
-        } else {
-            "partial"
-        };
+    println!("delegated Cargo artifact previews: {}", delegated.len());
+    for (decision, preview) in delegated.iter().take(25) {
+        let physical = decision.measurement.as_ref().map(|measurement| {
+            if measurement.complete && measurement.metrics.private_reclaimable_complete {
+                format!(
+                    "; physical reclaim ceiling {}",
+                    format_bytes(
+                        preview
+                            .owner_reported_reclaim_bytes
+                            .min(measurement.metrics.private_reclaimable_bytes)
+                    )
+                )
+            } else {
+                format!(
+                    "; {} private observed in partial target scan",
+                    format_bytes(measurement.metrics.private_reclaimable_bytes)
+                )
+            }
+        });
         println!(
-            "- {} ({} private, {} allocated, {completeness}, {} entries)",
+            "- {} (owner reports {}{})",
             decision.path.display(),
-            format_bytes(measurement.metrics.private_reclaimable_bytes),
-            format_bytes(measurement.metrics.allocated_bytes),
-            measurement.visited_entries
+            format_bytes(preview.owner_reported_reclaim_bytes),
+            physical.as_deref().unwrap_or("")
         );
     }
-    if measured.len() > 25 {
-        println!("- ... and {} more (see manifest)", measured.len() - 25);
+    if delegated.len() > 25 {
+        println!("- ... and {} more (see manifest)", delegated.len() - 25);
     }
 }
 
@@ -2562,6 +2631,7 @@ fn plan_sweep_decisions(
                     delegated: false,
                     project_dir: cargo_project_dir(target_dir, worktree),
                     reason: plan.reason,
+                    delegated_preview: None,
                     candidates: plan.candidates,
                     profile_candidates: Vec::new(),
                 })
@@ -2579,29 +2649,310 @@ fn plan_sweep_decisions(
                     delegated: false,
                     project_dir: cargo_project_dir(target_dir, worktree),
                     reason: plan.reason,
+                    delegated_preview: None,
                     candidates: Vec::new(),
                     profile_candidates: plan.candidates,
                 })
             }
-            SweepTool::CargoSweep => Ok(SweepDecision {
-                tool: SweepTool::CargoSweep,
-                limit: strategy.limit.clone(),
-                delegated: true,
-                project_dir: cargo_project_dir(target_dir, worktree),
-                reason: match strategy.limit {
-                    SweepLimit::AgeDays { days } => {
-                        format!("delegate fingerprint-associated outputs older than {days} days")
-                    }
-                    SweepLimit::MaxSize { bytes } => format!(
-                        "delegate oldest fingerprint-associated outputs above {}",
-                        format_bytes(bytes)
-                    ),
-                },
-                candidates: Vec::new(),
-                profile_candidates: Vec::new(),
-            }),
+            SweepTool::CargoSweep => {
+                let limit = effective_cargo_sweep_limit(&strategy.limit, pressure_days);
+                Ok(SweepDecision {
+                    tool: SweepTool::CargoSweep,
+                    limit: limit.clone(),
+                    delegated: true,
+                    project_dir: cargo_project_dir(target_dir, worktree),
+                    reason: match limit {
+                        SweepLimit::AgeDays { days } => {
+                            format!(
+                                "delegate fingerprint-associated outputs older than {days} days"
+                            )
+                        }
+                        SweepLimit::MaxSize { bytes } => format!(
+                            "delegate oldest fingerprint-associated outputs above {}",
+                            format_bytes(bytes)
+                        ),
+                    },
+                    delegated_preview: None,
+                    candidates: Vec::new(),
+                    profile_candidates: Vec::new(),
+                })
+            }
         })
         .collect()
+}
+
+fn effective_cargo_sweep_limit(limit: &SweepLimit, pressure_days: Option<u64>) -> SweepLimit {
+    match limit {
+        SweepLimit::AgeDays { days } => SweepLimit::AgeDays {
+            days: pressure_days.map_or(*days, |pressure| (*days).min(pressure)),
+        },
+        SweepLimit::MaxSize { bytes } => SweepLimit::MaxSize { bytes: *bytes },
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CargoSweepIdentity {
+    executable: PathBuf,
+    version: String,
+}
+
+fn populate_delegated_sweep_previews(decisions: &mut [GeneratedDirDecision]) {
+    let identity = discover_cargo_sweep();
+    for decision in decisions {
+        for sweep in &mut decision.sweeps {
+            if sweep.tool != SweepTool::CargoSweep || sweep.delegated_preview.is_some() {
+                continue;
+            }
+            let preview = match &identity {
+                Ok(identity) => cargo_sweep_preview(
+                    identity,
+                    &decision.path,
+                    &decision.worktree_path,
+                    sweep
+                        .project_dir
+                        .as_deref()
+                        .unwrap_or(&decision.worktree_path),
+                    &sweep.limit,
+                ),
+                Err(error) => DelegatedSweepPreview {
+                    executable: None,
+                    version: None,
+                    supported: false,
+                    command: Vec::new(),
+                    complete: false,
+                    owner_reported_reclaim_bytes: 0,
+                    reported_target: None,
+                    target_matches: false,
+                    error: Some(format!("{error:#}")),
+                },
+            };
+            sweep.reason = cargo_sweep_preview_reason(&preview, &sweep.limit);
+            sweep.delegated_preview = Some(preview);
+        }
+        refresh_generated_sweep_action(decision);
+    }
+}
+
+fn refresh_generated_sweep_action(decision: &mut GeneratedDirDecision) {
+    if decision.action != GeneratedDirAction::Sweep
+        || decision.sweeps.iter().any(SweepDecision::has_work)
+    {
+        return;
+    }
+    decision.action = GeneratedDirAction::Skip;
+    decision.reason = decision
+        .sweeps
+        .iter()
+        .map(|sweep| sweep.reason.as_str())
+        .filter(|reason| !reason.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if decision.reason.is_empty() {
+        decision.reason = "in-place sweeps found no eligible artifacts".to_string();
+    }
+}
+
+fn discover_cargo_sweep() -> Result<CargoSweepIdentity> {
+    let executable = find_path_executable(OsStr::new("cargo-sweep"))
+        .context("cargo-sweep was not found on PATH")?;
+    let executable = executable
+        .canonicalize()
+        .with_context(|| format!("resolve cargo-sweep executable {}", executable.display()))?;
+    let output = Command::new(&executable)
+        .args(["sweep", "--version"])
+        .stdin(Stdio::null())
+        .output()
+        .context("read cargo-sweep version")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cargo-sweep --version failed with {:?}",
+        output.status.code()
+    );
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok(CargoSweepIdentity {
+        executable,
+        version,
+    })
+}
+
+fn find_path_executable(name: &OsStr) -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn cargo_sweep_preview(
+    identity: &CargoSweepIdentity,
+    target_dir: &Path,
+    worktree: &Path,
+    project_dir: &Path,
+    limit: &SweepLimit,
+) -> DelegatedSweepPreview {
+    let supported = identity.version == SUPPORTED_CARGO_SWEEP_VERSION;
+    let mut command = vec![
+        identity.executable.display().to_string(),
+        "sweep".to_string(),
+        "--dry-run".to_string(),
+    ];
+    match limit {
+        SweepLimit::AgeDays { days } => {
+            command.push("--time".to_string());
+            command.push(days.to_string());
+        }
+        SweepLimit::MaxSize { bytes } => {
+            command.push("--maxsize".to_string());
+            command.push(format!("{bytes}B"));
+        }
+    }
+    command.push(project_dir.display().to_string());
+    if !supported {
+        return DelegatedSweepPreview {
+            executable: Some(identity.executable.clone()),
+            version: Some(identity.version.clone()),
+            supported,
+            command,
+            complete: false,
+            owner_reported_reclaim_bytes: 0,
+            reported_target: None,
+            target_matches: false,
+            error: Some(format!(
+                "preview semantics are reviewed only for {SUPPORTED_CARGO_SWEEP_VERSION}"
+            )),
+        };
+    }
+
+    let output = Command::new(&identity.executable)
+        .args(command.iter().skip(1))
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return DelegatedSweepPreview {
+                executable: Some(identity.executable.clone()),
+                version: Some(identity.version.clone()),
+                supported,
+                command,
+                complete: false,
+                owner_reported_reclaim_bytes: 0,
+                reported_target: None,
+                target_matches: false,
+                error: Some(format!("launch cargo-sweep dry-run: {error}")),
+            };
+        }
+    };
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .last()
+            .unwrap_or("cargo-sweep dry-run failed")
+            .chars()
+            .take(500)
+            .collect::<String>();
+        return DelegatedSweepPreview {
+            executable: Some(identity.executable.clone()),
+            version: Some(identity.version.clone()),
+            supported,
+            command,
+            complete: false,
+            owner_reported_reclaim_bytes: 0,
+            reported_target: None,
+            target_matches: false,
+            error: Some(format!(
+                "cargo-sweep dry-run exited {:?}: {detail}",
+                output.status.code()
+            )),
+        };
+    }
+
+    let parsed = parse_cargo_sweep_preview(&output.stdout, &output.stderr);
+    let (owner_reported_reclaim_bytes, reported_target) = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return DelegatedSweepPreview {
+                executable: Some(identity.executable.clone()),
+                version: Some(identity.version.clone()),
+                supported,
+                command,
+                complete: false,
+                owner_reported_reclaim_bytes: 0,
+                reported_target: None,
+                target_matches: false,
+                error: Some(format!("parse cargo-sweep dry-run: {error:#}")),
+            };
+        }
+    };
+    let target_matches = if owner_reported_reclaim_bytes == 0 && reported_target.is_none() {
+        true
+    } else {
+        reported_target.as_ref().is_some_and(|reported| {
+            fs::canonicalize(reported).ok() == fs::canonicalize(target_dir).ok()
+        })
+    };
+    DelegatedSweepPreview {
+        executable: Some(identity.executable.clone()),
+        version: Some(identity.version.clone()),
+        supported,
+        command,
+        complete: target_matches,
+        owner_reported_reclaim_bytes,
+        reported_target,
+        target_matches,
+        error: (!target_matches).then(|| {
+            format!(
+                "cargo-sweep reported a target other than {}",
+                target_dir.display()
+            )
+        }),
+    }
+}
+
+fn parse_cargo_sweep_preview(stdout: &[u8], stderr: &[u8]) -> Result<(u64, Option<PathBuf>)> {
+    let line = stderr
+        .split(|byte| *byte == b'\n')
+        .chain(stdout.split(|byte| *byte == b'\n'))
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .find(|line| line.contains("Would clean:"));
+    let Some(line) = line else {
+        return Ok((0, None));
+    };
+    let (_, rest) = line
+        .split_once("Would clean:")
+        .context("missing cargo-sweep reclaim marker")?;
+    let (size, target) = rest
+        .trim()
+        .rsplit_once(" from ")
+        .context("missing cargo-sweep target marker")?;
+    let bytes = parse_size::parse_size(size.trim())
+        .with_context(|| format!("parse cargo-sweep reclaim size {size:?}"))?;
+    let target = target.trim().trim_matches('"');
+    anyhow::ensure!(!target.is_empty(), "cargo-sweep reported an empty target");
+    Ok((bytes, Some(PathBuf::from(target))))
+}
+
+fn cargo_sweep_preview_reason(preview: &DelegatedSweepPreview, limit: &SweepLimit) -> String {
+    if !preview.complete {
+        return format!(
+            "cargo-sweep preview unavailable: {}",
+            preview.error.as_deref().unwrap_or("incomplete evidence")
+        );
+    }
+    if preview.owner_reported_reclaim_bytes == 0 {
+        return "cargo-sweep dry-run found no eligible fingerprint-associated outputs".into();
+    }
+    let policy = match limit {
+        SweepLimit::AgeDays { days } => format!("older than {days} days"),
+        SweepLimit::MaxSize { bytes } => {
+            format!("above a {} target", format_bytes(*bytes))
+        }
+    };
+    format!(
+        "cargo-sweep dry-run reports {} of fingerprint-associated outputs {policy}",
+        format_bytes(preview.owner_reported_reclaim_bytes)
+    )
 }
 
 // Newest mtime among the directory itself and its descendants up to
@@ -3599,6 +3950,23 @@ fn run_sweeps(
                 if cleanup_class != CleanupClass::Routine {
                     continue;
                 }
+                let Some(planned_preview) = sweep.delegated_preview.as_ref() else {
+                    eprintln!("  sweep skipped: cargo-sweep has no reviewed dry-run preview");
+                    continue;
+                };
+                if !planned_preview.complete || !planned_preview.supported {
+                    eprintln!(
+                        "  sweep skipped: {}",
+                        planned_preview
+                            .error
+                            .as_deref()
+                            .unwrap_or("cargo-sweep preview is incomplete")
+                    );
+                    continue;
+                }
+                if planned_preview.owner_reported_reclaim_bytes == 0 {
+                    continue;
+                }
                 // Pass the project directory containing the matched target dir
                 // explicitly: the scan can match nested `target/` dirs
                 // (workspace members, vendored crates), and without a path
@@ -3612,8 +3980,20 @@ fn run_sweeps(
                     &decision.path,
                     &decision.worktree_path,
                     cargo_lock_timeout,
-                    || {
-                        let mut command = Command::new("cargo");
+                    || -> Result<std::process::Output> {
+                        let identity = discover_cargo_sweep()?;
+                        let refreshed = cargo_sweep_preview(
+                            &identity,
+                            &decision.path,
+                            &decision.worktree_path,
+                            project_dir,
+                            &sweep.limit,
+                        );
+                        anyhow::ensure!(
+                            &refreshed == planned_preview,
+                            "cargo-sweep eligibility changed after planning; rerun without --execute to review the new owner preview"
+                        );
+                        let mut command = Command::new(&identity.executable);
                         command.arg("sweep");
                         match sweep.limit {
                             SweepLimit::AgeDays { days } => {
@@ -3628,6 +4008,7 @@ fn run_sweeps(
                             .current_dir(&decision.worktree_path)
                             .stdin(Stdio::null())
                             .output()
+                            .context("run reviewed cargo-sweep cleanup")
                     },
                 );
                 match result {
@@ -4267,6 +4648,116 @@ mod tests {
         assert!(
             format!("{error:#}").contains("cleanup.max_parallelism must be at least 1"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn cargo_sweep_preview_parses_owner_report() -> Result<()> {
+        let stderr = b"[INFO] Would clean: 8.24 GiB from \"/tmp/project/target\"\n";
+        let (bytes, target) = parse_cargo_sweep_preview(b"", stderr)?;
+
+        assert_eq!(bytes, parse_size::parse_size("8.24 GiB")?);
+        assert_eq!(target.as_deref(), Some(Path::new("/tmp/project/target")));
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_sweep_preview_accepts_success_without_reclaim() -> Result<()> {
+        let (bytes, target) = parse_cargo_sweep_preview(b"", b"[INFO] Done\n")?;
+
+        assert_eq!(bytes, 0);
+        assert_eq!(target, None);
+        Ok(())
+    }
+
+    #[test]
+    fn delegated_sweep_requires_complete_nonzero_preview_after_discovery() {
+        let preview = |bytes| DelegatedSweepPreview {
+            executable: Some(PathBuf::from("/usr/local/bin/cargo-sweep")),
+            version: Some(SUPPORTED_CARGO_SWEEP_VERSION.to_string()),
+            supported: true,
+            command: Vec::new(),
+            complete: true,
+            owner_reported_reclaim_bytes: bytes,
+            reported_target: None,
+            target_matches: true,
+            error: None,
+        };
+        let decision = |delegated_preview| SweepDecision {
+            tool: SweepTool::CargoSweep,
+            limit: SweepLimit::AgeDays { days: 7 },
+            delegated: true,
+            project_dir: None,
+            reason: "fixture".to_string(),
+            delegated_preview,
+            candidates: Vec::new(),
+            profile_candidates: Vec::new(),
+        };
+
+        assert!(decision(None).has_routine_work());
+        assert!(!decision(Some(preview(0))).has_routine_work());
+        assert!(decision(Some(preview(1))).has_routine_work());
+    }
+
+    #[test]
+    fn empty_delegated_preview_demotes_the_generated_sweep() {
+        let mut decision = GeneratedDirDecision {
+            path: PathBuf::from("/tmp/project/target"),
+            worktree_path: PathBuf::from("/tmp/project"),
+            name: "target".to_string(),
+            mtime: None,
+            mtime_unix: None,
+            effective_days: 7,
+            in_use: false,
+            protection: None,
+            cleanup_class: CleanupClass::Routine,
+            measurement: None,
+            sweeps: vec![SweepDecision {
+                tool: SweepTool::CargoSweep,
+                limit: SweepLimit::AgeDays { days: 7 },
+                delegated: true,
+                project_dir: None,
+                reason: "cargo-sweep dry-run found no eligible artifacts".to_string(),
+                delegated_preview: Some(DelegatedSweepPreview {
+                    executable: Some(PathBuf::from("/usr/local/bin/cargo-sweep")),
+                    version: Some(SUPPORTED_CARGO_SWEEP_VERSION.to_string()),
+                    supported: true,
+                    command: Vec::new(),
+                    complete: true,
+                    owner_reported_reclaim_bytes: 0,
+                    reported_target: None,
+                    target_matches: true,
+                    error: None,
+                }),
+                candidates: Vec::new(),
+                profile_candidates: Vec::new(),
+            }],
+            action: GeneratedDirAction::Sweep,
+            reason: "explicit in-place sweep".to_string(),
+        };
+
+        refresh_generated_sweep_action(&mut decision);
+
+        assert_eq!(decision.action, GeneratedDirAction::Skip);
+        assert_eq!(
+            decision.reason,
+            "cargo-sweep dry-run found no eligible artifacts"
+        );
+    }
+
+    #[test]
+    fn pressure_tightens_only_cargo_sweep_age_limits() {
+        assert_eq!(
+            effective_cargo_sweep_limit(&SweepLimit::AgeDays { days: 30 }, Some(7)),
+            SweepLimit::AgeDays { days: 7 }
+        );
+        assert_eq!(
+            effective_cargo_sweep_limit(&SweepLimit::AgeDays { days: 3 }, Some(7)),
+            SweepLimit::AgeDays { days: 3 }
+        );
+        assert_eq!(
+            effective_cargo_sweep_limit(&SweepLimit::MaxSize { bytes: 42 }, Some(7)),
+            SweepLimit::MaxSize { bytes: 42 }
         );
     }
 
@@ -5277,7 +5768,7 @@ mod tests {
         let target = fs::canonicalize(repo.join("target"))?;
         let repo = fs::canonicalize(repo)?;
         let decision = GeneratedDirDecision {
-            path: target,
+            path: target.clone(),
             worktree_path: repo.clone(),
             name: "target".to_string(),
             mtime: None,
@@ -5293,6 +5784,17 @@ mod tests {
                 delegated: true,
                 project_dir: Some(repo),
                 reason: "test delegated sweep".to_string(),
+                delegated_preview: Some(DelegatedSweepPreview {
+                    executable: Some(PathBuf::from("cargo-sweep")),
+                    version: Some(SUPPORTED_CARGO_SWEEP_VERSION.to_string()),
+                    supported: true,
+                    command: Vec::new(),
+                    complete: true,
+                    owner_reported_reclaim_bytes: 1,
+                    reported_target: Some(target.clone()),
+                    target_matches: true,
+                    error: None,
+                }),
                 candidates: Vec::new(),
                 profile_candidates: Vec::new(),
             }],
@@ -5370,6 +5872,7 @@ mod tests {
                 delegated: false,
                 project_dir: Some(repo),
                 reason: plan.reason,
+                delegated_preview: None,
                 candidates: Vec::new(),
                 profile_candidates: plan.candidates,
             }],
@@ -5583,6 +6086,7 @@ mod tests {
                     delegated: false,
                     project_dir: Some(PathBuf::from(repo)),
                     reason: "pressure profile fixture".to_string(),
+                    delegated_preview: None,
                     candidates: Vec::new(),
                     profile_candidates: vec![CargoProfileCandidateDecision {
                         path: profile.clone(),
