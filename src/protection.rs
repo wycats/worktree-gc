@@ -308,14 +308,61 @@ fn read_active_protections(registry_path: &Path, now: SystemTime) -> Result<Vec<
         );
     }
     for lease in &registry.leases {
-        let canonical = fs::canonicalize(&lease.path).with_context(|| {
-            format!(
-                "failed to resolve active protection path {} for lease {} in {}",
-                lease.path.display(),
-                lease.id,
-                registry_path.display()
-            )
-        })?;
+        let mut dormant = false;
+        // Path::ancestors is not double-ended. Collecting its borrowed paths
+        // keeps this root-to-leaf walk correct for platform prefixes without
+        // reconstructing paths component by component.
+        let prefixes = lease.path.ancestors().collect::<Vec<_>>();
+        for prefix in prefixes.into_iter().rev() {
+            match fs::symlink_metadata(prefix) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    bail!(
+                        "active protection path {} for lease {} in {} is not canonical",
+                        lease.path.display(),
+                        lease.id,
+                        registry_path.display()
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    dormant = true;
+                    break;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect active protection path {} for lease {} in {}",
+                            lease.path.display(),
+                            lease.id,
+                            registry_path.display()
+                        )
+                    });
+                }
+            }
+        }
+        if dormant {
+            continue;
+        }
+        let canonical = match fs::canonicalize(&lease.path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A component disappeared after the prefix walk. Treat this
+                // TOCTOU window like an ordinary dormant path: there is no
+                // resolved candidate to mutate now, and the stored canonical
+                // path is protected again if it reappears before expiry.
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve active protection path {} for lease {} in {}",
+                        lease.path.display(),
+                        lease.id,
+                        registry_path.display()
+                    )
+                });
+            }
+        };
         if canonical != lease.path {
             bail!(
                 "active protection path {} for lease {} in {} is not canonical",
@@ -687,18 +734,23 @@ mod tests {
     }
 
     #[test]
-    fn active_reads_reject_missing_paths() -> Result<()> {
+    fn active_reads_retain_missing_paths_as_dormant_leases() -> Result<()> {
         let temp = TempDir::new()?;
         let registry = temp.path().join("state/protections.json");
         let protected = temp.path().join("protected");
         fs::create_dir_all(&protected)?;
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        let lease = add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
         fs::remove_dir(&protected)?;
 
-        let error = active_protections_at(&registry, now)
-            .expect_err("missing active paths should fail closed");
-        assert!(error.to_string().contains("failed to resolve"));
+        assert_eq!(active_protections_at(&registry, now)?, vec![lease.clone()]);
+
+        fs::create_dir(&protected)?;
+        assert_eq!(active_protections_at(&registry, now)?, vec![lease]);
+        let ran = Cell::new(false);
+        let outcome = with_protection_guard_at(&registry, &protected, now, || ran.set(true))?;
+        assert!(matches!(outcome, ProtectionGuardOutcome::Protected(_)));
+        assert!(!ran.get());
         Ok(())
     }
 
@@ -724,6 +776,44 @@ mod tests {
 
         let error = active_protections_at(&registry, now)
             .expect_err("symlinked active paths should fail closed");
+        assert!(error.to_string().contains("is not canonical"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_reads_reject_dangling_symlink_replacements() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let protected = temp.path().join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        fs::remove_dir(&protected)?;
+        std::os::unix::fs::symlink(temp.path().join("missing"), &protected)?;
+
+        let error = active_protections_at(&registry, now)
+            .expect_err("a dangling symlink replacement must fail closed");
+        assert!(error.to_string().contains("is not canonical"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_reads_reject_dangling_intermediate_symlink_replacements() -> Result<()> {
+        let temp = TempDir::new()?;
+        let registry = temp.path().join("state/protections.json");
+        let parent = temp.path().join("parent");
+        let protected = parent.join("protected");
+        fs::create_dir_all(&protected)?;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        add_protection_at(&registry, &protected, "fixture".into(), 7, now)?;
+        fs::remove_dir(&protected)?;
+        fs::remove_dir(&parent)?;
+        std::os::unix::fs::symlink(temp.path().join("missing"), &parent)?;
+
+        let error = active_protections_at(&registry, now)
+            .expect_err("a dangling intermediate symlink replacement must fail closed");
         assert!(error.to_string().contains("is not canonical"));
         Ok(())
     }
