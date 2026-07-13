@@ -997,7 +997,6 @@ mod macos {
     pub(super) struct DirectoryReader {
         directory: File,
         attrs: AttrList,
-        buffer: Vec<u8>,
         pending: VecDeque<io::Result<DirectoryEntryMeasurement>>,
         exhausted: bool,
         yielded_entries: bool,
@@ -1018,7 +1017,6 @@ mod macos {
                     forkattr: ATTR_CMNEXT_PRIVATESIZE,
                     ..AttrList::default()
                 },
-                buffer: vec![0u8; 64 * 1024],
                 pending: VecDeque::new(),
                 exhausted: false,
                 yielded_entries: false,
@@ -1057,12 +1055,17 @@ mod macos {
         }
 
         fn fill_pending(&mut self) -> io::Result<()> {
+            // The buffer is only scratch space for one kernel call. Keeping a
+            // 64 KiB allocation in every resumable directory cursor makes a
+            // wide bounded scan consume memory in proportion to the number of
+            // partially visited siblings.
+            let mut buffer = vec![0u8; 64 * 1024];
             let count = unsafe {
                 getattrlistbulk(
                     self.directory.as_raw_fd(),
                     &mut self.attrs,
-                    self.buffer.as_mut_ptr().cast(),
-                    self.buffer.len(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
                     FSOPT_ATTR_CMN_EXTENDED,
                 )
             };
@@ -1076,9 +1079,9 @@ mod macos {
 
             let mut entry_offset = 0usize;
             for _ in 0..count {
-                let length = read_value::<u32>(&self.buffer, &mut entry_offset)? as usize;
+                let length = read_value::<u32>(&buffer, &mut entry_offset)? as usize;
                 if length < size_of::<u32>()
-                    || entry_offset - size_of::<u32>() + length > self.buffer.len()
+                    || entry_offset - size_of::<u32>() + length > buffer.len()
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1087,8 +1090,7 @@ mod macos {
                 }
                 let start = entry_offset - size_of::<u32>();
                 let end = start + length;
-                self.pending
-                    .push_back(parse_entry(&self.buffer[start..end]));
+                self.pending.push_back(parse_entry(&buffer[start..end]));
                 entry_offset = end;
             }
             Ok(())
