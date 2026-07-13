@@ -108,6 +108,15 @@ machine-wide by private reclaim and observed allocation, refreshes safety, and
 executes one candidate before checking free space again. Routine TTL order
 remains age-based.
 
+Cargo profile reset candidates participate individually in that controller.
+Profiles older than the routine reset window remain routine work; profiles
+that cross only the shorter pressure window are recorded separately in
+manifest version 6, measured as exact `target/debug` or `target/release`
+roots, and reset one at a time under Cargo's profile locks. Pressure execution
+ranks those profiles machine-wide by APFS-private reclaim and stops as soon as
+the filesystem reaches its target. This models a full profile rebuild as a
+bounded pressure cost without interpreting Cargo fingerprints.
+
 ## Incremental delivery
 
 The implementation order is intentionally useful after every merge:
@@ -126,16 +135,20 @@ The implementation order is intentionally useful after every merge:
    such as Codex-managed Git worktrees can then reuse the existing generated
    collectors; task metadata is advisory, while protections, Git state, open
    handles, Cargo locks, and execution-time revalidation remain authoritative.
-4. **Shared package-store collectors.** Discover pnpm's canonical content store
+4. **Pressure-aware Cargo profiles.** Measure exact host `debug` and `release`
+   profiles, distinguish routine from pressure-only reset windows, and trade a
+   bounded rebuild for machine-wide physical reclaim without parsing Cargo's
+   private fingerprint graph.
+5. **Shared package-store collectors.** Discover pnpm's canonical content store
    through pnpm and wrap official prune semantics with preflight, protections,
    measurement, and verification. Treat pnpm's metadata and `dlx` caches as a
    separate candidate domain: their path allocation can be mostly shared on
    APFS, and their retention contract is not the content store's prune contract.
-5. **Container/VM collectors.** Treat Docker/OrbStack, Lima, and Parallels as
+6. **Container/VM collectors.** Treat Docker/OrbStack, Lima, and Parallels as
    separate domains. Use their public inventory/prune/compact interfaces and
    surface running or suspended state. VM deletion or archival remains an
    explicit user decision.
-6. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
+7. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
    and application stores begin report-only. Activity must come from the
    owning application's task/database model rather than generic file mtimes
    when the owner rewrites or reindexes old content. A domain graduates to

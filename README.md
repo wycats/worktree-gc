@@ -323,6 +323,13 @@ ordered by expected rebuild cost (`.turbo`, `.next`, `target`, then
 controller prefers the largest conservative APFS-private reclaim, then the
 largest observed allocation, then the oldest activity. It refreshes and
 executes one exact candidate at a time; clean worktrees come last.
+For active Cargo targets, `cargo-profile-reset` applies the same distinction:
+profiles older than its configured age are routine work, while profiles older
+than `pressure.generated_days` are pressure-only candidates. Each exact
+`target/debug` or `target/release` profile is measured, ranked, revalidated
+under Cargo's locks, atomically quarantined, and removed before free space is
+checked again. This trades one profile rebuild for space without interpreting
+Cargo's private fingerprint format.
 The aggregate manifest records the policy, initial free-space observations,
 which decisions exist only because of pressure, and final free space after an
 executing run. Generated delete decisions also record logical, allocated, and
