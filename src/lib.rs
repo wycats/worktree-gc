@@ -740,6 +740,24 @@ fn plan_cleanup_with_protections(
 }
 
 fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()> {
+    measure_cleanup_runs_matching(runs, max_entries, None)
+}
+
+fn measure_cleanup_runs_matching(
+    runs: &mut [CleanupRun],
+    max_entries: u64,
+    only_path: Option<&Path>,
+) -> Result<()> {
+    if let Some(path) = only_path {
+        for run in runs.iter_mut() {
+            for decision in &mut run.manifest.generated_dirs {
+                if decision.path == path {
+                    decision.measurement = None;
+                }
+            }
+        }
+    }
+
     let mut targets: BTreeMap<PathBuf, GeneratedMeasurementTarget> = BTreeMap::new();
 
     for (run_index, run) in runs.iter().enumerate() {
@@ -756,6 +774,7 @@ fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()>
 
         for (decision_index, decision) in run.manifest.generated_dirs.iter().enumerate() {
             if decision.action != GeneratedDirAction::Delete
+                || only_path.is_some_and(|path| decision.path != path)
                 || routine_worktree_removals
                     .iter()
                     .any(|worktree| decision.path.starts_with(worktree))
@@ -766,6 +785,21 @@ fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()>
             // classification and measurement. Execution already treats a
             // vanished candidate as reclaimed, so it should not abort the
             // read-only evidence pass either.
+            let metadata = match fs::symlink_metadata(&decision.path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect generated measurement candidate {}",
+                            decision.path.display()
+                        )
+                    });
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
             let canonical = match fs::canonicalize(&decision.path) {
                 Ok(path) => path,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -778,6 +812,19 @@ fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()>
                     });
                 }
             };
+            let canonical_worktree =
+                fs::canonicalize(&decision.worktree_path).with_context(|| {
+                    format!(
+                        "failed to resolve generated candidate worktree {}",
+                        decision.worktree_path.display()
+                    )
+                })?;
+            anyhow::ensure!(
+                canonical.starts_with(&canonical_worktree),
+                "generated measurement candidate {} escaped worktree {}",
+                canonical.display(),
+                canonical_worktree.display()
+            );
             let priority = (
                 u8::from(decision.cleanup_class != CleanupClass::Pressure),
                 generated_rebuild_rank(&decision.name),
@@ -1094,6 +1141,13 @@ fn refresh_and_execute_repository(
         refreshed_open_handles.as_ref(),
     )?;
     carry_generated_measurements(&manifest.repositories[index], &mut refreshed);
+    if let Some(path) = only_generated_path {
+        measure_cleanup_runs_matching(
+            std::slice::from_mut(&mut refreshed),
+            GENERATED_MEASUREMENT_MAX_ENTRIES_PER_CANDIDATE,
+            Some(path),
+        )?;
+    }
     refreshed.manifest_path =
         write_manifest(&refreshed.manifest.git_common_dir, &refreshed.manifest)?;
     manifest.repositories[index] = refreshed;
@@ -5719,6 +5773,7 @@ mod tests {
                 now: now(),
             },
             &[],
+            None,
         )?;
         assert!(run
             .manifest
@@ -5744,6 +5799,112 @@ mod tests {
             1
         );
         assert!(measurements.iter().any(|measurement| !measurement.complete));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_measurement_does_not_follow_a_replaced_candidate_symlink() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules");
+        fs::create_dir_all(&candidate)?;
+        fs::write(candidate.join("artifact"), "fixture")?;
+        let old = unix_days_before_now(10);
+        set_mtime(&candidate.join("artifact"), old)?;
+        set_mtime(&candidate, old)?;
+
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+            &[],
+            None,
+        )?;
+        let external = repo
+            .parent()
+            .context("repository has no parent")?
+            .join("external");
+        fs::create_dir_all(&external)?;
+        fs::write(external.join("durable"), "keep")?;
+        fs::remove_dir_all(&candidate)?;
+        std::os::unix::fs::symlink(&external, &candidate)?;
+
+        measure_cleanup_runs(std::slice::from_mut(&mut run), 100)?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert!(decision.measurement.is_none());
+        assert!(external.join("durable").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_measurement_refresh_clears_vanished_candidate_evidence() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules");
+        fs::create_dir_all(&candidate)?;
+        fs::write(candidate.join("artifact"), "fixture")?;
+        let old = unix_days_before_now(10);
+        set_mtime(&candidate.join("artifact"), old)?;
+        set_mtime(&candidate, old)?;
+
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+            &[],
+            None,
+        )?;
+        let candidate = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?
+            .path
+            .clone();
+
+        measure_cleanup_runs(std::slice::from_mut(&mut run), 100)?;
+        assert!(run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == candidate)
+            .and_then(|decision| decision.measurement.as_ref())
+            .is_some());
+        fs::remove_dir_all(&candidate)?;
+
+        measure_cleanup_runs_matching(std::slice::from_mut(&mut run), 100, Some(&candidate))?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == candidate)
+            .context("missing node_modules decision after refresh")?;
+        assert!(decision.measurement.is_none());
         Ok(())
     }
 
