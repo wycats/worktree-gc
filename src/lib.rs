@@ -718,6 +718,13 @@ fn plan_cleanup_with_protections(
                     &dir.path,
                     &dir.worktree_path,
                     options.generated_config.sweep_strategies(&dir.name),
+                    (dir.cleanup_class == CleanupClass::Pressure).then(|| {
+                        options
+                            .pressure
+                            .as_ref()
+                            .expect("pressure-class candidate has a pressure policy")
+                            .generated_days
+                    }),
                     options.now,
                 )?
             } else {
@@ -6190,6 +6197,7 @@ mod tests {
             Some(&repo),
             CleanupOptions {
                 execute: true,
+                execution_permissions: ExecutionPermissions::all(),
                 stale_days: 30,
                 generated_days: 7,
                 generated_activity_only: false,
