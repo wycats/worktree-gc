@@ -114,6 +114,10 @@ The implementation order is intentionally useful after every merge:
 3. **Shared package-store collector.** Discover pnpm's canonical store through
    pnpm, distinguish project links from store allocation, and wrap official
    prune semantics with preflight, protections, measurement, and verification.
+   The first manual collector snapshots pnpm's link-count liveness evidence,
+   cache metadata, temporary content, and a configurable dlx TTL. It delegates
+   only when the snapshot is complete, stable, idle, and unprotected. Global
+   virtual stores remain advisory until project reachability can be planned.
 4. **Container/VM collectors.** Treat Docker/OrbStack and Parallels as separate
    domains. Use their public inventory/prune/compact interfaces and surface
    running or suspended state. VM deletion or archival remains an explicit

@@ -203,6 +203,47 @@ ordering without turning scheduled runs into broad recursive scans.
 The durable collector contract and incremental delivery order are documented
 in [`STORAGE.md`](STORAGE.md).
 
+## pnpm shared-store collection
+
+The first machine-wide collector wraps pnpm's maintained prune operation. A
+plain invocation is read-only:
+
+```sh
+worktree-gc collect pnpm
+worktree-gc collect pnpm --dlx-days 7 --max-entries 2000000 --scan-threads 4
+```
+
+The collector asks pnpm for its canonical store, resolves pnpm's cache,
+enumerates content files whose link count is one (the same liveness primitive
+used by `pnpm store prune`), and measures the exact metadata, temporary, and
+expired/orphaned dlx surfaces that pnpm will also remove. The manifest records
+the pnpm executable and version, an eligibility digest, bounded measurement,
+filesystem identity/free-space observations, protections, open paths, and
+active pnpm processes.
+
+Content prefixes are independent and use bounded parallelism. Four scan
+threads is the default; lower `--scan-threads` when interactive machine load
+matters more than inventory latency. The global entry budget is divided
+deterministically across prefixes, so concurrency cannot expand the scan.
+
+Execution remains explicit:
+
+```sh
+worktree-gc collect pnpm --dlx-days 7 --execute
+```
+
+Before delegation, worktree-gc locks the collector, reloads protections,
+repeats the bounded eligibility snapshot, and aborts if anything changed. It
+then runs pnpm's official `store prune` with the configured dlx TTL and records
+the realized free-space change. An active pnpm process, open store/cache path,
+incomplete scan, active protection, or pnpm global virtual-store layout keeps
+the operation report-only. The global virtual store needs a separate
+project-reachability planner before it can satisfy the same review boundary.
+
+This collector is initially manual rather than part of scheduled cleanup. Its
+manifests live under `$XDG_STATE_HOME/worktree-gc/collectors` (or
+`~/.local/state/worktree-gc/collectors`).
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but

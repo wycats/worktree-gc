@@ -5,12 +5,13 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories, inventory,
-    list_protections, print_cleanup, print_inventory, print_root_cleanup, print_root_triage,
-    print_triage, remove_protection, renew_protection, triage, triage_roots, CleanupOptions,
-    GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit, SweepStrategy, SweepTool,
-    TriageOptions, DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
-    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    add_protection, cleanup, cleanup_repositories, cleanup_roots, collect_pnpm,
+    discover_repositories, inventory, list_protections, print_cleanup, print_inventory,
+    print_pnpm_collect, print_root_cleanup, print_root_triage, print_triage, remove_protection,
+    renew_protection, triage, triage_roots, CleanupOptions, GeneratedDirConfig, InventoryOptions,
+    PnpmCollectOptions, PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions,
+    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS,
+    DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -64,6 +65,11 @@ enum Command {
 
         #[arg(long, help = "Write the complete structured report as JSON")]
         json: bool,
+    },
+    /// Plan or execute domain-aware cleanup through an owning tool
+    Collect {
+        #[command(subcommand)]
+        command: CollectorCommand,
     },
     #[command(visible_alias = "audit")]
     Triage {
@@ -138,6 +144,39 @@ enum Command {
     Protect {
         #[command(subcommand)]
         command: ProtectCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CollectorCommand {
+    /// Plan or delegate cleanup of pnpm's shared store and cache
+    Pnpm {
+        #[arg(
+            long,
+            help = "Revalidate the manifest and run official pnpm store prune"
+        )]
+        execute: bool,
+
+        #[arg(
+            long,
+            default_value_t = 7,
+            help = "Retain dlx entries used within this many days"
+        )]
+        dlx_days: u64,
+
+        #[arg(
+            long,
+            default_value_t = 2_000_000,
+            help = "Maximum entries to inspect while planning"
+        )]
+        max_entries: u64,
+
+        #[arg(
+            long,
+            default_value_t = 4,
+            help = "Maximum concurrent pnpm content-prefix scans"
+        )]
+        scan_threads: usize,
     },
 }
 
@@ -443,6 +482,29 @@ fn main() -> Result<()> {
                 println!();
             } else {
                 print_inventory(&report);
+            }
+        }
+        Command::Collect { command } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "collect discovers domain roots through the owning tool; do not pass --repo or --root"
+            );
+            match command {
+                CollectorCommand::Pnpm {
+                    execute,
+                    dlx_days,
+                    max_entries,
+                    scan_threads,
+                } => {
+                    let run = collect_pnpm(PnpmCollectOptions {
+                        execute,
+                        dlx_days,
+                        max_entries,
+                        scan_threads,
+                        now,
+                    })?;
+                    print_pnpm_collect(&run);
+                }
             }
         }
         Command::Triage {
@@ -874,6 +936,39 @@ mod tests {
                 assert_eq!(max_entries, 99);
                 assert!(!cross_filesystems);
                 assert!(json);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn pnpm_collector_cli_is_dry_run_by_default_and_accepts_policy() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "pnpm",
+            "--dlx-days",
+            "14",
+            "--max-entries",
+            "99",
+            "--scan-threads",
+            "2",
+        ])
+        .expect("pnpm collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Pnpm {
+                        execute,
+                        dlx_days,
+                        max_entries,
+                        scan_threads,
+                    },
+            } => {
+                assert!(!execute);
+                assert_eq!(dlx_days, 14);
+                assert_eq!(max_entries, 99);
+                assert_eq!(scan_threads, 2);
             }
             _ => unreachable!(),
         }
