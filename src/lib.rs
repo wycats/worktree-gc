@@ -8,10 +8,13 @@ use cargo_incremental::{
     cargo_profile_locks_present, cargo_project_dir, execute_incremental_sweep_with_timeout,
     is_cargo_lock_timeout, plan_incremental_sweep, with_cargo_profile_locks_timeout,
 };
-use cargo_profiles::{execute_cargo_profile_reset, plan_cargo_profile_sweep};
+use cargo_profiles::{
+    execute_cargo_profile_reset, plan_cargo_profile_sweep, profile_rebuild_rank,
+    CargoProfileExecutionPolicy,
+};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -42,7 +45,7 @@ pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", "
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
 pub const DEFAULT_CARGO_PROFILE_SWEEP_DAYS: u64 = 7;
-pub const MANIFEST_VERSION: u64 = 5;
+pub const MANIFEST_VERSION: u64 = 6;
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -95,6 +98,7 @@ pub struct PressurePolicy {
     pub target_bytes: u64,
     pub generated_days: u64,
     pub stale_days: u64,
+    pub cargo_profile_idle_minutes: u64,
     pub active: bool,
     pub entered_filesystems: Vec<String>,
 }
@@ -295,7 +299,21 @@ pub struct GeneratedDirMeasurement {
 #[derive(Debug)]
 struct GeneratedMeasurementTarget {
     priority: (u8, u8),
-    locations: Vec<(usize, usize)>,
+    locations: Vec<GeneratedMeasurementLocation>,
+}
+
+#[derive(Debug)]
+enum GeneratedMeasurementLocation {
+    Directory {
+        run_index: usize,
+        decision_index: usize,
+    },
+    CargoProfile {
+        run_index: usize,
+        decision_index: usize,
+        sweep_index: usize,
+        candidate_index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -345,6 +363,7 @@ impl SweepLimit {
 pub struct SweepDecision {
     pub tool: SweepTool,
     pub limit: SweepLimit,
+    pub pressure_idle_minutes: Option<u64>,
     pub delegated: bool,
     pub project_dir: Option<PathBuf>,
     pub reason: String,
@@ -367,6 +386,20 @@ impl SweepDecision {
                     SweepCandidateAction::Delete | SweepCandidateAction::RecoverTrash
                 )
             })
+    }
+
+    fn has_work_for(&self, class: CleanupClass) -> bool {
+        match self.tool {
+            SweepTool::RustcIncremental | SweepTool::CargoSweep => {
+                class == CleanupClass::Routine && self.has_work()
+            }
+            SweepTool::CargoProfileReset => self.profile_candidates.iter().any(|candidate| {
+                matches!(
+                    candidate.action,
+                    SweepCandidateAction::Delete | SweepCandidateAction::RecoverTrash
+                ) && candidate.cleanup_class == class
+            }),
+        }
     }
 }
 
@@ -738,6 +771,62 @@ fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()>
             .collect::<Vec<_>>();
 
         for (decision_index, decision) in run.manifest.generated_dirs.iter().enumerate() {
+            for (sweep_index, sweep) in decision.sweeps.iter().enumerate() {
+                if sweep.tool != SweepTool::CargoProfileReset {
+                    continue;
+                }
+                for (candidate_index, candidate) in sweep.profile_candidates.iter().enumerate() {
+                    if candidate.action != SweepCandidateAction::Delete {
+                        continue;
+                    }
+                    let metadata = match fs::symlink_metadata(&candidate.path) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.into()),
+                    };
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        continue;
+                    }
+                    let canonical = match fs::canonicalize(&candidate.path) {
+                        Ok(path) => path,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.into()),
+                    };
+                    let canonical_target = fs::canonicalize(&decision.path).with_context(|| {
+                        format!(
+                            "failed to resolve Cargo profile target {}",
+                            decision.path.display()
+                        )
+                    })?;
+                    anyhow::ensure!(
+                        canonical.starts_with(&canonical_target),
+                        "Cargo profile measurement candidate {} escaped target {}",
+                        canonical.display(),
+                        canonical_target.display()
+                    );
+                    let priority = (
+                        u8::from(candidate.cleanup_class != CleanupClass::Pressure),
+                        generated_rebuild_rank("target"),
+                    );
+                    let target =
+                        targets
+                            .entry(canonical)
+                            .or_insert_with(|| GeneratedMeasurementTarget {
+                                priority,
+                                locations: Vec::new(),
+                            });
+                    target.priority = target.priority.min(priority);
+                    target
+                        .locations
+                        .push(GeneratedMeasurementLocation::CargoProfile {
+                            run_index,
+                            decision_index,
+                            sweep_index,
+                            candidate_index,
+                        });
+                }
+            }
+
             if decision.action != GeneratedDirAction::Delete
                 || routine_worktree_removals
                     .iter()
@@ -800,7 +889,12 @@ fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()>
                     locations: Vec::new(),
                 });
             target.priority = target.priority.min(priority);
-            target.locations.push((run_index, decision_index));
+            target
+                .locations
+                .push(GeneratedMeasurementLocation::Directory {
+                    run_index,
+                    decision_index,
+                });
         }
     }
 
@@ -837,9 +931,26 @@ fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()>
             visited_entries: root.visited_entries,
             metrics: root.metrics,
         };
-        for (run_index, decision_index) in &target.locations {
-            runs[*run_index].manifest.generated_dirs[*decision_index].measurement =
-                Some(measurement.clone());
+        for location in &target.locations {
+            match *location {
+                GeneratedMeasurementLocation::Directory {
+                    run_index,
+                    decision_index,
+                } => {
+                    runs[run_index].manifest.generated_dirs[decision_index].measurement =
+                        Some(measurement.clone());
+                }
+                GeneratedMeasurementLocation::CargoProfile {
+                    run_index,
+                    decision_index,
+                    sweep_index,
+                    candidate_index,
+                } => {
+                    runs[run_index].manifest.generated_dirs[decision_index].sweeps[sweep_index]
+                        .profile_candidates[candidate_index]
+                        .measurement = Some(measurement.clone());
+                }
+            }
         }
     }
 
@@ -1104,6 +1215,29 @@ fn carry_generated_measurements(previous: &CleanupRun, refreshed: &mut CleanupRu
     for decision in &mut refreshed.manifest.generated_dirs {
         decision.measurement = measurements.get(&decision.path).cloned();
     }
+
+    let profile_measurements = previous
+        .manifest
+        .generated_dirs
+        .iter()
+        .flat_map(|decision| &decision.sweeps)
+        .flat_map(|sweep| &sweep.profile_candidates)
+        .filter_map(|candidate| {
+            candidate
+                .measurement
+                .clone()
+                .map(|measurement| (candidate.path.clone(), measurement))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for candidate in refreshed
+        .manifest
+        .generated_dirs
+        .iter_mut()
+        .flat_map(|decision| &mut decision.sweeps)
+        .flat_map(|sweep| &mut sweep.profile_candidates)
+    {
+        candidate.measurement = profile_measurements.get(&candidate.path).cloned();
+    }
 }
 
 fn pressure_generated_candidate_order(
@@ -1120,8 +1254,14 @@ fn pressure_generated_candidate_order(
                 .generated_dirs
                 .iter()
                 .filter(move |decision| {
-                    decision.action == GeneratedDirAction::Delete
-                        && decision.cleanup_class == CleanupClass::Pressure
+                    let pressure_delete = decision.action == GeneratedDirAction::Delete
+                        && decision.cleanup_class == CleanupClass::Pressure;
+                    let pressure_sweep = decision.action == GeneratedDirAction::Sweep
+                        && decision
+                            .sweeps
+                            .iter()
+                            .any(|sweep| sweep.has_work_for(CleanupClass::Pressure));
+                    (pressure_delete || pressure_sweep)
                         && generated_rebuild_rank(&decision.name) == rank
                 })
                 .map(move |decision| (index, decision))
@@ -1129,16 +1269,45 @@ fn pressure_generated_candidate_order(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, decision)| {
         let measurement = decision.measurement.as_ref();
+        let pressure_profiles = decision
+            .sweeps
+            .iter()
+            .flat_map(|sweep| &sweep.profile_candidates)
+            .filter(|candidate| {
+                candidate.action == SweepCandidateAction::Delete
+                    && candidate.cleanup_class == CleanupClass::Pressure
+            })
+            .collect::<Vec<_>>();
+        let profile_rank = pressure_profiles
+            .iter()
+            .map(|candidate| profile_rebuild_rank(candidate))
+            .min()
+            .unwrap_or_default();
+        let profile_private = pressure_profiles
+            .iter()
+            .filter_map(|candidate| candidate.measurement.as_ref())
+            .map(|measurement| measurement.metrics.private_reclaimable_bytes)
+            .sum::<u64>();
+        let profile_allocated = pressure_profiles
+            .iter()
+            .filter_map(|candidate| candidate.measurement.as_ref())
+            .map(|measurement| measurement.metrics.allocated_bytes)
+            .sum::<u64>();
         (
+            profile_rank,
             std::cmp::Reverse(
-                measurement
-                    .map(|measurement| measurement.metrics.private_reclaimable_bytes)
-                    .unwrap_or_default(),
+                profile_private.max(
+                    measurement
+                        .map(|measurement| measurement.metrics.private_reclaimable_bytes)
+                        .unwrap_or_default(),
+                ),
             ),
             std::cmp::Reverse(
-                measurement
-                    .map(|measurement| measurement.metrics.allocated_bytes)
-                    .unwrap_or_default(),
+                profile_allocated.max(
+                    measurement
+                        .map(|measurement| measurement.metrics.allocated_bytes)
+                        .unwrap_or_default(),
+                ),
             ),
             decision.mtime_unix.unwrap_or(i64::MAX),
             decision.path.clone(),
@@ -1954,7 +2123,8 @@ fn scan_generated_dirs_for_worktree(
     let ignored_paths = git_ignored_paths(&worktree.path, &candidates)?;
     let tracked_paths = git_tracked_paths(&worktree.path, &candidates)?;
     let open_generated_dirs = if policy.check_in_use {
-        dirs_with_open_handles(candidates.iter().map(|candidate| candidate.path.as_path()))
+        let paths = generated_open_handle_probe_paths(&candidates)?;
+        dirs_with_open_handles(paths.iter().map(PathBuf::as_path))
     } else {
         HashSet::new()
     };
@@ -1997,15 +2167,21 @@ fn scan_generated_dirs_for_worktree(
             .is_some_and(|days| days < routine_days);
         let routine_active = routine_worktree_recent || routine_dir_recent;
 
-        // Only pay for the open-handle probe when the directory would
-        // otherwise be deleted.
-        let deletable_so_far = candidate.action == GeneratedCandidateAction::Delete
-            && !worktree_recent
-            && !dir_recent
-            && !has_tracked_files;
-        let in_use = deletable_so_far && open_generated_dirs.contains(&candidate.path);
+        let in_use = open_generated_dirs
+            .iter()
+            .any(|open| open == &candidate.path || open.starts_with(&candidate.path));
         let sweep_strategies = config.sweep_strategies(&candidate.name);
         let active = worktree_recent || dir_recent;
+        let pressure_idle_minutes = if pressure_applies {
+            Some(
+                policy
+                    .pressure
+                    .expect("pressure applies only with a policy")
+                    .cargo_profile_idle_minutes,
+            )
+        } else {
+            None
+        };
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
             && protection.is_none()
             && (routine_active || candidate.action == GeneratedCandidateAction::SweepOnly)
@@ -2016,6 +2192,7 @@ fn scan_generated_dirs_for_worktree(
                 &candidate.path,
                 &worktree.path,
                 sweep_strategies,
+                pressure_idle_minutes,
                 policy.now,
             )?
         } else {
@@ -2162,6 +2339,7 @@ fn plan_sweep_decisions(
     target_dir: &Path,
     worktree: &Path,
     mut strategies: Vec<&SweepStrategy>,
+    pressure_idle_minutes: Option<u64>,
     now: SystemTime,
 ) -> Result<Vec<SweepDecision>> {
     strategies.sort_by_key(|strategy| strategy.tool.clone());
@@ -2177,6 +2355,7 @@ fn plan_sweep_decisions(
                 Ok(SweepDecision {
                     tool: SweepTool::RustcIncremental,
                     limit: strategy.limit.clone(),
+                    pressure_idle_minutes: None,
                     delegated: false,
                     project_dir: cargo_project_dir(target_dir, worktree),
                     reason: plan.reason,
@@ -2189,10 +2368,17 @@ fn plan_sweep_decisions(
                     .limit
                     .age_days()
                     .context("cargo-profile-reset requires an age-days limit")?;
-                let plan = plan_cargo_profile_sweep(target_dir, worktree, days, now)?;
+                let plan = plan_cargo_profile_sweep(
+                    target_dir,
+                    worktree,
+                    days,
+                    pressure_idle_minutes,
+                    now,
+                )?;
                 Ok(SweepDecision {
                     tool: SweepTool::CargoProfileReset,
                     limit: strategy.limit.clone(),
+                    pressure_idle_minutes,
                     delegated: false,
                     project_dir: cargo_project_dir(target_dir, worktree),
                     reason: plan.reason,
@@ -2203,6 +2389,7 @@ fn plan_sweep_decisions(
             SweepTool::CargoSweep => Ok(SweepDecision {
                 tool: SweepTool::CargoSweep,
                 limit: strategy.limit.clone(),
+                pressure_idle_minutes: None,
                 delegated: true,
                 project_dir: cargo_project_dir(target_dir, worktree),
                 reason: match strategy.limit {
@@ -2247,13 +2434,53 @@ fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
 }
 
 // Best-effort open-handle probe. `lsof +D` walks the whole tree, which is
-// too slow for multi-gigabyte caches, so this probes the directory and its
-// immediate children (`+d`). That catches the common live-dev-server shapes
-// (a held lockfile, trace file, or cache subdirectory handle) without the
-// full walk. Candidate sets are chunked below the OS argument limit. A failed
-// batch retries one directory at a time and keeps any individually unprobeable
-// directory protected; an unavailable lsof still degrades to mtime-only
-// judgment on supported platforms.
+// too slow for multi-gigabyte caches, so this probes each generated directory
+// and discovered Cargo profile root with `+d`. That catches common
+// live-dev-server shapes and directly running Cargo profile binaries without a
+// full recursive walk. Candidate sets are chunked below the OS argument limit.
+// A failed batch retries one directory at a time and keeps any individually
+// unprobeable directory protected; an unavailable lsof still degrades to
+// mtime-only judgment on supported platforms.
+fn generated_open_handle_probe_paths(candidates: &[GeneratedCandidate]) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    for candidate in candidates {
+        paths.insert(candidate.path.clone());
+        if candidate.name != "target" {
+            continue;
+        }
+        for entry in WalkDir::new(&candidate.path)
+            .follow_links(false)
+            .min_depth(2)
+            .max_depth(3)
+        {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error)
+                    if error
+                        .io_error()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to discover Cargo profiles under {} for open-file checks",
+                            candidate.path.display()
+                        )
+                    });
+                }
+            };
+            if entry.file_name() == ".cargo-lock" {
+                if let Some(profile) = entry.path().parent() {
+                    paths.insert(profile.to_path_buf());
+                }
+            }
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
 #[cfg(unix)]
 fn dirs_with_open_handles<'a>(paths: impl Iterator<Item = &'a Path>) -> HashSet<PathBuf> {
     const LSOF_PATH_CHUNK_SIZE: usize = 64;
@@ -2734,20 +2961,46 @@ fn execute_cleanup(
         })
         .collect::<Vec<_>>();
     sort_generated_deletions(&mut generated_deletions, pass);
-    let generated_sweeps = if pass == ExecutionPass::Routine {
+    let sweep_class = match pass {
+        ExecutionPass::Routine => Some(CleanupClass::Routine),
+        ExecutionPass::PressureGenerated(rank) if rank == generated_rebuild_rank("target") => {
+            Some(CleanupClass::Pressure)
+        }
+        _ => None,
+    };
+    let mut generated_sweeps = sweep_class.map_or_else(Vec::new, |class| {
         manifest
             .generated_dirs
             .iter()
             .filter(|decision| {
-                decision.sweeps.iter().any(SweepDecision::has_work)
+                only_generated_path.is_none_or(|path| decision.path == path)
+                    && decision
+                        .sweeps
+                        .iter()
+                        .any(|sweep| sweep.has_work_for(class))
                     && (decision.action == GeneratedDirAction::Sweep
                         || (decision.action == GeneratedDirAction::Delete
-                            && decision.cleanup_class == CleanupClass::Pressure))
+                            && decision.cleanup_class == CleanupClass::Pressure
+                            && class == CleanupClass::Routine))
             })
             .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    });
+    if sweep_class == Some(CleanupClass::Pressure) {
+        generated_sweeps.sort_by_key(|decision| {
+            let private = decision
+                .sweeps
+                .iter()
+                .flat_map(|sweep| &sweep.profile_candidates)
+                .filter(|candidate| {
+                    candidate.action == SweepCandidateAction::Delete
+                        && candidate.cleanup_class == CleanupClass::Pressure
+                })
+                .filter_map(|candidate| candidate.measurement.as_ref())
+                .map(|measurement| measurement.metrics.private_reclaimable_bytes)
+                .sum::<u64>();
+            (std::cmp::Reverse(private), decision.path.clone())
+        });
+    }
     let run_id = format!(
         "{}-{}",
         manifest.generated_at.replace([':', '.'], "-"),
@@ -2823,6 +3076,11 @@ fn execute_cleanup(
         if !decision.path.exists() || nested_in_planned_removal(&decision.path) {
             continue;
         }
+        if sweep_class == Some(CleanupClass::Pressure)
+            && !pressure_should_continue(manifest, &decision.path, &mut satisfied_filesystems)?
+        {
+            continue;
+        }
         eprintln!(
             "[sweep {}/{}] sweeping {}",
             index + 1,
@@ -2833,8 +3091,12 @@ fn execute_cleanup(
         let result = match with_protection_guard(&decision.path, SystemTime::now(), || {
             run_sweeps(
                 decision,
+                sweep_class.expect("generated sweeps require a cleanup class"),
                 &run_id,
                 manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
+                manifest.pressure.as_ref().and_then(|pressure| {
+                    (sweep_class == Some(CleanupClass::Pressure)).then_some(pressure.target_bytes)
+                }),
             )
         })? {
             ProtectionGuardOutcome::Protected(lease) => {
@@ -3056,10 +3318,15 @@ fn write_deferred_cargo_action(
 
 fn run_sweeps(
     decision: &GeneratedDirDecision,
+    cleanup_class: CleanupClass,
     run_id: &str,
     cargo_lock_timeout: Option<Duration>,
+    pressure_target_bytes: Option<u64>,
 ) -> Result<()> {
     for sweep in &decision.sweeps {
+        if !sweep.has_work_for(cleanup_class) {
+            continue;
+        }
         match sweep.tool {
             SweepTool::RustcIncremental => {
                 let days = sweep
@@ -3082,7 +3349,12 @@ fn run_sweeps(
                     &decision.path,
                     &decision.worktree_path,
                     &sweep.profile_candidates,
-                    days,
+                    CargoProfileExecutionPolicy {
+                        routine_days: days,
+                        pressure_idle_minutes: sweep.pressure_idle_minutes,
+                        cleanup_class,
+                        pressure_target_bytes,
+                    },
                     run_id,
                     cargo_lock_timeout,
                 )?;
@@ -3398,15 +3670,32 @@ fn print_sweep_candidates<'a>(dirs: impl IntoIterator<Item = (&'a Path, &'a [Swe
     println!("Cargo profile reset candidates: {}", profiles.len());
     for (target, sweep, candidate) in profiles.iter().take(50) {
         let activity = candidate
-            .activity_age_days
-            .map(|days| format!("{days}d old"))
+            .activity_age_minutes
+            .map(|minutes| {
+                if minutes >= 86_400 / 60 {
+                    format!("{}d old", minutes / (86_400 / 60))
+                } else {
+                    format!("{minutes}m idle")
+                }
+            })
             .unwrap_or_else(|| "unknown activity".to_string());
+        let measurement = candidate.measurement.as_ref().map_or_else(
+            || "unmeasured".to_string(),
+            |measurement| {
+                format!(
+                    "{} private",
+                    format_bytes(measurement.metrics.private_reclaimable_bytes)
+                )
+            },
+        );
         println!(
-            "- {} [{} in {}; {}]",
+            "- {} [{} in {}; {}; {}; {}]",
             candidate.path.display(),
             sweep_tool_name(&sweep.tool),
             target.display(),
-            activity
+            activity,
+            cleanup_class_name(candidate.cleanup_class),
+            measurement
         );
     }
     if profiles.len() > 50 {
@@ -3419,6 +3708,13 @@ fn sweep_tool_name(tool: &SweepTool) -> &'static str {
         SweepTool::RustcIncremental => "rustc-incremental",
         SweepTool::CargoProfileReset => "cargo-profile-reset",
         SweepTool::CargoSweep => "cargo-sweep",
+    }
+}
+
+fn cleanup_class_name(class: CleanupClass) -> &'static str {
+    match class {
+        CleanupClass::Routine => "routine",
+        CleanupClass::Pressure => "pressure",
     }
 }
 
@@ -4599,6 +4895,78 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn open_cargo_profile_handles_prevent_pressure_reset() -> Result<()> {
+        if Command::new("lsof")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: lsof unavailable");
+            return Ok(());
+        }
+
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"open-profile-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let target = repo.join("target");
+        let profile = target.join("debug");
+        fs::create_dir_all(&profile)?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        let binary = profile.join("fixture-bin");
+        fs::write(&binary, "running")?;
+        let planning_now = SystemTime::now();
+        let idle = system_time_to_unix(planning_now)
+            .context("current time does not fit a Unix timestamp")?
+            - 120 * 60;
+        for path in [&binary, &profile.join(".cargo-lock"), &profile, &target] {
+            set_mtime(path, idle)?;
+        }
+        let _held = fs::File::open(&binary)?;
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: Some(Duration::from_secs(10)),
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    cargo_profile_idle_minutes: 60,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: planning_now,
+            },
+        )?;
+
+        let target = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "target")
+            .context("missing target decision")?;
+        assert_eq!(target.action, GeneratedDirAction::Skip);
+        assert!(target.in_use);
+        assert!(target.reason.contains("open files"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn open_handle_probe_chunks_large_candidate_sets() -> Result<()> {
         if Command::new("lsof")
             .arg("-v")
@@ -4704,6 +5072,7 @@ mod tests {
             sweeps: vec![SweepDecision {
                 tool: SweepTool::CargoSweep,
                 limit: SweepLimit::MaxSize { bytes: 1_000_000 },
+                pressure_idle_minutes: None,
                 delegated: true,
                 project_dir: Some(repo),
                 reason: "test delegated sweep".to_string(),
@@ -4716,8 +5085,10 @@ mod tests {
 
         let error = run_sweeps(
             &decision,
+            CleanupClass::Routine,
             "cargo-sweep-timeout-test",
             Some(Duration::from_millis(20)),
+            None,
         )
         .expect_err("cargo-sweep coordination timeout should propagate");
         assert!(is_cargo_lock_timeout(&error));
@@ -4992,6 +5363,8 @@ mod tests {
                 target_bytes: u64::MAX,
                 generated_days: 1,
                 stale_days: 7,
+
+                cargo_profile_idle_minutes: 60,
                 active: true,
                 entered_filesystems: vec![filesystem_key(temp.path())?],
             }),
@@ -5033,6 +5406,8 @@ mod tests {
                     target_bytes: u64::MAX,
                     generated_days: 1,
                     stale_days: 7,
+
+                    cargo_profile_idle_minutes: 60,
                     active: false,
                     entered_filesystems: Vec::new(),
                 }),
@@ -5053,6 +5428,8 @@ mod tests {
             target_bytes: 150,
             generated_days: 1,
             stale_days: 7,
+
+            cargo_profile_idle_minutes: 60,
             active: false,
             entered_filesystems: Vec::new(),
         };
@@ -5114,6 +5491,8 @@ mod tests {
             target_bytes: u64::MAX,
             generated_days: 1,
             stale_days: 7,
+
+            cargo_profile_idle_minutes: 60,
             active: true,
             entered_filesystems: vec!["different-filesystem".to_string()],
         };
@@ -5149,6 +5528,8 @@ mod tests {
                     target_bytes: u64::MAX,
                     generated_days: 1,
                     stale_days: 7,
+
+                    cargo_profile_idle_minutes: 60,
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
@@ -5549,6 +5930,8 @@ mod tests {
                     target_bytes: 1,
                     generated_days: 1,
                     stale_days: 7,
+
+                    cargo_profile_idle_minutes: 60,
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
@@ -5568,6 +5951,8 @@ mod tests {
             target_bytes: u64::MAX,
             generated_days: 1,
             stale_days: 7,
+
+            cargo_profile_idle_minutes: 60,
             active: true,
             entered_filesystems: Vec::new(),
         };
@@ -5663,6 +6048,8 @@ mod tests {
                     target_bytes: u64::MAX,
                     generated_days: 1,
                     stale_days: 7,
+
+                    cargo_profile_idle_minutes: 60,
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
@@ -5684,6 +6071,149 @@ mod tests {
                     .iter()
                     .any(|candidate| candidate.action == SweepCandidateAction::Delete)
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_profiles_are_measured_without_making_the_target_stale() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"pressure-profile-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let target = repo.join("target");
+        let profile = target.join("debug");
+        let deps = profile.join("deps");
+        fs::create_dir_all(&deps)?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        let artifact = deps.join("libfixture.rlib");
+        fs::write(&artifact, vec![0_u8; 1024 * 1024])?;
+        let execution_now = SystemTime::now();
+        let idle = system_time_to_unix(execution_now)
+            .context("current time does not fit a Unix timestamp")?
+            - 120 * 60;
+        for path in [
+            &artifact,
+            &deps,
+            &profile.join(".cargo-lock"),
+            &profile,
+            &target,
+        ] {
+            set_mtime(path, idle)?;
+        }
+        let filesystem = filesystem_key(&target)?;
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    cargo_profile_idle_minutes: 60,
+                    active: true,
+                    entered_filesystems: vec![filesystem],
+                }),
+                now: execution_now,
+            },
+        )?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "target")
+            .context("missing target decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Sweep);
+        let candidate = decision
+            .sweeps
+            .iter()
+            .find(|sweep| sweep.tool == SweepTool::CargoProfileReset)
+            .and_then(|sweep| {
+                sweep
+                    .profile_candidates
+                    .iter()
+                    .find(|candidate| candidate.path.ends_with("target/debug"))
+            })
+            .context("missing pressure profile candidate")?;
+        assert_eq!(candidate.action, SweepCandidateAction::Delete);
+        assert_eq!(candidate.cleanup_class, CleanupClass::Pressure);
+        let measurement = candidate
+            .measurement
+            .as_ref()
+            .context("pressure profile was not measured")?;
+        assert!(measurement.complete);
+        assert!(measurement.metrics.private_reclaimable_bytes > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_execution_resets_only_the_quiescent_cargo_profile() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"pressure-profile-execution-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let target = repo.join("target");
+        let profile = target.join("debug");
+        let deps = profile.join("deps");
+        fs::create_dir_all(&deps)?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        let artifact = deps.join("libfixture.rlib");
+        fs::write(&artifact, vec![0_u8; 1024 * 1024])?;
+        let execution_now = SystemTime::now();
+        let idle = system_time_to_unix(execution_now)
+            .context("current time does not fit a Unix timestamp")?
+            - 120 * 60;
+        for path in [
+            &artifact,
+            &deps,
+            &profile.join(".cargo-lock"),
+            &profile,
+            &target,
+        ] {
+            set_mtime(path, idle)?;
+        }
+
+        cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: Some(Duration::from_secs(10)),
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    cargo_profile_idle_minutes: 60,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: execution_now,
+            },
+        )?;
+
+        assert!(!profile.exists());
+        assert!(target.is_dir());
+        assert!(repo.join("Cargo.toml").is_file());
         Ok(())
     }
 

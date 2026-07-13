@@ -90,12 +90,22 @@ The controller continues to check live free space after each operation. APFS
 private bytes improve ordering and planning; realized filesystem availability
 remains the stop condition.
 
+Cargo profile reset is a cache eviction operation under pressure, not a claim
+that every output in the profile is stale. Routine cleanup retains the
+seven-day age threshold. Pressure cleanup instead requires a configured idle
+window, Cargo lock coordination, no recursive protection, no detected open
+profile files when in-use checking is enabled, and atomic quarantine. It may
+therefore exchange a recently used profile for disk space when the machine
+values that space more than a warm rebuild. The manifest records this as a
+pressure candidate, measures the exact profile root, and keeps routine and
+pressure execution passes separate.
+
 Generated-directory cleanup applies the inventory primitive only after safety
-classification. Delete candidates share one sequential global entry budget
-and a smaller per-candidate slice; their complete or partial measurements are
-persisted in manifest version 5. When the evidence budget cannot cover every
-candidate, pressure candidates and lower rebuild-cost classes are measured
-first.
+classification. Generated-directory and Cargo-profile candidates share one
+sequential global entry budget and a smaller per-candidate slice; their
+complete or partial measurements are persisted in manifest version 6. When the
+evidence budget cannot cover every candidate, pressure candidates and lower
+rebuild-cost classes are measured first.
 Pressure execution preserves rebuild-cost classes, orders exact candidates
 machine-wide by private reclaim and observed allocation, refreshes safety, and
 executes one candidate before checking free space again. Routine TTL order

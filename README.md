@@ -261,6 +261,9 @@ enter_free_space = "100GiB"
 target_free_space = "150GiB"
 generated_days = 1
 stale_days = 7
+# Pressure-only Cargo profile reset waits for this process-free idle window.
+# Routine profile reset keeps its seven-day threshold.
+cargo_profile_idle_minutes = 60
 
 [history]
 retention_days = 90
@@ -292,6 +295,19 @@ ordered by expected rebuild cost (`.turbo`, `.next`, `target`, then
 controller prefers the largest conservative APFS-private reclaim, then the
 largest observed allocation, then the oldest activity. It refreshes and
 executes one exact candidate at a time; clean worktrees come last.
+
+Cargo profiles use a separate pressure boundary because a recently used
+`target/debug` can contain many gigabytes of historical outputs even when its
+current build is valuable. Once a profile has been quiet for
+`cargo_profile_idle_minutes`, pressure mode may reset it without waiting for the
+routine seven-day profile TTL. Recursive leases and Cargo's profile locks still
+protect it; scheduled open-file checks include Cargo profile roots so a directly
+running debug or release binary also keeps the target. Execution revalidates
+activity after lock acquisition, and atomic quarantine precedes deletion. Debug
+profiles are preferred over release profiles, then APFS-private reclaim orders
+candidates within that rebuild-cost class. Free space is checked after every
+profile and execution stops at `target_free_space`.
+
 The aggregate manifest records the policy, initial free-space observations,
 which decisions exist only because of pressure, and final free space after an
 executing run. Generated delete decisions also record logical, allocated, and

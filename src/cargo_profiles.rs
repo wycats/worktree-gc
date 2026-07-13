@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 use walkdir::WalkDir;
 
 use crate::cargo_incremental::{with_cargo_profile_locks_timeout, TRASH_DIR_NAME};
-use crate::SweepCandidateAction;
+use crate::{CleanupClass, GeneratedDirMeasurement, SweepCandidateAction};
 
 // Cargo build-script outputs commonly live below build/<unit>/out, and
 // generated files can add another directory or two. Keep this bounded while
@@ -25,6 +25,9 @@ pub struct CargoProfileCandidateDecision {
     pub last_activity_unix: Option<i64>,
     pub last_activity: Option<String>,
     pub activity_age_days: Option<u64>,
+    pub activity_age_minutes: Option<u64>,
+    pub cleanup_class: CleanupClass,
+    pub measurement: Option<GeneratedDirMeasurement>,
     pub action: SweepCandidateAction,
     pub reason: String,
 }
@@ -34,10 +37,19 @@ pub(crate) struct CargoProfilePlan {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CargoProfileExecutionPolicy {
+    pub routine_days: u64,
+    pub pressure_idle_minutes: Option<u64>,
+    pub cleanup_class: CleanupClass,
+    pub pressure_target_bytes: Option<u64>,
+}
+
 pub(crate) fn plan_cargo_profile_sweep(
     target_dir: &Path,
     worktree: &Path,
-    days: u64,
+    routine_days: u64,
+    pressure_idle_minutes: Option<u64>,
     now: SystemTime,
 ) -> Result<CargoProfilePlan> {
     let context = match resolve_build_context(target_dir, worktree)? {
@@ -72,6 +84,9 @@ pub(crate) fn plan_cargo_profile_sweep(
                 last_activity_unix,
                 last_activity: last_activity_unix.map(format_unix_time),
                 activity_age_days: last_activity_unix.and_then(|unix| age_days(now, unix)),
+                activity_age_minutes: last_activity_unix.and_then(|unix| age_minutes(now, unix)),
+                cleanup_class: CleanupClass::Routine,
+                measurement: None,
                 action: SweepCandidateAction::RecoverTrash,
                 reason: "recover profile quarantine from an interrupted run".to_string(),
             });
@@ -152,19 +167,34 @@ pub(crate) fn plan_cargo_profile_sweep(
         .to_string();
         let last_activity_unix = sampled_activity(&profile_dir)?;
         let activity_age_days = last_activity_unix.and_then(|unix| age_days(now, unix));
-        let action = if activity_age_days.is_some_and(|age| age >= days) {
-            SweepCandidateAction::Delete
+        let activity_age_minutes = last_activity_unix.and_then(|unix| age_minutes(now, unix));
+        let (action, cleanup_class, reason) = if activity_age_days
+            .is_some_and(|age| age >= routine_days)
+        {
+            (
+                SweepCandidateAction::Delete,
+                CleanupClass::Routine,
+                format!("Cargo profile has been inactive for at least {routine_days} days"),
+            )
+        } else if pressure_idle_minutes
+            .is_some_and(|minutes| activity_age_minutes.is_some_and(|age| age >= minutes))
+        {
+            let minutes = pressure_idle_minutes.expect("pressure idle window was checked");
+            (
+                SweepCandidateAction::Delete,
+                CleanupClass::Pressure,
+                format!("pressure eviction after at least {minutes} idle minutes"),
+            )
         } else {
-            SweepCandidateAction::Keep
-        };
-        let reason = match action {
-            SweepCandidateAction::Delete => {
-                format!("Cargo profile has been inactive for at least {days} days")
-            }
-            SweepCandidateAction::Keep => {
-                format!("Cargo profile activity is newer than {days} days")
-            }
-            _ => unreachable!(),
+            let reason = pressure_idle_minutes.map_or_else(
+                || format!("Cargo profile activity is newer than {routine_days} days"),
+                |minutes| {
+                    format!(
+                        "Cargo profile activity is newer than both {routine_days} days and the {minutes}-minute pressure idle window"
+                    )
+                },
+            );
+            (SweepCandidateAction::Keep, CleanupClass::Routine, reason)
         };
         candidates.push(CargoProfileCandidateDecision {
             path: profile_dir,
@@ -173,19 +203,32 @@ pub(crate) fn plan_cargo_profile_sweep(
             last_activity_unix,
             last_activity: last_activity_unix.map(format_unix_time),
             activity_age_days,
+            activity_age_minutes,
+            cleanup_class,
+            measurement: None,
             action,
             reason,
         });
     }
 
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
-    let delete_count = candidates
+    let routine_count = candidates
         .iter()
-        .filter(|candidate| candidate.action == SweepCandidateAction::Delete)
+        .filter(|candidate| {
+            candidate.action == SweepCandidateAction::Delete
+                && candidate.cleanup_class == CleanupClass::Routine
+        })
+        .count();
+    let pressure_count = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.action == SweepCandidateAction::Delete
+                && candidate.cleanup_class == CleanupClass::Pressure
+        })
         .count();
     Ok(CargoProfilePlan {
         reason: format!(
-            "inspected {} Cargo profiles; {delete_count} stale profiles",
+            "inspected {} Cargo profiles; {routine_count} stale profiles; {pressure_count} pressure-eviction profiles",
             candidates.len()
         ),
         candidates,
@@ -196,7 +239,7 @@ pub(crate) fn execute_cargo_profile_reset(
     target_dir: &Path,
     worktree: &Path,
     candidates: &[CargoProfileCandidateDecision],
-    days: u64,
+    policy: CargoProfileExecutionPolicy,
     run_id: &str,
     timeout: Option<Duration>,
 ) -> Result<()> {
@@ -218,17 +261,47 @@ pub(crate) fn execute_cargo_profile_reset(
     }
     remove_empty_trash_root(&trash_root)?;
 
-    for candidate in candidates
+    let mut eligible = candidates
         .iter()
-        .filter(|candidate| candidate.action == SweepCandidateAction::Delete)
-    {
+        .filter(|candidate| {
+            candidate.action == SweepCandidateAction::Delete
+                && candidate.cleanup_class == policy.cleanup_class
+        })
+        .collect::<Vec<_>>();
+    eligible.sort_by_key(|candidate| {
+        (
+            profile_rebuild_rank(candidate),
+            std::cmp::Reverse(
+                candidate
+                    .measurement
+                    .as_ref()
+                    .map(|measurement| measurement.metrics.private_reclaimable_bytes)
+                    .unwrap_or_default(),
+            ),
+            candidate.path.clone(),
+        )
+    });
+
+    for candidate in eligible {
+        if let Some(target) = policy.pressure_target_bytes {
+            let available = fs4::available_space(&target_dir).with_context(|| {
+                format!(
+                    "failed to read free space while resetting Cargo profiles under {}",
+                    target_dir.display()
+                )
+            })?;
+            if available >= target {
+                eprintln!("  pressure target reached; keeping remaining Cargo profiles");
+                break;
+            }
+        }
         let Some(profile) = candidate.cargo_profile.as_deref() else {
             continue;
         };
         if !candidate.path.exists() {
             continue;
         }
-        if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
+        if !profile_is_eligible(&target_dir, worktree, &candidate.path, profile, policy)? {
             eprintln!(
                 "  keeping refreshed Cargo profile {}",
                 candidate.path.display()
@@ -241,7 +314,7 @@ pub(crate) fn execute_cargo_profile_reset(
             worktree,
             timeout,
             || -> Result<Option<PathBuf>> {
-                if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
+                if !profile_is_eligible(&target_dir, worktree, &candidate.path, profile, policy)? {
                     eprintln!(
                         "  keeping Cargo profile refreshed while waiting for its lock {}",
                         candidate.path.display()
@@ -335,19 +408,34 @@ fn remove_empty_trash_root(trash_root: &Path) -> Result<()> {
     }
 }
 
-fn profile_is_stale(
+fn profile_is_eligible(
     target_dir: &Path,
     worktree: &Path,
     candidate_path: &Path,
     profile: &str,
-    days: u64,
+    policy: CargoProfileExecutionPolicy,
 ) -> Result<bool> {
-    let refreshed = plan_cargo_profile_sweep(target_dir, worktree, days, SystemTime::now())?;
+    let refreshed = plan_cargo_profile_sweep(
+        target_dir,
+        worktree,
+        policy.routine_days,
+        policy.pressure_idle_minutes,
+        SystemTime::now(),
+    )?;
     Ok(refreshed.candidates.iter().any(|refreshed| {
         refreshed.path == candidate_path
             && refreshed.cargo_profile.as_deref() == Some(profile)
             && refreshed.action == SweepCandidateAction::Delete
+            && refreshed.cleanup_class == policy.cleanup_class
     }))
+}
+
+pub(crate) fn profile_rebuild_rank(candidate: &CargoProfileCandidateDecision) -> u8 {
+    match candidate.cargo_profile.as_deref() {
+        Some("dev") => 0,
+        Some("release") => 1,
+        _ => 2,
+    }
 }
 
 struct BuildContext {
@@ -466,6 +554,9 @@ fn skipped_candidate(
         last_activity_unix: None,
         last_activity: None,
         activity_age_days: None,
+        activity_age_minutes: None,
+        cleanup_class: CleanupClass::Routine,
+        measurement: None,
         action: SweepCandidateAction::Skip,
         reason: reason.to_string(),
     }
@@ -492,12 +583,20 @@ fn canonicalize_if_present(path: &Path) -> Option<PathBuf> {
 }
 
 fn age_days(now: SystemTime, unix: i64) -> Option<u64> {
+    age_seconds(now, unix).map(|seconds| seconds / 86_400)
+}
+
+fn age_minutes(now: SystemTime, unix: i64) -> Option<u64> {
+    age_seconds(now, unix).map(|seconds| seconds / 60)
+}
+
+fn age_seconds(now: SystemTime, unix: i64) -> Option<u64> {
     let then = if unix >= 0 {
         UNIX_EPOCH.checked_add(Duration::from_secs(unix as u64))?
     } else {
         UNIX_EPOCH.checked_sub(Duration::from_secs(unix.unsigned_abs()))?
     };
-    Some(now.duration_since(then).unwrap_or(Duration::ZERO).as_secs() / 86_400)
+    Some(now.duration_since(then).unwrap_or(Duration::ZERO).as_secs())
 }
 
 fn system_time_to_unix(time: SystemTime) -> Option<i64> {
@@ -544,10 +643,23 @@ mod tests {
     }
 
     fn age_fixture(profile: &Path) -> Result<()> {
-        set_old(&profile.join("deps/libfixture-old.rlib"))?;
-        set_old(&profile.join("deps"))?;
-        set_old(&profile.join(".cargo-lock"))?;
-        set_old(profile)
+        age_fixture_by(profile, Duration::from_secs(20 * 86_400))
+    }
+
+    fn age_fixture_by(profile: &Path, age: Duration) -> Result<()> {
+        let modified = SystemTime::now() - age;
+        for path in [
+            profile.join("deps/libfixture-old.rlib"),
+            profile.join("deps"),
+            profile.join(".cargo-lock"),
+            profile.to_path_buf(),
+        ] {
+            File::options()
+                .read(true)
+                .open(path)?
+                .set_modified(modified)?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -555,7 +667,8 @@ mod tests {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
 
-        let plan = plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, SystemTime::now())?;
+        let plan =
+            plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, None, SystemTime::now())?;
         let candidate = plan
             .candidates
             .iter()
@@ -568,17 +681,111 @@ mod tests {
     }
 
     #[test]
-    fn atomically_resets_a_stale_profile() -> Result<()> {
+    fn plans_recent_quiescent_profiles_only_for_pressure() -> Result<()> {
         let (_temp, repo, profile) = fixture()?;
-        age_fixture(&profile)?;
+        age_fixture_by(&profile, Duration::from_secs(2 * 60 * 60))?;
+
+        let plan =
+            plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, Some(60), SystemTime::now())?;
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&profile).unwrap())
+            .context("missing debug profile")?;
+        assert_eq!(candidate.action, SweepCandidateAction::Delete);
+        assert_eq!(candidate.cleanup_class, CleanupClass::Pressure);
+        assert!(candidate
+            .activity_age_minutes
+            .is_some_and(|minutes| minutes >= 60));
+        assert!(candidate.activity_age_days.is_some_and(|days| days < 7));
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_profiles_inside_the_pressure_idle_window() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture_by(&profile, Duration::from_secs(30 * 60))?;
+
+        let plan =
+            plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, Some(60), SystemTime::now())?;
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&profile).unwrap())
+            .context("missing debug profile")?;
+        assert_eq!(candidate.action, SweepCandidateAction::Keep);
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_profile_revalidation_keeps_new_activity() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture_by(&profile, Duration::from_secs(2 * 60 * 60))?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, Some(60), SystemTime::now())?;
+        fs::write(profile.join("deps/new.rlib"), "new artifact")?;
 
         execute_cargo_profile_reset(
             &target,
             &repo,
             &plan.candidates,
-            7,
+            CargoProfileExecutionPolicy {
+                routine_days: 7,
+                pressure_idle_minutes: Some(60),
+                cleanup_class: CleanupClass::Pressure,
+                pressure_target_bytes: None,
+            },
+            "pressure-test-run",
+            Some(Duration::from_secs(10)),
+        )?;
+
+        assert!(profile.is_dir());
+        assert!(profile.join("deps/new.rlib").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_target_keeps_profiles_without_starting_reset() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture_by(&profile, Duration::from_secs(2 * 60 * 60))?;
+        let target = repo.join("target");
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, Some(60), SystemTime::now())?;
+
+        execute_cargo_profile_reset(
+            &target,
+            &repo,
+            &plan.candidates,
+            CargoProfileExecutionPolicy {
+                routine_days: 7,
+                pressure_idle_minutes: Some(60),
+                cleanup_class: CleanupClass::Pressure,
+                pressure_target_bytes: Some(0),
+            },
+            "pressure-target-test-run",
+            Some(Duration::from_secs(10)),
+        )?;
+
+        assert!(profile.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn atomically_resets_a_stale_profile() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture(&profile)?;
+        let target = repo.join("target");
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, None, SystemTime::now())?;
+
+        execute_cargo_profile_reset(
+            &target,
+            &repo,
+            &plan.candidates,
+            CargoProfileExecutionPolicy {
+                routine_days: 7,
+                pressure_idle_minutes: None,
+                cleanup_class: CleanupClass::Routine,
+                pressure_target_bytes: None,
+            },
             "test-run",
             Some(Duration::from_secs(10)),
         )?;
@@ -593,14 +800,19 @@ mod tests {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, None, SystemTime::now())?;
         fs::write(profile.join("deps/new.rlib"), "new artifact")?;
 
         execute_cargo_profile_reset(
             &target,
             &repo,
             &plan.candidates,
-            7,
+            CargoProfileExecutionPolicy {
+                routine_days: 7,
+                pressure_idle_minutes: None,
+                cleanup_class: CleanupClass::Routine,
+                pressure_target_bytes: None,
+            },
             "test-run",
             Some(Duration::from_secs(10)),
         )?;
@@ -630,7 +842,8 @@ mod tests {
 
         // Rewriting an existing output does not refresh its ancestors.
         fs::write(&output, "fresh output")?;
-        let plan = plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, SystemTime::now())?;
+        let plan =
+            plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, None, SystemTime::now())?;
         let candidate = plan
             .candidates
             .iter()
@@ -652,7 +865,7 @@ mod tests {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, None, SystemTime::now())?;
         let held = File::options()
             .read(true)
             .write(true)
@@ -670,7 +883,12 @@ mod tests {
             &target,
             &repo,
             &plan.candidates,
-            7,
+            CargoProfileExecutionPolicy {
+                routine_days: 7,
+                pressure_idle_minutes: None,
+                cleanup_class: CleanupClass::Routine,
+                pressure_target_bytes: None,
+            },
             "test-run",
             Some(Duration::from_secs(2)),
         )?;
@@ -686,7 +904,7 @@ mod tests {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, None, SystemTime::now())?;
         let held = File::options()
             .read(true)
             .write(true)
@@ -697,7 +915,12 @@ mod tests {
             &target,
             &repo,
             &plan.candidates,
-            7,
+            CargoProfileExecutionPolicy {
+                routine_days: 7,
+                pressure_idle_minutes: None,
+                cleanup_class: CleanupClass::Routine,
+                pressure_target_bytes: None,
+            },
             "test-run",
             Some(Duration::from_millis(20)),
         )
@@ -715,7 +938,7 @@ mod tests {
         fs::create_dir_all(&trash)?;
         fs::write(trash.join("artifact"), "old")?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, None, SystemTime::now())?;
         assert!(plan
             .candidates
             .iter()
@@ -725,7 +948,12 @@ mod tests {
             &target,
             &repo,
             &plan.candidates,
-            7,
+            CargoProfileExecutionPolicy {
+                routine_days: 7,
+                pressure_idle_minutes: None,
+                cleanup_class: CleanupClass::Routine,
+                pressure_target_bytes: None,
+            },
             "test-run",
             Some(Duration::from_secs(10)),
         )?;
@@ -742,7 +970,8 @@ mod tests {
             fs::write(profile.join(".cargo-lock"), "")?;
         }
 
-        let plan = plan_cargo_profile_sweep(&repo.join("target"), &repo, 0, SystemTime::now())?;
+        let plan =
+            plan_cargo_profile_sweep(&repo.join("target"), &repo, 0, None, SystemTime::now())?;
         let skipped = plan
             .candidates
             .iter()

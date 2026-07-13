@@ -400,11 +400,16 @@ fn scheduled_pressure_policy(
         pressure.stale_days > 0,
         "pressure.stale_days must be at least 1"
     );
+    anyhow::ensure!(
+        pressure.cargo_profile_idle_minutes > 0,
+        "pressure.cargo_profile_idle_minutes must be at least 1"
+    );
     Ok(Some(PressurePolicy {
         enter_bytes,
         target_bytes,
         generated_days: pressure.generated_days,
         stale_days: pressure.stale_days,
+        cargo_profile_idle_minutes: pressure.cargo_profile_idle_minutes,
         active: false,
         entered_filesystems: Vec::new(),
     }))
@@ -982,6 +987,7 @@ stale_days = 7
         assert_eq!(policy.target_bytes, 150 * 1024 * 1024 * 1024);
         assert_eq!(policy.generated_days, 1);
         assert_eq!(policy.stale_days, 7);
+        assert_eq!(policy.cargo_profile_idle_minutes, 60);
         assert!(!policy.active);
         Ok(())
     }
@@ -1002,6 +1008,12 @@ stale_days = 7
         )
         .unwrap();
         assert!(scheduled_pressure_policy(&zero_days, &cleanup).is_err());
+
+        let zero_idle: config::PressureConfig = toml::from_str(
+            "enter_free_space = '100GiB'\ntarget_free_space = '150GiB'\ncargo_profile_idle_minutes = 0",
+        )
+        .unwrap();
+        assert!(scheduled_pressure_policy(&zero_idle, &cleanup).is_err());
     }
 
     #[test]

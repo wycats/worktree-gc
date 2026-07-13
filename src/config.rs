@@ -40,6 +40,7 @@ pub(crate) struct PressureConfig {
     pub target_free_space: Option<String>,
     pub generated_days: u64,
     pub stale_days: u64,
+    pub cargo_profile_idle_minutes: u64,
 }
 
 impl PressureConfig {
@@ -55,6 +56,7 @@ impl Default for PressureConfig {
             target_free_space: None,
             generated_days: 1,
             stale_days: 7,
+            cargo_profile_idle_minutes: 60,
         }
     }
 }
@@ -186,6 +188,7 @@ enter_free_space = "100GiB"
 target_free_space = "150GiB"
 generated_days = 1
 stale_days = 7
+cargo_profile_idle_minutes = 90
 
 [history]
 retention_days = 120
@@ -205,6 +208,7 @@ retention_days = 120
         assert_eq!(pressure.target_free_space.as_deref(), Some("150GiB"));
         assert_eq!(pressure.generated_days, 1);
         assert_eq!(pressure.stale_days, 7);
+        assert_eq!(pressure.cargo_profile_idle_minutes, 90);
         assert_eq!(config.history.retention_days, 120);
         assert_eq!(config.history.repository_refresh_days, 7);
         Ok(())
