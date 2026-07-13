@@ -169,6 +169,40 @@ Or start from an empty generated-directory policy:
 cargo run -- triage --repo /path/to/repo --no-default-generated --delete-generated coverage
 ```
 
+## Storage inventory
+
+Use `inventory` to find the directories that account for a root's disk usage
+before deciding which domain-specific cleanup policy should own them:
+
+```sh
+worktree-gc inventory ~/Code ~/.codex --depth 2 --top 20
+worktree-gc inventory ~/Library/Application\ Support --depth 1 --json > inventory.json
+```
+
+The scanner visits each directory once and retains only the requested shallow
+aggregates, so `--depth` controls report detail rather than making totals
+partial. `--top` keeps the largest children beneath each displayed directory.
+`--max-entries` (default 2,000,000 across all requested roots) is a hard work
+bound; a report says `incomplete` if it reaches that limit. Traversal stays on
+each root's filesystem unless `--cross-filesystems` is explicit, never follows
+symlinks, and deduplicates hard-linked files.
+
+On macOS, directory enumeration and file accounting use `getattrlistbulk`.
+Alongside logical and allocated size, APFS reports
+`ATTR_CMNEXT_PRIVATESIZE` as `private_reclaimable_bytes`: a conservative floor
+for space immediately private to the visited files. APFS clones can share
+extents, so deleting an entire clone family can reclaim more than this floor;
+ordinary path allocation can substantially overstate the space freed by
+deleting only one clone or one pnpm-linked dependency tree. Other platforms
+report logical and allocated bytes and mark private-byte accounting incomplete.
+
+Inventory is read-only and deliberately separate from scheduled cleanup in
+this first version. Its structured output is the evidence surface for adding
+domain collectors and, later, cached physical-reclaim estimates to pressure
+ordering without turning scheduled runs into broad recursive scans.
+The durable collector contract and incremental delivery order are documented
+in [`STORAGE.md`](STORAGE.md).
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but
