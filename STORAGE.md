@@ -144,6 +144,9 @@ The implementation order is intentionally useful after every merge:
    measurement, and verification. Treat pnpm's metadata and `dlx` caches as a
    separate candidate domain: their path allocation can be mostly shared on
    APFS, and their retention contract is not the content store's prune contract.
+   Until pnpm exposes a structured plan and an interprocess prune lock, the
+   mirrored estimate is version-attributed and execution remains an explicit
+   manual delegation to pnpm rather than scheduled cleanup.
 6. **Container/VM collectors.** Treat Docker/OrbStack, Lima, and Parallels as
    separate domains. Use their public inventory/prune/compact interfaces and
    surface running or suspended state. VM deletion or archival remains an

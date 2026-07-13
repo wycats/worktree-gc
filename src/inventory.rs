@@ -121,19 +121,19 @@ impl MetricsAccumulator {
 }
 
 #[derive(Debug)]
-struct FileMeasurement {
-    logical_bytes: u64,
-    allocated_bytes: u64,
-    private_reclaimable_bytes: Option<u64>,
+pub(crate) struct FileMeasurement {
+    pub(crate) logical_bytes: u64,
+    pub(crate) allocated_bytes: u64,
+    pub(crate) private_reclaimable_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
-struct DirectoryEntryMeasurement {
-    name: std::ffi::OsString,
-    kind: EntryKind,
-    file_id: Option<u64>,
-    link_count: Option<u64>,
-    file: Option<FileMeasurement>,
+pub(crate) struct DirectoryEntryMeasurement {
+    pub(crate) name: std::ffi::OsString,
+    pub(crate) kind: EntryKind,
+    pub(crate) file_id: Option<u64>,
+    pub(crate) link_count: Option<u64>,
+    pub(crate) file: Option<FileMeasurement>,
 }
 
 #[derive(Debug)]
@@ -145,16 +145,16 @@ struct PendingHardlink {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntryKind {
+pub(crate) enum EntryKind {
     File,
     Directory,
     Other,
 }
 
 #[derive(Debug)]
-struct DirectoryVisit {
-    visited_entries: u64,
-    exhausted: bool,
+pub(crate) struct DirectoryVisit {
+    pub(crate) visited_entries: u64,
+    pub(crate) exhausted: bool,
 }
 
 #[derive(Debug)]
@@ -766,6 +766,18 @@ fn metadata_device(_metadata: &fs::Metadata) -> Option<u64> {
     None
 }
 
+pub(crate) fn visit_directory<F>(
+    path: &Path,
+    max_entries: u64,
+    visitor: &mut F,
+) -> io::Result<DirectoryVisit>
+where
+    F: FnMut(io::Result<DirectoryEntryMeasurement>),
+{
+    let mut reader = DirectoryReader::open(path)?;
+    reader.visit(path, max_entries, visitor)
+}
+
 mod portable {
     use super::*;
 
@@ -805,6 +817,33 @@ mod portable {
                         continue;
                     }
                 };
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        visitor(Err(io::Error::new(
+                            error.kind(),
+                            format!("{}: {error}", entry.path().display()),
+                        )));
+                        continue;
+                    }
+                };
+                let kind = if file_type.is_dir() {
+                    EntryKind::Directory
+                } else if file_type.is_file() {
+                    EntryKind::File
+                } else {
+                    EntryKind::Other
+                };
+                if kind == EntryKind::Other {
+                    visitor(Ok(DirectoryEntryMeasurement {
+                        name: entry.file_name(),
+                        kind,
+                        file_id: None,
+                        link_count: None,
+                        file: None,
+                    }));
+                    continue;
+                }
                 let metadata = match entry.metadata() {
                     Ok(metadata) => metadata,
                     Err(error) => {
@@ -814,13 +853,6 @@ mod portable {
                         )));
                         continue;
                     }
-                };
-                let kind = if metadata.is_dir() {
-                    EntryKind::Directory
-                } else if metadata.is_file() {
-                    EntryKind::File
-                } else {
-                    EntryKind::Other
                 };
                 visitor(Ok(DirectoryEntryMeasurement {
                     name: entry.file_name(),
@@ -1476,6 +1508,28 @@ mod tests {
         assert!(metrics.private_reclaimable_complete);
         assert!(metrics.private_reclaimable_bytes >= 4096);
         assert_eq!(metrics.private_reclaimable_bytes, metrics.allocated_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_directory_visit_keeps_symlinks_opaque() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        write_bytes(&external.join("data"), 4096);
+        std::os::unix::fs::symlink(&external, temp.path().join("linked")).unwrap();
+
+        let mut entries = Vec::new();
+        let visit = portable::DirectoryReader::open(temp.path())
+            .unwrap()
+            .visit(10, &mut |entry| entries.push(entry.unwrap()))
+            .unwrap();
+
+        assert_eq!(visit.visited_entries, 2);
+        assert!(visit.exhausted);
+        let linked = entries.iter().find(|entry| entry.name == "linked").unwrap();
+        assert_eq!(linked.kind, EntryKind::Other);
+        assert!(linked.file.is_none());
     }
 
     fn write_bytes(path: &Path, length: usize) {

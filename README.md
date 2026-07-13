@@ -221,6 +221,54 @@ incomplete instead of hiding every later sibling.
 The durable collector contract and incremental delivery order are documented
 in [`STORAGE.md`](STORAGE.md).
 
+## pnpm shared-store collection
+
+The first machine-wide collector wraps pnpm's maintained prune operation. A
+plain invocation is read-only:
+
+```sh
+worktree-gc collect pnpm
+worktree-gc collect pnpm --dlx-days 7 --max-entries 2000000 --scan-threads 1
+```
+
+The collector asks pnpm for its canonical store, resolves pnpm's cache, and
+records a bounded advisory estimate of the content, metadata, temporary, and
+expired/orphaned dlx surfaces maintained by `pnpm store prune`. The estimate is
+not deletion authority: pnpm's own command decides what it removes. Because
+pnpm does not expose a dry-run or structured prune plan, the first planner is
+explicitly tied to the locally reviewed pnpm 10.32.1 semantics and remains
+report-only for any other version. The manifest records this provenance beside
+the executable/version, eligibility digest, measurements, filesystem
+observations, protections, and active pnpm owners.
+
+Content prefixes are independent and support bounded parallelism. One scan
+thread is the deliberately low-load default; increase `--scan-threads` only
+when inventory latency matters more than interactive machine load. The global
+entry budget is divided deterministically across prefixes, so concurrency
+cannot expand the scan.
+
+Execution remains explicit:
+
+```sh
+worktree-gc collect pnpm --dlx-days 7 --execute
+```
+
+Before delegation, worktree-gc locks the collector, reloads protections,
+repeats the bounded eligibility snapshot, and aborts if anything changed. It
+then runs pnpm's official `store prune` with the configured dlx TTL and records
+the realized free-space change. Owner checks are PID-scoped instead of taking a
+full-machine open-file snapshot. An unsupported pnpm version, active pnpm
+process, incomplete scan, active protection, or pnpm global virtual-store
+layout keeps the operation report-only. The global virtual store needs a
+separate project-reachability planner before it can satisfy the same review
+boundary.
+
+This collector is manual rather than part of scheduled cleanup: pnpm does not
+offer an interprocess prune lock that worktree-gc can acquire atomically with
+its owner checks. Its manifests live under
+`$XDG_STATE_HOME/worktree-gc/collectors` (or
+`~/.local/state/worktree-gc/collectors`).
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but
