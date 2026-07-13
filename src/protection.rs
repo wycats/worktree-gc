@@ -309,8 +309,10 @@ fn read_active_protections(registry_path: &Path, now: SystemTime) -> Result<Vec<
     }
     for lease in &registry.leases {
         let mut dormant = false;
-        for prefix in lease.path.ancestors().collect::<Vec<_>>().into_iter().rev() {
-            match fs::symlink_metadata(prefix) {
+        let mut prefix = PathBuf::with_capacity(lease.path.as_os_str().len());
+        for component in lease.path.components() {
+            prefix.push(component.as_os_str());
+            match fs::symlink_metadata(&prefix) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     bail!(
                         "active protection path {} for lease {} in {} is not canonical",
