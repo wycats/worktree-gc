@@ -5,12 +5,13 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories, inventory,
-    list_protections, print_cleanup, print_inventory, print_root_cleanup, print_root_triage,
-    print_triage, remove_protection, renew_protection, triage, triage_roots, CleanupOptions,
-    GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit, SweepStrategy, SweepTool,
-    TriageOptions, DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
-    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    add_protection, cleanup, cleanup_repositories_with_parallelism, cleanup_roots,
+    discover_repositories_bounded, inventory, list_protections, print_cleanup, print_inventory,
+    print_root_cleanup, print_root_triage, print_triage, remove_protection, renew_protection,
+    triage, triage_roots, CleanupOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy,
+    SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
+    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -508,6 +509,10 @@ fn main() -> Result<()> {
                 config_path.display()
             );
             anyhow::ensure!(
+                scheduled.cleanup.max_parallelism > 0,
+                "cleanup.max_parallelism must be at least 1"
+            );
+            anyhow::ensure!(
                 repo.is_none() && roots.is_empty(),
                 "scheduled mode reads roots from {}; do not pass --repo or --root",
                 config_path.display()
@@ -533,9 +538,15 @@ fn main() -> Result<()> {
                 &scheduled.roots,
                 scheduled.history.repository_refresh_days,
                 refresh_repositories,
+                scheduled.cleanup.max_parallelism,
                 now,
             )?;
-            let run = cleanup_repositories(&scheduled.roots, &repositories, options)?;
+            let run = cleanup_repositories_with_parallelism(
+                &scheduled.roots,
+                &repositories,
+                options,
+                scheduled.cleanup.max_parallelism,
+            )?;
             print_root_cleanup(&run);
             if !dry_run {
                 let removed = config::prune_history(scheduled.history.retention_days, now)?;
@@ -621,6 +632,7 @@ fn scheduled_repositories(
     roots: &[PathBuf],
     refresh_days: u64,
     force_refresh: bool,
+    max_parallelism: usize,
     now: SystemTime,
 ) -> Result<Vec<PathBuf>> {
     let mut canonical_roots = roots
@@ -657,7 +669,7 @@ fn scheduled_repositories(
         }
     }
 
-    let repositories = discover_repositories(&canonical_roots)?;
+    let repositories = discover_repositories_bounded(&canonical_roots, max_parallelism)?;
     let index = RepositoryIndex {
         generated_at_unix: now_unix,
         roots: canonical_roots,

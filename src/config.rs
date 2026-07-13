@@ -17,6 +17,7 @@ pub(crate) struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CleanupConfig {
+    pub max_parallelism: usize,
     pub stale_days: u64,
     pub generated_days: u64,
     pub generated_windows: BTreeMap<String, u64>,
@@ -62,6 +63,7 @@ impl Default for PressureConfig {
 impl Default for CleanupConfig {
     fn default() -> Self {
         Self {
+            max_parallelism: 1,
             stale_days: 14,
             generated_days: 7,
             generated_windows: BTreeMap::new(),
@@ -175,6 +177,7 @@ mod tests {
 roots = ["/code", "/plugins"]
 
 [cleanup]
+max_parallelism = 3
 stale_days = 12
 generated_days = 9
 generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
@@ -193,6 +196,7 @@ retention_days = 120
         )?;
 
         assert_eq!(config.roots.len(), 2);
+        assert_eq!(config.cleanup.max_parallelism, 3);
         assert_eq!(config.cleanup.stale_days, 12);
         assert_eq!(config.cleanup.generated_days, 9);
         assert_eq!(config.cleanup.generated_windows[".next"], 7);
@@ -213,5 +217,10 @@ retention_days = 120
     #[test]
     fn rejects_unknown_configuration() {
         assert!(toml::from_str::<Config>("root = ['/code']").is_err());
+    }
+
+    #[test]
+    fn scheduled_cleanup_defaults_to_one_worker() {
+        assert_eq!(CleanupConfig::default().max_parallelism, 1);
     }
 }
