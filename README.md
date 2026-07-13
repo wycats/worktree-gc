@@ -202,7 +202,9 @@ domain collectors and, later, cached physical-reclaim estimates to pressure
 ordering without turning scheduled runs into broad recursive scans.
 For multi-root scans, the global entry budget is divided fairly across the
 remaining roots and unused shares flow forward, so one large tree cannot hide
-every later storage domain.
+every later storage domain. Within a root, queued sibling directories share the
+remaining root budget for the same reason: a wide early subtree is reported as
+incomplete instead of hiding every later sibling.
 The durable collector contract and incremental delivery order are documented
 in [`STORAGE.md`](STORAGE.md).
 
