@@ -14,10 +14,12 @@ tool understands.
 
 ## Inventory contract
 
-An inventory scan visits each requested root once and aggregates descendants
-into a shallow report tree. `display_depth` and `top` bound retained report
-state; `max_entries` bounds filesystem work. The scanner stays on one
-filesystem by default, does not follow symlinks, and deduplicates hard links.
+An inventory scan visits each requested directory root once and aggregates
+descendants into a shallow report tree. An exact file root is measured directly
+without enumerating its parent directory. `display_depth` and `top` bound
+retained report state; `max_entries` bounds filesystem work. The scanner stays
+on one filesystem by default, does not follow symlinks, and deduplicates hard
+links.
 Multi-root scans divide the remaining global budget across the remaining roots;
 small roots return unused entries to the pool for later roots. Queued sibling
 directories likewise share the remaining root budget, so a wide early subtree
@@ -40,6 +42,7 @@ whose siblings remain outside the root contributes no reclaimable bytes.
 
 The macOS backend uses `getattrlistbulk`, which returns directory names, types,
 file IDs, logical/allocated sizes, link counts, and APFS private size in batches.
+Exact file roots use `getattrlist` for the same APFS private-size attribute.
 Other platforms use a portable directory iterator and mark private accounting
 incomplete. A filesystem that rejects the extended macOS attributes falls back
 to the portable path.
