@@ -4,21 +4,18 @@ use serde::Serialize;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use walkdir::WalkDir;
 
-use crate::cargo_incremental::with_cargo_profile_locks_timeout;
+use crate::cargo_incremental::{with_cargo_profile_locks_timeout, TRASH_DIR_NAME};
 use crate::SweepCandidateAction;
 
 // Cargo build-script outputs commonly live below build/<unit>/out, and
 // generated files can add another directory or two. Keep this bounded while
 // sampling deeply enough that rewriting an existing output is visible.
 const PROFILE_ACTIVITY_SAMPLE_DEPTH: usize = 6;
-const MIN_CARGO_CLEAN_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CargoProfileCandidateDecision {
@@ -54,6 +51,32 @@ pub(crate) fn plan_cargo_profile_sweep(
     };
 
     let mut candidates = Vec::new();
+    let trash_root = context.build_dir.join(TRASH_DIR_NAME);
+    if trash_root.exists() {
+        let metadata = fs::symlink_metadata(&trash_root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("invalid Cargo profile quarantine {}", trash_root.display());
+        }
+        for entry in fs::read_dir(&trash_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                bail!("invalid Cargo profile quarantine entry {}", path.display());
+            }
+            let last_activity_unix = metadata.modified().ok().and_then(system_time_to_unix);
+            candidates.push(CargoProfileCandidateDecision {
+                path,
+                lock_path: trash_root.clone(),
+                cargo_profile: None,
+                last_activity_unix,
+                last_activity: last_activity_unix.map(format_unix_time),
+                activity_age_days: last_activity_unix.and_then(|unix| age_days(now, unix)),
+                action: SweepCandidateAction::RecoverTrash,
+                reason: "recover profile quarantine from an interrupted run".to_string(),
+            });
+        }
+    }
     for entry in WalkDir::new(&context.build_dir)
         .follow_links(false)
         .min_depth(2)
@@ -87,7 +110,7 @@ pub(crate) fn plan_cargo_profile_sweep(
             candidates.push(skipped_candidate(
                 profile_dir,
                 lock_path,
-                "cross-target Cargo profiles are not yet mapped to a stable cargo clean invocation",
+                "cross-target Cargo profiles are not yet mapped to a stable profile reset boundary",
             ));
             continue;
         }
@@ -169,14 +192,31 @@ pub(crate) fn plan_cargo_profile_sweep(
     })
 }
 
-pub(crate) fn execute_cargo_profile_sweep(
+pub(crate) fn execute_cargo_profile_reset(
     target_dir: &Path,
     worktree: &Path,
-    project_dir: &Path,
     candidates: &[CargoProfileCandidateDecision],
     days: u64,
+    run_id: &str,
     timeout: Option<Duration>,
 ) -> Result<()> {
+    let target_dir = fs::canonicalize(target_dir)
+        .with_context(|| format!("failed to resolve {}", target_dir.display()))?;
+    let trash_root = target_dir.join(TRASH_DIR_NAME);
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.action == SweepCandidateAction::RecoverTrash)
+    {
+        if candidate.path.parent() != Some(trash_root.as_path()) {
+            bail!(
+                "profile quarantine candidate is outside {}: {}",
+                trash_root.display(),
+                candidate.path.display()
+            );
+        }
+        remove_quarantine_entry(&candidate.path)?;
+    }
+
     for candidate in candidates
         .iter()
         .filter(|candidate| candidate.action == SweepCandidateAction::Delete)
@@ -187,7 +227,7 @@ pub(crate) fn execute_cargo_profile_sweep(
         if !candidate.path.exists() {
             continue;
         }
-        if !profile_is_stale(target_dir, worktree, &candidate.path, profile, days)? {
+        if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
             eprintln!(
                 "  keeping refreshed Cargo profile {}",
                 candidate.path.display()
@@ -195,80 +235,99 @@ pub(crate) fn execute_cargo_profile_sweep(
             continue;
         }
 
-        // Establish a quiet boundary before asking Cargo to clean. The lock is
-        // released before spawning Cargo because Cargo owns the public cleanup
-        // transaction and acquires the same profile lock itself.
-        with_cargo_profile_locks_timeout(target_dir, worktree, timeout, || ())?;
-        if !profile_is_stale(target_dir, worktree, &candidate.path, profile, days)? {
-            eprintln!(
-                "  keeping Cargo profile refreshed while waiting for its lock {}",
-                candidate.path.display()
-            );
-            continue;
+        let quarantined = with_cargo_profile_locks_timeout(
+            &target_dir,
+            worktree,
+            timeout,
+            || -> Result<Option<PathBuf>> {
+                if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
+                    eprintln!(
+                        "  keeping Cargo profile refreshed while waiting for its lock {}",
+                        candidate.path.display()
+                    );
+                    return Ok(None);
+                }
+                let metadata = fs::symlink_metadata(&candidate.path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!(
+                        "refusing to reset replaced Cargo profile {}",
+                        candidate.path.display()
+                    );
+                }
+                if candidate.path.parent() != Some(target_dir.as_path()) {
+                    bail!(
+                        "Cargo profile is not a direct child of {}: {}",
+                        target_dir.display(),
+                        candidate.path.display()
+                    );
+                }
+                let run_trash = trash_root.join(run_id);
+                fs::create_dir_all(&run_trash)?;
+                let destination = run_trash.join(
+                    candidate
+                        .path
+                        .file_name()
+                        .context("Cargo profile has no directory name")?,
+                );
+                if destination.exists() {
+                    bail!(
+                        "profile quarantine already exists: {}",
+                        destination.display()
+                    );
+                }
+                fs::rename(&candidate.path, &destination).with_context(|| {
+                    format!(
+                        "failed to quarantine stale Cargo profile {}",
+                        candidate.path.display()
+                    )
+                })?;
+                Ok(Some(destination))
+            },
+        )??;
+        if let Some(quarantined) = quarantined {
+            remove_quarantine_entry(&quarantined)?;
+            remove_empty_ancestors(&quarantined, &trash_root)?;
+            eprintln!("  reset stale Cargo profile {}", candidate.path.display());
         }
-
-        let mut child = Command::new("cargo")
-            .args(["clean", "--profile", profile, "--manifest-path"])
-            .arg(project_dir.join("Cargo.toml"))
-            .current_dir(project_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to start Cargo profile cleanup for {}",
-                    candidate.path.display()
-                )
-            })?;
-        wait_for_cargo_clean(&mut child, cargo_clean_timeout(timeout), &candidate.path)?;
     }
     Ok(())
 }
 
-fn wait_for_cargo_clean(
-    child: &mut std::process::Child,
-    timeout: Option<Duration>,
-    profile_dir: &Path,
-) -> Result<()> {
-    let started = Instant::now();
-    let mut next_progress = Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if status.success() {
-                return Ok(());
-            }
-            bail!(
-                "cargo clean failed for {} with status {status}",
-                profile_dir.display()
-            );
-        }
-        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "timed out waiting for cargo clean of {}",
-                    profile_dir.display()
-                ),
-            )
-            .into());
-        }
-        if started.elapsed() >= next_progress {
-            eprintln!(
-                "  waiting for Cargo to clean {} ({:.0}s)",
-                profile_dir.display(),
-                started.elapsed().as_secs_f64()
-            );
-            next_progress += Duration::from_secs(10);
-        }
-        thread::sleep(Duration::from_millis(100));
+fn remove_quarantine_entry(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
     }
+    .with_context(|| format!("failed to remove profile quarantine {}", path.display()))
 }
 
-fn cargo_clean_timeout(lock_timeout: Option<Duration>) -> Option<Duration> {
-    lock_timeout.map(|timeout| timeout.max(MIN_CARGO_CLEAN_TIMEOUT))
+fn remove_empty_ancestors(path: &Path, trash_root: &Path) -> Result<()> {
+    if let Some(run_trash) = path.parent() {
+        match fs::remove_dir(run_trash) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match fs::remove_dir(trash_root) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn profile_is_stale(
@@ -324,7 +383,7 @@ fn resolve_build_context(target_dir: &Path, worktree: &Path) -> Result<BuildCont
         .no_deps();
     let metadata = command.exec().with_context(|| {
         format!(
-            "cargo metadata failed for profile cleanup at {}",
+            "cargo metadata failed for profile reset at {}",
             manifest_path.display()
         )
     })?;
@@ -443,6 +502,7 @@ fn format_unix_time(unix: i64) -> String {
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::thread;
     use tempfile::TempDir;
 
     fn fixture() -> Result<(TempDir, PathBuf, PathBuf)> {
@@ -492,18 +552,18 @@ mod tests {
     }
 
     #[test]
-    fn delegates_profile_deletion_to_cargo_clean() -> Result<()> {
+    fn atomically_resets_a_stale_profile() -> Result<()> {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
         let target = repo.join("target");
         let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
 
-        execute_cargo_profile_sweep(
+        execute_cargo_profile_reset(
             &target,
-            &repo,
             &repo,
             &plan.candidates,
             7,
+            "test-run",
             Some(Duration::from_secs(10)),
         )?;
 
@@ -520,12 +580,12 @@ mod tests {
         let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
         fs::write(profile.join("deps/new.rlib"), "new artifact")?;
 
-        execute_cargo_profile_sweep(
+        execute_cargo_profile_reset(
             &target,
-            &repo,
             &repo,
             &plan.candidates,
             7,
+            "test-run",
             Some(Duration::from_secs(10)),
         )?;
 
@@ -583,12 +643,12 @@ mod tests {
             Ok(())
         });
 
-        execute_cargo_profile_sweep(
+        execute_cargo_profile_reset(
             &target,
-            &repo,
             &repo,
             &plan.candidates,
             7,
+            "test-run",
             Some(Duration::from_secs(2)),
         )?;
         refresher.join().expect("refresher thread panicked")?;
@@ -599,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_cleanup_obeys_the_scheduled_lock_timeout() -> Result<()> {
+    fn profile_reset_obeys_the_scheduled_lock_timeout() -> Result<()> {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
         let target = repo.join("target");
@@ -610,12 +670,12 @@ mod tests {
             .open(profile.join(".cargo-lock"))?;
         held.lock()?;
 
-        let error = execute_cargo_profile_sweep(
+        let error = execute_cargo_profile_reset(
             &target,
-            &repo,
             &repo,
             &plan.candidates,
             7,
+            "test-run",
             Some(Duration::from_millis(20)),
         )
         .expect_err("contended Cargo profile should time out");
@@ -626,16 +686,28 @@ mod tests {
     }
 
     #[test]
-    fn cargo_clean_uses_a_distinct_longer_execution_timeout() {
-        assert_eq!(
-            cargo_clean_timeout(Some(Duration::from_secs(30 * 60))),
-            Some(MIN_CARGO_CLEAN_TIMEOUT)
-        );
-        assert_eq!(
-            cargo_clean_timeout(Some(Duration::from_secs(3 * 60 * 60))),
-            Some(Duration::from_secs(3 * 60 * 60))
-        );
-        assert_eq!(cargo_clean_timeout(None), None);
+    fn interrupted_profile_quarantine_is_recovered() -> Result<()> {
+        let (_temp, repo, _profile) = fixture()?;
+        let trash = repo.join("target/.worktree-gc-trash/interrupted/debug");
+        fs::create_dir_all(&trash)?;
+        fs::write(trash.join("artifact"), "old")?;
+        let target = repo.join("target");
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        assert!(plan
+            .candidates
+            .iter()
+            .any(|candidate| candidate.action == SweepCandidateAction::RecoverTrash));
+
+        execute_cargo_profile_reset(
+            &target,
+            &repo,
+            &plan.candidates,
+            7,
+            "test-run",
+            Some(Duration::from_secs(10)),
+        )?;
+        assert!(!repo.join("target/.worktree-gc-trash/interrupted").exists());
+        Ok(())
     }
 
     #[test]

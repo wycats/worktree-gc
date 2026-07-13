@@ -7,7 +7,7 @@ use cargo_incremental::{
     cargo_profile_locks_present, cargo_project_dir, execute_incremental_sweep_with_timeout,
     is_cargo_lock_timeout, plan_incremental_sweep, with_cargo_profile_locks_timeout,
 };
-use cargo_profiles::{execute_cargo_profile_sweep, plan_cargo_profile_sweep};
+use cargo_profiles::{execute_cargo_profile_reset, plan_cargo_profile_sweep};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -291,7 +291,7 @@ pub struct SweepStrategy {
 #[serde(rename_all = "kebab-case")]
 pub enum SweepTool {
     RustcIncremental,
-    CargoCleanProfiles,
+    CargoProfileReset,
     CargoSweep,
 }
 
@@ -331,10 +331,12 @@ impl SweepDecision {
                     SweepCandidateAction::Delete | SweepCandidateAction::RecoverTrash
                 )
             })
-            || self
-                .profile_candidates
-                .iter()
-                .any(|candidate| candidate.action == SweepCandidateAction::Delete)
+            || self.profile_candidates.iter().any(|candidate| {
+                matches!(
+                    candidate.action,
+                    SweepCandidateAction::Delete | SweepCandidateAction::RecoverTrash
+                )
+            })
     }
 }
 
@@ -419,7 +421,7 @@ impl GeneratedDirConfig {
             });
             sweeps.push(SweepStrategy {
                 name: "target".to_string(),
-                tool: SweepTool::CargoCleanProfiles,
+                tool: SweepTool::CargoProfileReset,
                 limit: SweepLimit::AgeDays {
                     days: DEFAULT_CARGO_PROFILE_SWEEP_DAYS,
                 },
@@ -713,7 +715,13 @@ pub fn cleanup_repositories(
 ) -> Result<RootCleanupRun> {
     let roots = canonicalize_roots(roots)?;
     let pressure = if let Some(policy) = options.pressure.as_mut() {
-        let observations = observe_free_space(&roots)?;
+        let observation_paths = pressure_observation_paths(
+            &roots,
+            repositories,
+            &options.generated_config,
+            options.now,
+        )?;
+        let observations = observe_free_space(&observation_paths)?;
         for observation in &observations {
             if policy.target_bytes > observation.total_bytes {
                 bail!(
@@ -801,7 +809,18 @@ pub fn cleanup_repositories(
                 )?;
             }
         }
-        let final_observations = observe_free_space(&manifest.roots)?;
+        let final_paths = manifest
+            .pressure
+            .as_ref()
+            .map(|pressure| {
+                pressure
+                    .observations
+                    .iter()
+                    .map(|observation| observation.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| manifest.roots.clone());
+        let final_observations = observe_free_space(&final_paths)?;
         if let Some(pressure) = &mut manifest.pressure {
             pressure.final_observations = Some(final_observations);
             write_root_manifest(&manifest)?;
@@ -815,19 +834,50 @@ pub fn cleanup_repositories(
 }
 
 fn observe_free_space(paths: &[PathBuf]) -> Result<Vec<PressureObservation>> {
-    paths
-        .iter()
-        .map(|path| {
-            Ok(PressureObservation {
-                path: path.clone(),
-                available_bytes: fs4::available_space(path)
-                    .with_context(|| format!("failed to read free space for {}", path.display()))?,
-                total_bytes: fs4::total_space(path).with_context(|| {
-                    format!("failed to read filesystem capacity for {}", path.display())
-                })?,
-            })
-        })
-        .collect()
+    let mut seen_filesystems = HashSet::new();
+    let mut observations = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        if !seen_filesystems.insert(filesystem_key(path)?) {
+            continue;
+        }
+        observations.push(PressureObservation {
+            path: path.clone(),
+            available_bytes: fs4::available_space(path)
+                .with_context(|| format!("failed to read free space for {}", path.display()))?,
+            total_bytes: fs4::total_space(path).with_context(|| {
+                format!("failed to read filesystem capacity for {}", path.display())
+            })?,
+        });
+    }
+    Ok(observations)
+}
+
+fn pressure_observation_paths(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    generated_config: &GeneratedDirConfig,
+    now: SystemTime,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = roots.to_vec();
+    for repository in repositories {
+        let context = repo_context(Some(repository))?;
+        let worktrees = inspect_worktrees(&context, now)?;
+        for worktree in worktrees
+            .iter()
+            .filter(|worktree| worktree.exists && worktree.prunable.is_none())
+        {
+            paths.push(worktree.path.clone());
+            paths.extend(
+                generated_candidates(worktree, generated_config)?
+                    .into_iter()
+                    .map(|candidate| candidate.path),
+            );
+        }
+    }
+    Ok(paths)
 }
 
 fn refresh_and_execute_repository(
@@ -1845,14 +1895,14 @@ fn plan_sweep_decisions(
                     profile_candidates: Vec::new(),
                 })
             }
-            SweepTool::CargoCleanProfiles => {
+            SweepTool::CargoProfileReset => {
                 let days = strategy
                     .limit
                     .age_days()
-                    .context("cargo-clean-profiles requires an age-days limit")?;
+                    .context("cargo-profile-reset requires an age-days limit")?;
                 let plan = plan_cargo_profile_sweep(target_dir, worktree, days, now)?;
                 Ok(SweepDecision {
-                    tool: SweepTool::CargoCleanProfiles,
+                    tool: SweepTool::CargoProfileReset,
                     limit: strategy.limit.clone(),
                     delegated: false,
                     project_dir: cargo_project_dir(target_dir, worktree),
@@ -2686,21 +2736,17 @@ fn run_sweeps(
                     cargo_lock_timeout,
                 )?;
             }
-            SweepTool::CargoCleanProfiles => {
+            SweepTool::CargoProfileReset => {
                 let days = sweep
                     .limit
                     .age_days()
-                    .context("cargo-clean-profiles requires an age-days limit")?;
-                let project_dir = sweep
-                    .project_dir
-                    .as_deref()
-                    .context("cargo-clean-profiles requires a Cargo project directory")?;
-                execute_cargo_profile_sweep(
+                    .context("cargo-profile-reset requires an age-days limit")?;
+                execute_cargo_profile_reset(
                     &decision.path,
                     &decision.worktree_path,
-                    project_dir,
                     &sweep.profile_candidates,
                     days,
+                    run_id,
                     cargo_lock_timeout,
                 )?;
             }
@@ -3012,7 +3058,7 @@ fn print_sweep_candidates<'a>(dirs: impl IntoIterator<Item = (&'a Path, &'a [Swe
         return;
     }
     println!();
-    println!("Cargo profile cleanup candidates: {}", profiles.len());
+    println!("Cargo profile reset candidates: {}", profiles.len());
     for (target, sweep, candidate) in profiles.iter().take(50) {
         let activity = candidate
             .activity_age_days
@@ -3034,7 +3080,7 @@ fn print_sweep_candidates<'a>(dirs: impl IntoIterator<Item = (&'a Path, &'a [Swe
 fn sweep_tool_name(tool: &SweepTool) -> &'static str {
     match tool {
         SweepTool::RustcIncremental => "rustc-incremental",
-        SweepTool::CargoCleanProfiles => "cargo-clean-profiles",
+        SweepTool::CargoProfileReset => "cargo-profile-reset",
         SweepTool::CargoSweep => "cargo-sweep",
     }
 }
@@ -3395,7 +3441,7 @@ mod tests {
         assert_eq!(
             target_sweeps
                 .iter()
-                .find(|strategy| strategy.tool == SweepTool::CargoCleanProfiles)
+                .find(|strategy| strategy.tool == SweepTool::CargoProfileReset)
                 .map(|strategy| &strategy.limit),
             Some(&SweepLimit::AgeDays {
                 days: DEFAULT_CARGO_PROFILE_SWEEP_DAYS
@@ -3598,7 +3644,7 @@ mod tests {
         let profile_sweep = target
             .sweeps
             .iter()
-            .find(|sweep| sweep.tool == SweepTool::CargoCleanProfiles)
+            .find(|sweep| sweep.tool == SweepTool::CargoProfileReset)
             .context("missing default Cargo profile sweep")?;
         assert_eq!(
             profile_sweep.limit,
@@ -4555,6 +4601,34 @@ mod tests {
         assert!(error
             .to_string()
             .contains("exceeds total filesystem capacity"));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_observes_repository_worktrees_and_generated_candidates() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let linked = temp.path().join("pressure-linked");
+        add_worktree(&repo, &linked, "pressure-linked-branch")?;
+        fs::create_dir_all(linked.join("target/debug"))?;
+        fs::write(linked.join("target/debug/.cargo-lock"), "")?;
+
+        let paths = pressure_observation_paths(
+            &[temp.path().to_path_buf()],
+            std::slice::from_ref(&repo),
+            &GeneratedDirConfig::default(),
+            now(),
+        )?;
+        let linked = fs::canonicalize(linked)?;
+        assert!(paths.contains(&linked));
+        assert!(paths.contains(&linked.join("target")));
+
+        let observations = observe_free_space(&paths)?;
+        let device_count = paths
+            .iter()
+            .map(|path| filesystem_key(path))
+            .collect::<Result<HashSet<_>>>()?
+            .len();
+        assert_eq!(observations.len(), device_count);
         Ok(())
     }
 

@@ -93,11 +93,11 @@ cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-u
 ```
 
 Active Rust `target` directories receive a built-in incremental-cache sweep
-during ordinary cleanup planning. They also receive a Cargo-owned profile
-cleanup pass. Rustc incremental roots with no session activity for 14 days are
+during ordinary cleanup planning. They also receive an atomic profile-reset
+pass. Rustc incremental roots with no session activity for 14 days are
 selected for in-place pruning; host Cargo profiles such as `debug` and
-`release` that have been inactive for 7 days are delegated to stable
-`cargo clean --profile`. A whole `target` directory that has been inactive for
+`release` that have been inactive for 7 days are reset as a unit while holding
+their Cargo profile locks. A whole `target` directory that has been inactive for
 3 days remains a wholesale deletion candidate. The dry run records every
 incremental root and Cargo profile, including its path, newest activity, age,
 and planned action.
@@ -111,10 +111,10 @@ cargo run -- cleanup --repo /path/to/repo --sweep target=rustc-incremental:7 --e
 Override the Cargo profile window independently:
 
 ```sh
-cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-clean-profiles:14 --execute
+cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-profile-reset:14 --execute
 ```
 
-Profile cleanup deliberately works at Cargo's public profile boundary instead
+Profile reset deliberately works at Cargo's profile boundary instead
 of interpreting private fingerprint JSON or reconstructing artifact hashes.
 This reclaims the profile's `deps`, `.fingerprint`, `build`, and incremental
 outputs together while preserving other profiles. Cross-target profiles are
@@ -123,7 +123,7 @@ map their output directory back to the exact target specification.
 
 Before pruning, `worktree-gc` verifies the directory against `cargo metadata`
 and leaves shared or external build directories untouched. Execution waits for
-Cargo's profile lock, rechecks activity, atomically moves stale roots into a
+Cargo's profile lock, rechecks activity, atomically moves the stale profile into a
 tool-owned quarantine, releases the lock, and then deletes the quarantine. A
 later execution recovers quarantine left by an interrupted run.
 
@@ -137,7 +137,7 @@ cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-sweep:max-size=50
 ```
 
 When multiple strategies are configured, the built-in incremental sweep runs
-first, followed by Cargo profile cleanup and then the legacy backend.
+first, followed by Cargo profile reset and then the legacy backend.
 `cargo-sweep` intentionally leaves rustc's `incremental/` cache
 directories alone and requires `cargo-sweep` on `PATH`
 (`cargo install cargo-sweep`). Before invoking it, `worktree-gc` verifies the
@@ -155,7 +155,7 @@ Generated directory defaults are:
 - delete candidates: `node_modules`, `.next`, `.turbo`, `target`
 - report-only candidates: `dist`
 - in-place sweeps: `target=rustc-incremental:14`
-- Cargo profile cleanup: `target=cargo-clean-profiles:7`
+- Atomic Cargo profile reset: `target=cargo-profile-reset:7`
 
 You can add repo-specific generated directory names:
 

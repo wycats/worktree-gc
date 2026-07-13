@@ -188,7 +188,7 @@ struct GeneratedArgs {
         value_name = "NAME=TOOL:LIMIT",
         value_delimiter = ',',
         value_parser = parse_sweep_strategy,
-        help = "In-place pruning for active dirs (e.g. target=rustc-incremental:14, target=cargo-clean-profiles:7, or target=cargo-sweep:max-size=50GB); repeat or comma-separate"
+        help = "In-place pruning for active dirs (e.g. target=rustc-incremental:14, target=cargo-profile-reset:7, or target=cargo-sweep:max-size=50GB); repeat or comma-separate"
     )]
     sweep: Vec<SweepStrategy>,
 
@@ -233,11 +233,11 @@ fn parse_sweep_strategy(raw: &str) -> Result<SweepStrategy, String> {
         .ok_or_else(|| format!("expected TOOL:LIMIT in '{raw}'"))?;
     let tool = match tool.trim() {
         "rustc-incremental" => SweepTool::RustcIncremental,
-        "cargo-clean-profiles" => SweepTool::CargoCleanProfiles,
+        "cargo-profile-reset" => SweepTool::CargoProfileReset,
         "cargo-sweep" => SweepTool::CargoSweep,
         other => {
             return Err(format!(
-                "unknown sweep tool '{other}' (supported: rustc-incremental, cargo-clean-profiles, cargo-sweep)"
+                "unknown sweep tool '{other}' (supported: rustc-incremental, cargo-profile-reset, cargo-sweep)"
             ))
         }
     };
@@ -287,7 +287,7 @@ impl GeneratedArgs {
 fn tool_name(tool: &SweepTool) -> &'static str {
     match tool {
         SweepTool::RustcIncremental => "rustc-incremental",
-        SweepTool::CargoCleanProfiles => "cargo-clean-profiles",
+        SweepTool::CargoProfileReset => "cargo-profile-reset",
         SweepTool::CargoSweep => "cargo-sweep",
     }
 }
@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(
             sweeps
                 .iter()
-                .find(|strategy| strategy.tool == SweepTool::CargoCleanProfiles)
+                .find(|strategy| strategy.tool == SweepTool::CargoProfileReset)
                 .map(|strategy| &strategy.limit),
             Some(&SweepLimit::AgeDays {
                 days: worktree_gc::DEFAULT_CARGO_PROFILE_SWEEP_DAYS
@@ -828,12 +828,12 @@ mod tests {
     }
 
     #[test]
-    fn cargo_clean_profiles_accepts_an_age_limit() {
-        let strategy = parse_sweep_strategy("target=cargo-clean-profiles:9")
+    fn cargo_profile_reset_accepts_an_age_limit() {
+        let strategy = parse_sweep_strategy("target=cargo-profile-reset:9")
             .expect("Cargo profile strategy should parse");
-        assert_eq!(strategy.tool, SweepTool::CargoCleanProfiles);
+        assert_eq!(strategy.tool, SweepTool::CargoProfileReset);
         assert_eq!(strategy.limit, SweepLimit::AgeDays { days: 9 });
-        assert!(parse_sweep_strategy("target=cargo-clean-profiles:max-size=1GB").is_err());
+        assert!(parse_sweep_strategy("target=cargo-profile-reset:max-size=1GB").is_err());
     }
 
     #[test]
