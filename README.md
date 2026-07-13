@@ -256,6 +256,8 @@ roots = [
 ]
 
 [cleanup]
+# Total worker budget across repository, worktree, and generated scans.
+max_parallelism = 1
 stale_days = 14
 generated_days = 7
 # Per-directory entries override generated_days and any tighter built-in window.
@@ -282,6 +284,13 @@ repository_refresh_days = 7
 `--generated-window NAME=DAYS` arguments and applies to any configured generated
 directory name. Build caches (`.next`, `.turbo`, and `target`) otherwise use a
 tighter built-in window; other names use `generated_days`.
+
+`max_parallelism` bounds the entire scheduled planning pool, including nested
+repository, worktree, and generated-directory scans; repository-index refresh
+passes the same limit to ripgrep. It defaults to `1` so an unattended run
+favors low background impact over elapsed time. This does not limit owning-tool
+subprocesses after they are started, so Cargo locks and the configured
+per-target timeout remain separate coordination boundaries.
 
 The Cargo lock timeout applies to each generated `target` directory. A
 contended target is deferred to a later run, recorded under

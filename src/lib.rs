@@ -10,6 +10,7 @@ use cargo_incremental::{
 };
 use cargo_profiles::{execute_cargo_profile_reset, plan_cargo_profile_sweep};
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
@@ -889,6 +890,33 @@ pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootC
     cleanup_repositories(&roots, &repositories, options)
 }
 
+pub fn cleanup_repositories_with_parallelism(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    options: CleanupOptions,
+    max_parallelism: usize,
+) -> Result<RootCleanupRun> {
+    with_parallelism(max_parallelism, || {
+        cleanup_repositories(roots, repositories, options)
+    })
+}
+
+fn with_parallelism<T: Send>(
+    max_parallelism: usize,
+    operation: impl FnOnce() -> Result<T> + Send,
+) -> Result<T> {
+    anyhow::ensure!(
+        max_parallelism > 0,
+        "cleanup.max_parallelism must be at least 1"
+    );
+    ThreadPoolBuilder::new()
+        .num_threads(max_parallelism)
+        .thread_name(|index| format!("worktree-gc-{index}"))
+        .build()
+        .context("failed to build the scheduled cleanup thread pool")?
+        .install(operation)
+}
+
 pub fn cleanup_repositories(
     roots: &[PathBuf],
     repositories: &[PathBuf],
@@ -1251,6 +1279,24 @@ fn prunable_worktree_paths(worktrees: &[WorktreeDecision]) -> Vec<PathBuf> {
 }
 
 pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    discover_repositories_with_parallelism(roots, None)
+}
+
+pub fn discover_repositories_bounded(
+    roots: &[PathBuf],
+    max_parallelism: usize,
+) -> Result<Vec<PathBuf>> {
+    anyhow::ensure!(
+        max_parallelism > 0,
+        "cleanup.max_parallelism must be at least 1"
+    );
+    discover_repositories_with_parallelism(roots, Some(max_parallelism))
+}
+
+fn discover_repositories_with_parallelism(
+    roots: &[PathBuf],
+    ripgrep_threads: Option<usize>,
+) -> Result<Vec<PathBuf>> {
     let roots = canonicalize_roots(roots)?;
     let mut candidates = Vec::new();
 
@@ -1260,7 +1306,7 @@ pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
             continue;
         }
 
-        if let Some(discovered) = discover_repositories_with_ripgrep(&root)? {
+        if let Some(discovered) = discover_repositories_with_ripgrep(&root, ripgrep_threads)? {
             candidates.extend(discovered);
             continue;
         }
@@ -1345,34 +1391,38 @@ fn git_common_dir_hint(worktree: &Path) -> Option<PathBuf> {
     }
 }
 
-fn discover_repositories_with_ripgrep(root: &Path) -> Result<Option<Vec<PathBuf>>> {
+fn discover_repositories_with_ripgrep(
+    root: &Path,
+    max_parallelism: Option<usize>,
+) -> Result<Option<Vec<PathBuf>>> {
     let sibling_rg = std::env::current_exe()
         .ok()
         .and_then(|executable| executable.parent().map(|parent| parent.join("rg")))
         .filter(|path| path.is_file());
-    let output = match Command::new(sibling_rg.as_deref().unwrap_or_else(|| Path::new("rg")))
-        .args([
-            "--files",
-            "--hidden",
-            "--no-ignore",
-            "-g",
-            "**/.git",
-            "-g",
-            "**/.git/HEAD",
-            "-g",
-            "!**/node_modules/**",
-            "-g",
-            "!**/target/**",
-            "-g",
-            "!**/.next/**",
-            "-g",
-            "!**/.turbo/**",
-            "-g",
-            "!**/dist/**",
-        ])
-        .arg(root)
-        .output()
-    {
+    let mut command = Command::new(sibling_rg.as_deref().unwrap_or_else(|| Path::new("rg")));
+    command.args([
+        "--files",
+        "--hidden",
+        "--no-ignore",
+        "-g",
+        "**/.git",
+        "-g",
+        "**/.git/HEAD",
+        "-g",
+        "!**/node_modules/**",
+        "-g",
+        "!**/target/**",
+        "-g",
+        "!**/.next/**",
+        "-g",
+        "!**/.turbo/**",
+        "-g",
+        "!**/dist/**",
+    ]);
+    if let Some(max_parallelism) = max_parallelism {
+        command.arg("--threads").arg(max_parallelism.to_string());
+    }
+    let output = match command.arg(root).output() {
         Ok(output) => output,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("failed to run ripgrep repository discovery"),
@@ -3756,6 +3806,35 @@ mod tests {
 
     fn unix_days_before_now(days: u64) -> i64 {
         system_time_to_unix(now()).expect("test now fits in unix time") - (days * 86_400) as i64
+    }
+
+    #[test]
+    fn scheduled_parallelism_uses_one_shared_worker_budget() -> Result<()> {
+        let observed = with_parallelism(2, || {
+            Ok((0..8_usize)
+                .into_par_iter()
+                .map(|_| {
+                    (0..8_usize)
+                        .into_par_iter()
+                        .map(|_| rayon::current_num_threads())
+                        .max()
+                        .unwrap_or_default()
+                })
+                .max()
+                .unwrap_or_default())
+        })?;
+
+        assert_eq!(observed, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_parallelism_rejects_zero_workers() {
+        let error = with_parallelism(0, || Ok(())).expect_err("zero workers must be rejected");
+        assert!(
+            format!("{error:#}").contains("cleanup.max_parallelism must be at least 1"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
