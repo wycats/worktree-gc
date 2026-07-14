@@ -188,7 +188,9 @@ parent directory, which makes indexed large-file results cheap to verify.
 `--max-entries` (default 2,000,000 across all requested roots) is a hard work
 bound; a report says `incomplete` if it reaches that limit. Traversal stays on
 each root's filesystem unless `--cross-filesystems` is explicit, never follows
-symlinks, and deduplicates hard-linked files.
+symlinks, and deduplicates hard-linked files. Fair resumption keeps wide trees
+from monopolizing the budget, while a fixed live-reader cap prevents resumable
+directory cursors from exhausting process file descriptors.
 
 On macOS, directory enumeration and file accounting use `getattrlistbulk`;
 exact file roots use `getattrlist`.

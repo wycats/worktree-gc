@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const INVENTORY_VERSION: u64 = 1;
+const MAX_OPEN_DIRECTORY_READERS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct InventoryOptions {
@@ -305,7 +306,8 @@ fn scan_root(
         return scan_file_root(root, filesystem, &metadata, remaining_entries);
     }
 
-    let mut queue = VecDeque::from([PendingDirectory::new(root.clone())]);
+    let mut unopened_directories = VecDeque::from([PendingDirectory::new(root.clone())]);
+    let mut open_directory_readers = VecDeque::new();
     let mut seen_files = HashSet::new();
     let mut pending_hardlinks: HashMap<(u64, u64), PendingHardlink> = HashMap::new();
     let mut aggregates = BTreeMap::new();
@@ -314,16 +316,18 @@ fn scan_root(
     let mut visited_entries = 0u64;
     let mut complete = true;
     let mut errors = Vec::new();
-
-    while let Some(mut pending) = queue.pop_front() {
+    loop {
         if *remaining_entries == 0 {
-            complete = false;
+            complete &= unopened_directories.is_empty() && open_directory_readers.is_empty();
             break;
         }
-        let directory = &pending.path;
 
-        if pending.reader.is_none() {
-            let directory_metadata = match fs::metadata(directory) {
+        while open_directory_readers.len() < MAX_OPEN_DIRECTORY_READERS {
+            let Some(mut pending) = unopened_directories.pop_front() else {
+                break;
+            };
+            let directory = &pending.path;
+            let directory_metadata = match fs::symlink_metadata(directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     record_error(&mut aggregates, directory, &error.to_string());
@@ -332,6 +336,13 @@ fn scan_root(
                     continue;
                 }
             };
+            if !directory_metadata.is_dir() {
+                let message = "queued inventory directory is no longer a directory";
+                record_error(&mut aggregates, directory, message);
+                push_error(&mut errors, directory, message.to_string());
+                complete = false;
+                continue;
+            }
             pending.device = metadata_device(&directory_metadata);
             if options.one_filesystem && pending.device != root_device {
                 continue;
@@ -345,12 +356,22 @@ fn scan_root(
                     continue;
                 }
             };
+            open_directory_readers.push_back(pending);
+            debug_assert!(open_directory_readers.len() <= MAX_OPEN_DIRECTORY_READERS);
         }
 
-        let queued_directories = u64::try_from(queue.len().saturating_add(1)).unwrap_or(u64::MAX);
-        let directory_budget = remaining_entries
-            .saturating_add(queued_directories.saturating_sub(1))
-            / queued_directories;
+        let Some(mut pending) = open_directory_readers.pop_front() else {
+            break;
+        };
+        let directory = &pending.path;
+        let queued_directories = u64::try_from(
+            unopened_directories
+                .len()
+                .saturating_add(open_directory_readers.len())
+                .saturating_add(1),
+        )
+        .unwrap_or(u64::MAX);
+        let directory_budget = directory_visit_budget(*remaining_entries, queued_directories);
         let directory_device = pending.device;
         let visit = pending
             .reader
@@ -376,7 +397,7 @@ fn scan_root(
                             aggregates.entry(path.clone()).or_default();
                         }
                         add_directory(&mut aggregates, &path);
-                        queue.push_back(PendingDirectory::new(path));
+                        unopened_directories.push_back(PendingDirectory::new(path));
                     }
                     EntryKind::File => {
                         let file_key = entry
@@ -444,7 +465,7 @@ fn scan_root(
         visited_entries = visited_entries.saturating_add(visit.visited_entries);
         *remaining_entries = remaining_entries.saturating_sub(visit.visited_entries);
         if !visit.exhausted {
-            queue.push_back(pending);
+            open_directory_readers.push_back(pending);
         }
     }
 
@@ -470,6 +491,11 @@ fn scan_root(
         entries,
         errors,
     })
+}
+
+fn directory_visit_budget(remaining_entries: u64, queued_directories: u64) -> u64 {
+    remaining_entries.saturating_add(queued_directories.saturating_sub(1))
+        / queued_directories.max(1)
 }
 
 fn scan_file_root(
@@ -805,7 +831,7 @@ mod portable {
                         continue;
                     }
                 };
-                let metadata = match entry.metadata() {
+                let metadata = match fs::symlink_metadata(entry.path()) {
                     Ok(metadata) => metadata,
                     Err(error) => {
                         visitor(Err(io::Error::new(
@@ -1202,6 +1228,43 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn directory_budget_preserves_fair_slices() {
+        assert_eq!(directory_visit_budget(1_000, 100), 10);
+        assert_eq!(directory_visit_budget(1_000, 1), 1_000);
+    }
+
+    #[test]
+    fn inventory_completes_a_tree_wider_than_the_reader_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..MAX_OPEN_DIRECTORY_READERS * 2 {
+            let child = temp.path().join(format!("child-{index:03}"));
+            fs::create_dir(&child).unwrap();
+            write_bytes(&child.join("data"), 16);
+        }
+
+        let report = inventory(
+            &[temp.path().to_path_buf()],
+            InventoryOptions {
+                display_depth: 1,
+                top: MAX_OPEN_DIRECTORY_READERS * 2,
+                max_entries: 1_000,
+                ..InventoryOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.roots[0].complete);
+        assert_eq!(
+            report.roots[0].metrics.files,
+            (MAX_OPEN_DIRECTORY_READERS * 2) as u64
+        );
+        assert_eq!(
+            report.roots[0].entries.len(),
+            MAX_OPEN_DIRECTORY_READERS * 2
+        );
+    }
+
+    #[test]
     fn inventory_aggregates_and_ranks_shallow_directories() {
         let temp = tempfile::tempdir().unwrap();
         let large = temp.path().join("large");
@@ -1302,6 +1365,27 @@ mod tests {
 
         let error = inventory(&[link], InventoryOptions::default()).unwrap_err();
         assert!(error.to_string().contains("inventory root is a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_does_not_follow_a_nested_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let external = temp.path().join("external");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&external).unwrap();
+        write_bytes(&external.join("data"), 4096);
+        symlink(&external, root.join("external-link")).unwrap();
+
+        let report = inventory(&[root], InventoryOptions::default()).unwrap();
+
+        assert!(report.roots[0].complete);
+        assert_eq!(report.roots[0].metrics.files, 0);
+        assert_eq!(report.roots[0].metrics.logical_bytes, 0);
+        assert_eq!(report.roots[0].metrics.directories, 1);
     }
 
     #[test]
