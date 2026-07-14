@@ -146,6 +146,38 @@ observed development-task and renewal behavior in a separate source-intent
 decision. Regional holiday calendars and class-specific windows beyond the
 initial Cargo profile policy also remain follow-up work.
 
+## Evidence composition
+
+The survey layer accepts one explicit inventory manifest and at most one
+explicit manifest per collector. It performs no filesystem traversal. Each
+collector adapter preserves the source manifest path, evidence age,
+completeness, owner paths, approval digest, and, when that owner executor is
+present in the same release, the exact follow-up command.
+
+Claims are either additive APFS-private reclaim, non-additive owner estimates,
+or observed allocation. Only complete digest-bound owner plans enter the
+approval-ready free-space projection. Broad inventories, generated-root
+allocation, and rebuild opportunities stay report-only until a narrower owner
+plan exists. Claims known to describe one backing store share an overlap group
+and are never summed.
+
+All additive evidence is fresh for 15 minutes by default and must not overlap
+another additive collector's owner paths. Approval-ready evidence must also
+carry a full SHA-256 approval digest and exact execution handoff. Stale,
+future-dated, malformed, or overlapping evidence fails closed to non-additive
+report-only status rather than making either projection look more certain than
+current owner evidence supports.
+
+An action spanning multiple owner roots is approval-ready only when the
+inventory covers every root and maps all of them to one observed filesystem.
+Partial filesystem placement is still useful owner evidence, but it cannot be
+added to a free-space goal.
+
+Free-space goals are evaluated per observed filesystem. The survey reports the
+current shortfall and projected shortfall after approval-ready and
+review-required claims separately; it never turns either projection into an
+execution request.
+
 ## Pressure policy
 
 Routine policy can remove uncontroversially stale, recoverable content even

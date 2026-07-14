@@ -7,6 +7,7 @@ mod inventory;
 mod lima;
 mod pnpm;
 mod protection;
+mod survey;
 
 use anyhow::{bail, Context, Result};
 use cargo_incremental::{
@@ -63,6 +64,12 @@ pub use protection::{
     protection_registry_path, remove_protection, renew_protection, with_protection_guard,
     with_protection_guard_for_paths, ProtectionGuardOutcome, ProtectionLease, ProtectionMatch,
     DEFAULT_PROTECTION_TTL_DAYS, MAX_PROTECTION_TTL_DAYS,
+};
+pub use survey::{
+    print_storage_survey, storage_survey, StorageClaim, StorageClaimKind, StorageClaimReadiness,
+    StorageCollectorEvidence, StorageFilesystemGoal, StorageInventoryEvidence,
+    StorageInventoryMatch, StorageOverlapGroup, StorageSurveyOptions, StorageSurveyReport,
+    DEFAULT_APPROVAL_MAX_AGE_SECONDS, STORAGE_SURVEY_VERSION,
 };
 
 pub const DEFAULT_STALE_DAYS: u64 = 30;

@@ -226,6 +226,48 @@ incomplete instead of hiding every later sibling.
 The durable collector contract and incremental delivery order are documented
 in [`STORAGE.md`](STORAGE.md).
 
+## Composed storage survey
+
+`survey` turns an already-paid-for inventory and explicit collector manifests
+into one read-only decision report. It does not rescan directory trees or
+implicitly select whichever manifest happens to be newest:
+
+```sh
+worktree-gc inventory ~/Code ~/Library --depth 3 --top 30 --json > storage.json
+worktree-gc survey \
+  --inventory-manifest storage.json \
+  --collector-manifest ~/.local/state/worktree-gc/collectors/<pnpm>.json \
+  --collector-manifest ~/.local/state/worktree-gc/collectors/<lima>.json \
+  --collector-manifest ~/.local/state/worktree-gc/collectors/<chromium-components>.json \
+  --target-free 100GiB --target-free 150GiB
+```
+
+The report preserves evidence age, completeness, owner paths, retained
+inventory nodes, and exact originating manifests. Reclaim claims are separated
+into `approval_ready`, `review_required`, and `report_only`. Only additive
+APFS-private claims with an exact owner execution handoff contribute to the
+first free-space projection. Broad generated-root allocation and rebuild
+opportunities remain non-additive orientation evidence. Exact pnpm,
+Lima-retirement, and Chromium-component plans can become approval-ready when
+their owner manifests provide the required execution handoff. Cargo-profile
+and Bambu evidence remains review-required until their owner executors land in
+the same release.
+
+Additive claims default to a 15-minute evidence lifetime. Older or future-dated
+manifests remain visible but become non-additive report-only evidence with no
+execution command. Override the reviewed window explicitly with
+`--approval-max-age-minutes`. Approval handoffs must be complete
+`sha256:` digests, and independently additive collectors must have disjoint
+owner paths. Multi-root owner actions, such as Lima retirement, also require
+the inventory manifest to cover every destructive owner root on one observed
+filesystem. The survey keeps overlapping or incompletely placed plans visible
+but downgrades them so they cannot inflate a filesystem projection.
+
+This is composition, not another cleanup path. Every mutation still belongs to
+its domain collector and its own revalidation and approval boundary. Exactly
+one explicit manifest per collector is accepted so old and new views of the
+same owner cannot be counted twice.
+
 ### Generated build-state inventory
 
 Use the report-only `generated` collector when a broad inventory shows that

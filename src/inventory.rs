@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -36,7 +36,7 @@ impl Default for InventoryOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InventoryReport {
     pub inventory_version: u64,
     pub generated_at_unix: u64,
@@ -44,7 +44,7 @@ pub struct InventoryReport {
     pub roots: Vec<InventoryRoot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InventoryReportOptions {
     pub display_depth: usize,
     pub top: usize,
@@ -52,7 +52,7 @@ pub struct InventoryReportOptions {
     pub one_filesystem: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InventoryRoot {
     pub path: PathBuf,
     pub filesystem: String,
@@ -63,7 +63,7 @@ pub struct InventoryRoot {
     pub errors: Vec<InventoryScanError>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InventoryEntry {
     pub path: PathBuf,
     pub relative_path: PathBuf,
@@ -72,7 +72,7 @@ pub struct InventoryEntry {
     pub metrics: InventoryMetrics,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct InventoryMetrics {
     pub logical_bytes: u64,
     pub allocated_bytes: u64,
@@ -88,7 +88,7 @@ pub struct InventoryMetrics {
     pub errors: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InventoryScanError {
     pub path: PathBuf,
     pub message: String,

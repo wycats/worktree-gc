@@ -9,13 +9,14 @@ use worktree_gc::{
     cleanup_with_parallelism, collect_chromium_components, collect_generated, collect_lima,
     collect_pnpm, discover_repositories_bounded, inventory, list_protections,
     print_chromium_component_collect, print_cleanup, print_generated_collect, print_inventory,
-    print_lima_collect, print_pnpm_collect, print_root_cleanup, print_root_triage, print_triage,
-    remove_protection, renew_protection, triage_roots_with_parallelism, triage_with_parallelism,
-    ChromiumComponentCollectOptions, CleanupOptions, GeneratedCollectOptions, GeneratedDirConfig,
-    InventoryOptions, LimaCollectOptions, PnpmCollectOptions, PressurePolicy, SweepLimit,
-    SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
-    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
-    MAX_PROTECTION_TTL_DAYS,
+    print_lima_collect, print_pnpm_collect, print_root_cleanup, print_root_triage,
+    print_storage_survey, print_triage, remove_protection, renew_protection, storage_survey,
+    triage_roots_with_parallelism, triage_with_parallelism, ChromiumComponentCollectOptions,
+    CleanupOptions, GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions,
+    LimaCollectOptions, PnpmCollectOptions, PressurePolicy, StorageSurveyOptions, SweepLimit,
+    SweepStrategy, SweepTool, TriageOptions, DEFAULT_APPROVAL_MAX_AGE_SECONDS,
+    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS,
+    DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -66,6 +67,41 @@ enum Command {
 
         #[arg(long, help = "Allow traversal into mounted filesystems below a root")]
         cross_filesystems: bool,
+
+        #[arg(long, help = "Write the complete structured report as JSON")]
+        json: bool,
+    },
+    /// Compose inventory and owner-collector manifests without rescanning storage
+    Survey {
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Inventory JSON produced by `inventory --json`"
+        )]
+        inventory_manifest: PathBuf,
+
+        #[arg(
+            long,
+            value_name = "PATH",
+            required = true,
+            help = "Explicit owner-collector manifest to compose; repeat for multiple owners"
+        )]
+        collector_manifest: Vec<PathBuf>,
+
+        #[arg(
+            long,
+            value_name = "SIZE",
+            default_values = ["100GiB", "150GiB"],
+            help = "Free-space goal to evaluate; repeat for multiple goals"
+        )]
+        target_free: Vec<String>,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_APPROVAL_MAX_AGE_SECONDS / 60,
+            help = "Maximum age in minutes for a collector claim to remain approval-ready"
+        )]
+        approval_max_age_minutes: u64,
 
         #[arg(long, help = "Write the complete structured report as JSON")]
         json: bool,
@@ -646,6 +682,40 @@ fn main() -> Result<()> {
                 println!();
             } else {
                 print_inventory(&report);
+            }
+        }
+        Command::Survey {
+            inventory_manifest,
+            collector_manifest,
+            target_free,
+            approval_max_age_minutes,
+            json,
+        } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "survey composes explicit manifests; do not pass --repo or --root"
+            );
+            let target_free_bytes = target_free
+                .iter()
+                .map(|size| {
+                    parse_size::parse_size(size)
+                        .with_context(|| format!("parse free-space target {size:?}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let report = storage_survey(StorageSurveyOptions {
+                inventory_manifest,
+                collector_manifests: collector_manifest,
+                target_free_bytes,
+                approval_max_age_seconds: approval_max_age_minutes
+                    .checked_mul(60)
+                    .context("approval evidence max age overflow")?,
+                now,
+            })?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+                println!();
+            } else {
+                print_storage_survey(&report);
             }
         }
         Command::Collect { command } => {
@@ -1576,6 +1646,40 @@ stale_days = 7
         assert!(parse_sweep_strategy("target=rustc-incremental:nope").is_err());
         assert!(parse_sweep_strategy("target=rustc-incremental:max-size=50GB").is_err());
         assert!(parse_sweep_strategy("target=cargo-sweep:max-size=nope").is_err());
+    }
+
+    #[test]
+    fn survey_cli_requires_explicit_evidence_and_accepts_free_space_goals() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "survey",
+            "--inventory-manifest",
+            "/tmp/inventory.json",
+            "--collector-manifest",
+            "/tmp/bambu.json",
+            "--target-free",
+            "100GiB",
+            "--target-free",
+            "150GiB",
+            "--json",
+        ])
+        .expect("survey CLI should parse");
+        match cli.command {
+            Command::Survey {
+                inventory_manifest,
+                collector_manifest,
+                target_free,
+                approval_max_age_minutes,
+                json,
+            } => {
+                assert_eq!(inventory_manifest, PathBuf::from("/tmp/inventory.json"));
+                assert_eq!(collector_manifest, [PathBuf::from("/tmp/bambu.json")]);
+                assert_eq!(target_free, ["100GiB", "150GiB"]);
+                assert_eq!(approval_max_age_minutes, 15);
+                assert!(json);
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
