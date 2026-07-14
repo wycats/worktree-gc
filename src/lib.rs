@@ -2654,6 +2654,16 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
         std::process::id()
     );
     let execution_open_handles = manifest.check_in_use.then(capture_open_handle_snapshot);
+    let execution_open_generated_dirs = if manifest.check_in_use {
+        dirs_with_open_handles(
+            generated_deletions
+                .iter()
+                .map(|decision| decision.path.as_path()),
+            execution_open_handles.as_ref(),
+        )
+    } else {
+        HashSet::new()
+    };
 
     eprintln!(
         "executing {pass:?} cleanup: {} worktrees, {} generated dirs, {} sweeps",
@@ -2695,12 +2705,7 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
         if decision.action != GeneratedDirAction::Delete {
             continue;
         }
-        if !dirs_with_open_handles(
-            std::iter::once(decision.path.as_path()),
-            execution_open_handles.as_ref(),
-        )
-        .is_empty()
-        {
+        if execution_open_generated_dirs.contains(&decision.path) {
             eprintln!(
                 "  keeping {} because a running process has open files inside it",
                 decision.path.display()
@@ -4608,9 +4613,13 @@ mod tests {
 
         let (_temp, repo) = init_repo()?;
         let generated = repo.join("node_modules");
+        let idle = repo.join(".next");
         fs::create_dir(&generated)?;
+        fs::create_dir(&idle)?;
         fs::write(generated.join("held.lock"), "held")?;
+        fs::write(idle.join("cache"), "idle")?;
         let expected = fs::canonicalize(&generated)?;
+        let idle = fs::canonicalize(&idle)?;
         let mut run = plan_cleanup_with_protections(
             Some(&repo),
             CleanupOptions {
@@ -4641,6 +4650,7 @@ mod tests {
         execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
 
         assert!(generated.exists());
+        assert!(!idle.exists());
         Ok(())
     }
 
