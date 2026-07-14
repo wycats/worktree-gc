@@ -22,13 +22,8 @@ pub(crate) fn system_local_activity_age(
     now: SystemTime,
     activity_unix: i64,
 ) -> Option<ActivityAgeEvidence> {
-    let (timezone, timezone_name) = match TimeZone::try_system() {
-        Ok(timezone) => {
-            let name = timezone.iana_name().unwrap_or("system-local").to_string();
-            (timezone, name)
-        }
-        Err(_) => (TimeZone::UTC, "UTC-fallback".to_string()),
-    };
+    let timezone = TimeZone::try_system().ok()?;
+    let timezone_name = timezone.iana_name().unwrap_or("system-local").to_string();
     let observation = Timestamp::try_from(now).ok()?;
     let activity = Timestamp::from_second(activity_unix).ok()?;
     activity_age_in_timezone(observation, activity, &timezone, timezone_name)

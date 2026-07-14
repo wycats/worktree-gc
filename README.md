@@ -247,6 +247,10 @@ cost tiers, with a cumulative APFS-private reclaim floor per filesystem.
 Incomplete ownership evidence fails closed. The collector remains report-only;
 run a fresh `cleanup` dry-run before proposing any mutation.
 
+The collector also records the scheduled three-workday retention window for
+`target`, `.next`, and `.turbo`, including timezone/calendar evidence.
+`--generated-days` retains elapsed-day meaning for other artifact classes.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but
@@ -293,8 +297,10 @@ roots = [
 max_parallelism = 1
 stale_days = 14
 generated_days = 7
-# Per-directory entries override generated_days and any tighter built-in window.
-generated_windows = { ".next" = 7, ".turbo" = 7, target = 7, node_modules = 7 }
+# Scheduled build-cache retention uses local workdays. Explicit elapsed-day
+# entries keep the legacy generated_windows/CLI meaning and override this map.
+generated_workday_windows = { ".next" = 3, ".turbo" = 3, target = 3 }
+generated_windows = { node_modules = 7 }
 generated_activity_only = true
 check_in_use = true
 cargo_lock_timeout_minutes = 30
@@ -315,8 +321,10 @@ repository_refresh_days = 7
 
 `generated_windows` has the same meaning as repeated CLI
 `--generated-window NAME=DAYS` arguments and applies to any configured generated
-directory name. Build caches (`.next`, `.turbo`, and `target`) otherwise use a
-tighter built-in window; other names use `generated_days`.
+directory name. `generated_workday_windows` is scheduled-mode-only and records
+local timezone/date/calendar evidence in the cleanup manifest. Explicit elapsed
+windows win when a name appears in both maps. Build caches (`.next`, `.turbo`,
+and `target`) default to three local workdays; other names use `generated_days`.
 
 `max_parallelism` bounds the entire scheduled planning pool, including nested
 repository, worktree, and generated-directory scans; repository-index refresh
