@@ -371,6 +371,44 @@ owner commands are sequential rather than transactional, so the manifest keeps
 each command's result and exact post-operation verification if Lima reports a
 failure after an earlier instance was already removed.
 
+## Chromium on-device component inventory
+
+Chromium user-data roots mix durable browser state with large re-downloadable
+component models. The manual collector requires explicit initialized profile
+roots with a regular, non-symlink `Local State` marker and uses a closed
+component-name list rather than inferring disposability from location or age:
+
+```sh
+worktree-gc collect chromium-components \
+  --profile "$HOME/Library/Application Support/Google/Chrome"
+```
+
+The list is limited to optimization-guide models, the on-device head-suggest
+model, and the downloaded WASM text-to-speech engine. `Default`, `Local State`,
+cookies, history, sessions, service workers, extension state, and every
+unrecognized directory are excluded. Each component root is APFS-measured.
+Profile-specific Chromium process trees, one bounded global `lsof` snapshot,
+and recursive protections must all be complete before a claim becomes
+approval-ready. An active profile-owning browser, open component path,
+protection, or incomplete inventory fails closed.
+
+This is a whole-component cache reset, not stale-revision pruning: it removes
+the currently installed model revision and accepts the full re-download cost.
+The collector never runs unattended. After reviewing a dry-run, execute only
+its digest-bound plan:
+
+```sh
+worktree-gc collect chromium-components \
+  --profile "$HOME/Library/Application Support/Google/Chrome" \
+  --execute --approved-digest sha256:<reviewed-digest>
+```
+
+Execution replans the same explicit profiles under a protection guard, checks
+component identity and liveness again, and atomically renames only closed-list
+roots into private same-profile quarantines. It repeats browser/open-file
+checks before recursively removing only the quarantined roots. Interrupted
+quarantine blocks later plans for explicit recovery review.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but

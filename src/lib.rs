@@ -1,6 +1,7 @@
 mod activity_age;
 mod cargo_incremental;
 mod cargo_profiles;
+mod chromium_components;
 mod generated;
 mod inventory;
 mod lima;
@@ -31,6 +32,12 @@ use walkdir::WalkDir;
 pub use activity_age::{ActivityAgeEvidence, WEEKDAY_CALENDAR_ID};
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
+pub use chromium_components::{
+    collect_chromium_components, print_chromium_component_collect, ChromiumComponentAction,
+    ChromiumComponentCollectManifest, ChromiumComponentCollectOptions, ChromiumComponentCollectRun,
+    ChromiumComponentIdentity, ChromiumComponentObservation, ChromiumComponentPlan,
+    ChromiumComponentPolicy, ChromiumComponentPruneOutcome, ChromiumProfileIdentity,
+};
 pub use generated::{
     collect_generated, print_generated_collect, GeneratedArtifactMeasurement,
     GeneratedArtifactObservation, GeneratedArtifactSummary, GeneratedCollectAction,
@@ -2666,6 +2673,17 @@ fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
 }
 
 #[cfg(unix)]
+pub(crate) fn open_handle_evidence_for_paths(paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+    if paths.is_empty() {
+        return (HashSet::new(), true);
+    }
+    let snapshot = capture_open_handle_snapshot();
+    let complete = matches!(snapshot, OpenHandleSnapshot::Available(_));
+    let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path), Some(&snapshot));
+    (open, complete)
+}
+
+#[cfg(unix)]
 fn dirs_with_open_handles<'a>(
     paths: impl Iterator<Item = &'a Path>,
     snapshot: Option<&OpenHandleSnapshot>,
@@ -2800,6 +2818,14 @@ fn lsof_probe_error(
 #[cfg(not(unix))]
 fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
     OpenHandleSnapshot::Unavailable
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_handle_evidence_for_paths(paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+    if paths.is_empty() {
+        return (HashSet::new(), true);
+    }
+    (paths.iter().cloned().collect(), false)
 }
 
 #[cfg(not(unix))]

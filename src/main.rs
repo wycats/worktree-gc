@@ -6,15 +6,16 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup_repositories_with_parallelism, cleanup_roots_with_parallelism,
-    cleanup_with_parallelism, collect_generated, collect_lima, collect_pnpm,
-    discover_repositories_bounded, inventory, list_protections, print_cleanup,
-    print_generated_collect, print_inventory, print_lima_collect, print_pnpm_collect,
-    print_root_cleanup, print_root_triage, print_triage, remove_protection, renew_protection,
-    triage_roots_with_parallelism, triage_with_parallelism, CleanupOptions,
-    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, LimaCollectOptions,
-    PnpmCollectOptions, PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions,
-    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS,
-    DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    cleanup_with_parallelism, collect_chromium_components, collect_generated, collect_lima,
+    collect_pnpm, discover_repositories_bounded, inventory, list_protections,
+    print_chromium_component_collect, print_cleanup, print_generated_collect, print_inventory,
+    print_lima_collect, print_pnpm_collect, print_root_cleanup, print_root_triage, print_triage,
+    remove_protection, renew_protection, triage_roots_with_parallelism, triage_with_parallelism,
+    ChromiumComponentCollectOptions, CleanupOptions, GeneratedCollectOptions, GeneratedDirConfig,
+    InventoryOptions, LimaCollectOptions, PnpmCollectOptions, PressurePolicy, SweepLimit,
+    SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
+    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -69,7 +70,7 @@ enum Command {
         #[arg(long, help = "Write the complete structured report as JSON")]
         json: bool,
     },
-    /// Run a report-only domain collector
+    /// Plan or execute cleanup through a domain owner contract
     Collect {
         #[command(subcommand)]
         command: CollectorCommand,
@@ -166,6 +167,35 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CollectorCommand {
+    /// Inventory whole re-downloadable Chromium component roots for a manual cache reset
+    ChromiumComponents {
+        #[arg(long, help = "Revalidate and delete only an approved dry-run plan")]
+        execute: bool,
+
+        #[arg(
+            long,
+            value_name = "SHA256",
+            requires = "execute",
+            help = "Execute only the exact eligibility digest from a reviewed dry-run"
+        )]
+        approved_digest: Option<String>,
+
+        #[arg(
+            long = "profile",
+            value_name = "PATH",
+            required = true,
+            help = "Explicit Chromium user-data root; repeat for multiple profiles"
+        )]
+        profile_paths: Vec<PathBuf>,
+
+        #[arg(
+            long,
+            default_value_t = 500_000,
+            help = "Maximum entries to APFS-measure across component roots"
+        )]
+        max_entries: u64,
+    },
+
     /// Rehearse Lima's owner-defined download-cache prune and optionally delegate it
     Lima {
         #[arg(
@@ -624,6 +654,21 @@ fn main() -> Result<()> {
                 "collect takes domain roots as positional arguments; do not pass --repo or --root"
             );
             match command {
+                CollectorCommand::ChromiumComponents {
+                    execute,
+                    approved_digest,
+                    profile_paths,
+                    max_entries,
+                } => {
+                    let run = collect_chromium_components(ChromiumComponentCollectOptions {
+                        execute,
+                        approved_digest,
+                        profile_paths,
+                        max_entries,
+                        now,
+                    })?;
+                    print_chromium_component_collect(&run);
+                }
                 CollectorCommand::Lima {
                     retire,
                     execute,
@@ -1531,6 +1576,75 @@ stale_days = 7
         assert!(parse_sweep_strategy("target=rustc-incremental:nope").is_err());
         assert!(parse_sweep_strategy("target=rustc-incremental:max-size=50GB").is_err());
         assert!(parse_sweep_strategy("target=cargo-sweep:max-size=nope").is_err());
+    }
+
+    #[test]
+    fn chromium_component_collector_requires_explicit_profiles() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "chromium-components",
+            "--profile",
+            "/tmp/profile-a",
+            "--profile",
+            "/tmp/profile-b",
+            "--max-entries",
+            "123",
+        ])
+        .expect("Chromium component collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::ChromiumComponents {
+                        execute,
+                        approved_digest,
+                        profile_paths,
+                        max_entries,
+                    },
+            } => {
+                assert!(!execute);
+                assert!(approved_digest.is_none());
+                assert_eq!(
+                    profile_paths,
+                    [
+                        PathBuf::from("/tmp/profile-a"),
+                        PathBuf::from("/tmp/profile-b")
+                    ]
+                );
+                assert_eq!(max_entries, 123);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn chromium_component_execution_accepts_an_approval_digest() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "chromium-components",
+            "--profile",
+            "/tmp/profile-a",
+            "--execute",
+            "--approved-digest",
+            &digest,
+        ])
+        .expect("Chromium component execution CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::ChromiumComponents {
+                        execute,
+                        approved_digest,
+                        ..
+                    },
+            } => {
+                assert!(execute);
+                assert_eq!(approved_digest.as_deref(), Some(digest.as_str()));
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

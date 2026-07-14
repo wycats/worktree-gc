@@ -208,7 +208,6 @@ The implementation order is intentionally useful after every merge:
    measurement, and verification. Treat pnpm's metadata and `dlx` caches as a
    separate candidate domain: their path allocation can be mostly shared on
    APFS, and their retention contract is not the content store's prune contract.
-
    Bounded routine scans may cache per-prefix hard-link evidence long enough to
    converge without repeatedly walking the whole store, but cached observations
    never authorize deletion. A fresh scan binds the complete candidate set,
@@ -218,7 +217,14 @@ The implementation order is intentionally useful after every merge:
    then delegates to the reviewed pnpm `store prune` operation. pnpm exposes no
    interprocess prune lock, so this handoff remains explicitly user-approved
    rather than scheduled.
-6. **Container/VM collectors.** Treat Docker/OrbStack, Lima, and Parallels as
+6. **Closed browser component caches.** Treat a Chromium profile root as mixed
+   durable state, then admit only a closed list of whole re-downloadable model
+   directories. Explicit profile identity, browser-process ownership, one
+   bounded open-handle snapshot, recursive protections, APFS-private bytes,
+   and exact component identities must all revalidate. This is a manual
+   whole-component reset with explicit download cost; profile data and unknown
+   roots never enter the claim.
+7. **Container/VM collectors.** Treat Docker/OrbStack, Lima, and Parallels as
    separate domains. Use their public inventory/prune/compact interfaces and
    surface running or suspended state. VM deletion or archival remains an
    explicit user decision.
@@ -237,7 +243,7 @@ The implementation order is intentionally useful after every merge:
    into the reviewed dry-run digest; age alone cannot supply that intent.
    Execution remains manual because Lima exposes no instance/download handoff
    lock, and the exact plan must reproduce after the final guarded replan.
-7. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
+8. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
    and application stores begin report-only. Activity must come from the
    owning application's task/database model rather than generic file mtimes
    when the owner rewrites or reindexes old content. A domain graduates to
