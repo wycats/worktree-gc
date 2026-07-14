@@ -208,6 +208,16 @@ The implementation order is intentionally useful after every merge:
    measurement, and verification. Treat pnpm's metadata and `dlx` caches as a
    separate candidate domain: their path allocation can be mostly shared on
    APFS, and their retention contract is not the content store's prune contract.
+
+   Bounded routine scans may cache per-prefix hard-link evidence long enough to
+   converge without repeatedly walking the whole store, but cached observations
+   never authorize deletion. A fresh scan binds the complete candidate set,
+   policy, owner paths, filesystem identities, and APFS measurements into an
+   approval digest. Manual execution reacquires the collector and protection
+   guards, rebuilds that fresh plan, requires an exact digest match, and only
+   then delegates to the reviewed pnpm `store prune` operation. pnpm exposes no
+   interprocess prune lock, so this handoff remains explicitly user-approved
+   rather than scheduled.
 6. **Container/VM collectors.** Treat Docker/OrbStack, Lima, and Parallels as
    separate domains. Use their public inventory/prune/compact interfaces and
    surface running or suspended state. VM deletion or archival remains an

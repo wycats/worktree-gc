@@ -122,19 +122,19 @@ impl MetricsAccumulator {
 }
 
 #[derive(Debug)]
-struct FileMeasurement {
-    logical_bytes: u64,
-    allocated_bytes: u64,
-    private_reclaimable_bytes: Option<u64>,
+pub(crate) struct FileMeasurement {
+    pub(crate) logical_bytes: u64,
+    pub(crate) allocated_bytes: u64,
+    pub(crate) private_reclaimable_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
-struct DirectoryEntryMeasurement {
-    name: std::ffi::OsString,
-    kind: EntryKind,
-    file_id: Option<u64>,
-    link_count: Option<u64>,
-    file: Option<FileMeasurement>,
+pub(crate) struct DirectoryEntryMeasurement {
+    pub(crate) name: std::ffi::OsString,
+    pub(crate) kind: EntryKind,
+    pub(crate) file_id: Option<u64>,
+    pub(crate) link_count: Option<u64>,
+    pub(crate) file: Option<FileMeasurement>,
 }
 
 #[derive(Debug)]
@@ -146,16 +146,16 @@ struct PendingHardlink {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntryKind {
+pub(crate) enum EntryKind {
     File,
     Directory,
     Other,
 }
 
 #[derive(Debug)]
-struct DirectoryVisit {
-    visited_entries: u64,
-    exhausted: bool,
+pub(crate) struct DirectoryVisit {
+    pub(crate) visited_entries: u64,
+    pub(crate) exhausted: bool,
 }
 
 #[derive(Debug)]
@@ -790,6 +790,18 @@ fn metadata_device(metadata: &fs::Metadata) -> Option<u64> {
 #[cfg(not(unix))]
 fn metadata_device(_metadata: &fs::Metadata) -> Option<u64> {
     None
+}
+
+pub(crate) fn visit_directory<F>(
+    path: &Path,
+    max_entries: u64,
+    visitor: &mut F,
+) -> io::Result<DirectoryVisit>
+where
+    F: FnMut(io::Result<DirectoryEntryMeasurement>),
+{
+    let mut reader = DirectoryReader::open(path)?;
+    reader.visit(path, max_entries, visitor)
 }
 
 mod portable {
