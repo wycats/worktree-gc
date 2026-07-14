@@ -6,14 +6,15 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup_repositories_with_parallelism, cleanup_roots_with_parallelism,
-    cleanup_with_parallelism, collect_generated, collect_pnpm, discover_repositories_bounded,
-    inventory, list_protections, print_cleanup, print_generated_collect, print_inventory,
-    print_pnpm_collect, print_root_cleanup, print_root_triage, print_triage, remove_protection,
-    renew_protection, triage_roots_with_parallelism, triage_with_parallelism, CleanupOptions,
-    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, PnpmCollectOptions,
-    PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
-    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
-    MAX_PROTECTION_TTL_DAYS,
+    cleanup_with_parallelism, collect_generated, collect_lima, collect_pnpm,
+    discover_repositories_bounded, inventory, list_protections, print_cleanup,
+    print_generated_collect, print_inventory, print_lima_collect, print_pnpm_collect,
+    print_root_cleanup, print_root_triage, print_triage, remove_protection, renew_protection,
+    triage_roots_with_parallelism, triage_with_parallelism, CleanupOptions,
+    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, LimaCollectOptions,
+    PnpmCollectOptions, PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions,
+    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS,
+    DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -165,6 +166,29 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CollectorCommand {
+    /// Rehearse Lima's owner-defined download-cache prune and optionally delegate it
+    Lima {
+        #[arg(
+            long,
+            help = "Plan explicit retirement of all stopped Lima instances and downloads"
+        )]
+        retire: bool,
+
+        #[arg(
+            long,
+            help = "Revalidate the reviewed plan and run only its official Lima owner commands"
+        )]
+        execute: bool,
+
+        #[arg(
+            long,
+            value_name = "SHA256",
+            requires = "execute",
+            help = "Execute only the exact approval digest from a reviewed dry-run"
+        )]
+        approved_digest: Option<String>,
+    },
+
     /// Plan or delegate cleanup of pnpm's shared store and dlx cache
     Pnpm {
         #[arg(
@@ -600,6 +624,19 @@ fn main() -> Result<()> {
                 "collect takes domain roots as positional arguments; do not pass --repo or --root"
             );
             match command {
+                CollectorCommand::Lima {
+                    retire,
+                    execute,
+                    approved_digest,
+                } => {
+                    let run = collect_lima(LimaCollectOptions {
+                        execute,
+                        retire,
+                        approved_digest,
+                        now,
+                    })?;
+                    print_lima_collect(&run);
+                }
                 CollectorCommand::Pnpm {
                     execute,
                     fresh,
@@ -1189,6 +1226,90 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn lima_collector_is_dry_run_by_default() {
+        let cli = Cli::try_parse_from(["worktree-gc", "collect", "lima"])
+            .expect("Lima collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Lima {
+                        retire,
+                        execute,
+                        approved_digest,
+                    },
+            } => {
+                assert!(!retire);
+                assert!(!execute);
+                assert!(approved_digest.is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn lima_collector_execution_accepts_an_approval_digest() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "lima",
+            "--execute",
+            "--approved-digest",
+            &digest,
+        ])
+        .expect("Lima execution CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Lima {
+                        retire,
+                        execute,
+                        approved_digest,
+                    },
+            } => {
+                assert!(!retire);
+                assert!(execute);
+                assert_eq!(approved_digest.as_deref(), Some(digest.as_str()));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn lima_domain_retirement_is_explicit() {
+        let cli = Cli::try_parse_from(["worktree-gc", "collect", "lima", "--retire"])
+            .expect("Lima retirement collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Lima {
+                        retire,
+                        execute,
+                        approved_digest,
+                    },
+            } => {
+                assert!(retire);
+                assert!(!execute);
+                assert!(approved_digest.is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn lima_approval_digest_requires_execution() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "lima",
+            "--approved-digest",
+            &digest,
+        ])
+        .is_err());
     }
 
     #[test]

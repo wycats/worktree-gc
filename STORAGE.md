@@ -222,6 +222,21 @@ The implementation order is intentionally useful after every merge:
    separate domains. Use their public inventory/prune/compact interfaces and
    surface running or suspended state. VM deletion or archival remains an
    explicit user decision.
+
+   Lima uses `limactl prune --keep-referred` as its ownership rule. Since Lima
+   has no structured dry run, worktree-gc simulates the owner command against
+   an APFS clone containing the real download cache plus the instance
+   `lima.yaml` and custom template YAML read by Lima 2.1.0, but no VM disks.
+   Removed clone entries become exact advisory candidates, and
+   their original paths are measured for private reclaim. Stopped and running
+   instance directories are measured separately as bounded advisory inventory,
+   never deletion candidates in ordinary mode. An explicit retirement mode may
+   combine stopped-instance deletion with a full download prune when the user
+   supplies the intent that the whole Lima domain is no longer wanted. It must
+   bind every instance, cache entry, measurement, owner process, and protection
+   into the reviewed dry-run digest; age alone cannot supply that intent.
+   Execution remains manual because Lima exposes no instance/download handoff
+   lock, and the exact plan must reproduce after the final guarded replan.
 7. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
    and application stores begin report-only. Activity must come from the
    owning application's task/database model rather than generic file mtimes

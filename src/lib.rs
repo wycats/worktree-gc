@@ -3,6 +3,7 @@ mod cargo_incremental;
 mod cargo_profiles;
 mod generated;
 mod inventory;
+mod lima;
 mod pnpm;
 mod protection;
 
@@ -39,6 +40,11 @@ pub use generated::{
 pub use inventory::{
     inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
     InventoryReport, InventoryReportOptions, InventoryRoot, InventoryScanError, INVENTORY_VERSION,
+};
+pub use lima::{
+    collect_lima, print_lima_collect, LimaCollectManifest, LimaCollectOptions, LimaCollectRun,
+    LimaCommandOutcome, LimaDownloadCandidate, LimaIdentity, LimaInstance, LimaPolicy,
+    LimaPruneAction, LimaPruneOutcome, LimaPrunePlan,
 };
 pub use pnpm::{
     collect_pnpm, print_pnpm_collect, PnpmCollectManifest, PnpmCollectOptions, PnpmCollectRun,

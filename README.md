@@ -314,6 +314,63 @@ interprocess prune lock that worktree-gc can acquire atomically with its owner
 checks. Manifests live under `$XDG_STATE_HOME/worktree-gc/collectors` (or
 `~/.local/state/worktree-gc/collectors`).
 
+## Lima download-cache collection
+
+The Lima collector asks Lima which cached downloads are unreferenced. Because
+`limactl prune` does not expose a dry run, planning uses an APFS clone of the
+download cache plus only the instance `lima.yaml` and custom template YAML that
+Lima 2.1.0's prune implementation reads. It runs `limactl prune
+--keep-referred` against that isolated home and maps clone
+removals back to exact real cache entries. VM disks and instance data are never
+copied or selected. Existing instances are nevertheless measured with the same
+bounded APFS inventory and shown as advisory storage, so a stopped legacy VM is
+visible without making instance deletion part of the collector.
+
+```sh
+worktree-gc collect lima
+```
+
+Each candidate is measured at its real path so the manifest distinguishes
+logical allocation from APFS-private reclaim. Running instances, Lima owner
+processes, incomplete clone simulation, and active protections keep the plan
+non-executable. On platforms without APFS clonefile support the collector is
+report-only rather than copying the cache to simulate a plan. Candidate
+provenance retains only a SHA-256 URL digest, never the raw download URL;
+process evidence retains only PID and executable basename.
+
+When the user knows Lima itself is retired, an explicit mode turns the measured
+stopped instances and complete download cache into one owner-domain plan:
+
+```sh
+worktree-gc collect lima --retire
+```
+
+Retirement is never inferred from age. The flag records the missing fact the
+filesystem cannot supply: these stopped instances are no longer wanted. A
+complete plan delegates instance removal to `limactl delete --tty=false`, then
+delegates full download cleanup to `limactl prune --tty=false`. Omitting
+`--force` makes Lima refuse if an instance starts after the final replan.
+Running, errored, or owner-protected instances, owner processes, incomplete
+APFS measurements, and worktree-gc protections keep retirement non-executable.
+
+Explicit execution requires the full approval digest from a reviewed dry-run,
+revalidates the Lima identity and exact candidate plan, and delegates to the
+owner operation:
+
+```sh
+worktree-gc collect lima --execute --approved-digest sha256:<digest>
+worktree-gc collect lima --retire --execute --approved-digest sha256:<digest>
+```
+
+Execution remains manual because Lima does not provide an interprocess lock
+spanning instance/download activity and prune. Any identity, candidate,
+provenance, measurement, process, instance, mode, or protection change
+invalidates the approved digest before owner commands run. Ordinary collection
+never deletes instances; only an exact reviewed `--retire` plan can do so. The
+owner commands are sequential rather than transactional, so the manifest keeps
+each command's result and exact post-operation verification if Lima reports a
+failure after an earlier instance was already removed.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but
