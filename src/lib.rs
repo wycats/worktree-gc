@@ -976,35 +976,6 @@ fn triage_repositories(
     })
 }
 
-pub fn triage_roots_with_parallelism(
-    roots: &[PathBuf],
-    options: TriageOptions,
-    max_parallelism: usize,
-) -> Result<RootTriageReport> {
-    with_parallelism(max_parallelism, || {
-        let roots = canonicalize_roots(roots)?;
-        let repositories = discover_repositories_bounded(&roots, max_parallelism)?;
-        let protections = active_protections(options.now)?;
-        let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
-        let repositories = repositories
-            .par_iter()
-            .map(|repo| {
-                triage_with_protections(
-                    Some(repo),
-                    options.clone(),
-                    &protections,
-                    open_handles.as_ref(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(RootTriageReport {
-            roots,
-            repositories,
-        })
-    })
-}
-
 pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootCleanupRun> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
