@@ -2092,7 +2092,7 @@ fn capture_lsof_open_handle_snapshot() -> OpenHandleSnapshot {
         output.status.success(),
         output.status.code(),
         &output.stderr,
-        &[],
+        None,
     ) {
         eprintln!(
             "warning: global lsof snapshot failed ({error}); keeping all generated paths protected"
@@ -2229,7 +2229,7 @@ fn probe_open_handles(paths: &[PathBuf]) -> io::Result<HashSet<PathBuf>> {
         output.status.success(),
         output.status.code(),
         &output.stderr,
-        paths,
+        Some(paths),
     ) {
         return Err(error);
     }
@@ -2254,18 +2254,18 @@ fn lsof_probe_error(
     success: bool,
     status_code: Option<i32>,
     stderr: &[u8],
-    paths: &[PathBuf],
+    scoped_paths: Option<&[PathBuf]>,
 ) -> Option<io::Error> {
     if success {
         return None;
     }
 
     let stderr = String::from_utf8_lossy(stderr);
-    let failed_path = paths.iter().any(|path| {
+    let failed_path = scoped_paths.into_iter().flatten().any(|path| {
         let path = path.to_string_lossy();
         !path.is_empty() && stderr.contains(path.as_ref())
     });
-    if status_code == Some(1) && !failed_path {
+    if scoped_paths.is_some() && status_code == Some(1) && !failed_path {
         return None;
     }
 
@@ -4713,14 +4713,26 @@ mod tests {
             false,
             Some(1),
             b"lsof: WARNING: can't stat() fuse mount /unrelated\n",
-            std::slice::from_ref(&candidate),
+            Some(std::slice::from_ref(&candidate)),
         )
         .is_none());
         assert!(lsof_probe_error(
             false,
             Some(1),
             b"lsof: WARNING: can't stat /tmp/worktree-gc-candidate\n",
-            std::slice::from_ref(&candidate),
+            Some(std::slice::from_ref(&candidate)),
+        )
+        .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_lsof_status_one_is_incomplete_even_without_a_path_specific_error() {
+        assert!(lsof_probe_error(
+            false,
+            Some(1),
+            b"lsof: WARNING: can't stat() fuse mount /unrelated\n",
+            None,
         )
         .is_some());
     }
