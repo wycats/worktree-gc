@@ -2052,6 +2052,13 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
+    fn fresh_options() -> PnpmCollectOptions {
+        PnpmCollectOptions {
+            fresh: true,
+            ..PnpmCollectOptions::default()
+        }
+    }
+
     #[test]
     fn process_matching_identifies_pnpm_owners_without_matching_our_subcommand() {
         assert!(is_pnpm_command("pnpm install"));
@@ -2398,7 +2405,8 @@ mod tests {
             cache_path: cache,
         };
 
-        let plan = snapshot_pnpm(&identity, &PnpmCollectOptions::default())?;
+        let plan = snapshot_pnpm(&identity, &fresh_options())?;
+        assert!(plan.content_evidence.cache_path.is_none());
         assert_eq!(plan.store_tmp, Some(store.join("tmp")));
         Ok(())
     }
@@ -2422,7 +2430,8 @@ mod tests {
             cache_path: cache,
         };
 
-        let mut plan = snapshot_pnpm(&identity, &PnpmCollectOptions::default())?;
+        let mut plan = snapshot_pnpm(&identity, &fresh_options())?;
+        assert!(plan.content_evidence.cache_path.is_none());
         assert_eq!(plan.unsupported_layout_paths, vec![store.join("files")]);
         plan.open_handle_check_complete = true;
         assert_eq!(classify_plan(&plan), PnpmPruneAction::UnsupportedLayout);
@@ -2444,7 +2453,8 @@ mod tests {
             cache_path: cache,
         };
 
-        let mut plan = snapshot_pnpm(&identity, &PnpmCollectOptions::default())?;
+        let mut plan = snapshot_pnpm(&identity, &fresh_options())?;
+        assert!(plan.content_evidence.cache_path.is_none());
         plan.open_handle_check_complete = true;
         assert!(!plan.planner_supported);
         assert_eq!(classify_plan(&plan), PnpmPruneAction::UnsupportedVersion);
