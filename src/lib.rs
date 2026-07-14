@@ -1,3 +1,4 @@
+mod activity_age;
 mod cargo_incremental;
 mod cargo_profiles;
 mod generated;
@@ -27,6 +28,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use walkdir::WalkDir;
 
+pub use activity_age::{ActivityAgeEvidence, WEEKDAY_CALENDAR_ID};
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
 pub use generated::{
