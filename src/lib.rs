@@ -550,19 +550,29 @@ struct GeneratedScanPolicy<'a> {
     generated_days: u64,
     generated_activity_only: bool,
     check_in_use: bool,
+    open_handle_snapshot: Option<&'a OpenHandleSnapshot>,
     now: SystemTime,
     pressure: Option<&'a PressurePolicy>,
 }
 
+#[derive(Debug)]
+enum OpenHandleSnapshot {
+    Available(HashSet<PathBuf>),
+    Unavailable,
+    Indeterminate,
+}
+
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
     let protections = active_protections(options.now)?;
-    triage_with_protections(repo, options, &protections)
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
+    triage_with_protections(repo, options, &protections, open_handles.as_ref())
 }
 
 fn triage_with_protections(
     repo: Option<&Path>,
     options: TriageOptions,
     protections: &[ProtectionLease],
+    open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<TriageReport> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
@@ -581,6 +591,7 @@ fn triage_with_protections(
             generated_days: options.generated_days,
             generated_activity_only: options.generated_activity_only,
             check_in_use: options.check_in_use,
+            open_handle_snapshot: open_handles,
             now: options.now,
             pressure: None,
         },
@@ -620,7 +631,9 @@ pub fn audit(repo: Option<&Path>, generated_days: u64, now: SystemTime) -> Resul
 pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
     let execute = options.execute;
     let protections = active_protections(options.now)?;
-    let mut run = plan_cleanup_with_protections(repo, options, &protections)?;
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
+    let mut run =
+        plan_cleanup_with_protections(repo, options, &protections, open_handles.as_ref())?;
     measure_cleanup_runs(
         std::slice::from_mut(&mut run),
         GENERATED_MEASUREMENT_MAX_ENTRIES,
@@ -646,6 +659,7 @@ fn plan_cleanup_with_protections(
     repo: Option<&Path>,
     options: CleanupOptions,
     protections: &[ProtectionLease],
+    open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<CleanupRun> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
@@ -657,6 +671,7 @@ fn plan_cleanup_with_protections(
             generated_days: options.generated_days,
             generated_activity_only: options.generated_activity_only,
             check_in_use: options.check_in_use,
+            open_handle_snapshot: open_handles,
             now: options.now,
             pressure: options.pressure.as_ref(),
         },
@@ -873,9 +888,17 @@ pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTri
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
     let protections = active_protections(options.now)?;
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
     let repositories = repositories
         .par_iter()
-        .map(|repo| triage_with_protections(Some(repo), options.clone(), &protections))
+        .map(|repo| {
+            triage_with_protections(
+                Some(repo),
+                options.clone(),
+                &protections,
+                open_handles.as_ref(),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(RootTriageReport {
@@ -947,9 +970,17 @@ pub fn cleanup_repositories(
         CleanupMode::DryRun
     };
     let protections = active_protections(options.now)?;
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
     let mut repositories = repositories
         .par_iter()
-        .map(|repo| plan_cleanup_with_protections(Some(repo), options.clone(), &protections))
+        .map(|repo| {
+            plan_cleanup_with_protections(
+                Some(repo),
+                options.clone(),
+                &protections,
+                open_handles.as_ref(),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     measure_cleanup_runs(&mut repositories, GENERATED_MEASUREMENT_MAX_ENTRIES)?;
     let mut manifest = RootCleanupManifest {
@@ -968,10 +999,14 @@ pub fn cleanup_repositories(
             let mut refreshed_options = options.clone();
             refreshed_options.now = SystemTime::now();
             let refreshed_protections = active_protections(refreshed_options.now)?;
+            let refreshed_open_handles = refreshed_options
+                .check_in_use
+                .then(capture_open_handle_snapshot);
             let mut refreshed = plan_cleanup_with_protections(
                 Some(&repo_root),
                 refreshed_options,
                 &refreshed_protections,
+                refreshed_open_handles.as_ref(),
             )?;
             carry_generated_measurements(&manifest.repositories[index], &mut refreshed);
             refreshed.manifest_path =
@@ -1122,8 +1157,15 @@ fn refresh_and_execute_repository(
     let mut refreshed_options = options.clone();
     refreshed_options.now = SystemTime::now();
     let refreshed_protections = active_protections(refreshed_options.now)?;
-    let mut refreshed =
-        plan_cleanup_with_protections(Some(&repo_root), refreshed_options, &refreshed_protections)?;
+    let refreshed_open_handles = refreshed_options
+        .check_in_use
+        .then(capture_open_handle_snapshot);
+    let mut refreshed = plan_cleanup_with_protections(
+        Some(&repo_root),
+        refreshed_options,
+        &refreshed_protections,
+        refreshed_open_handles.as_ref(),
+    )?;
     carry_generated_measurements(&manifest.repositories[index], &mut refreshed);
     if let Some(path) = only_generated_path {
         measure_cleanup_runs_matching(
@@ -2030,7 +2072,10 @@ fn scan_generated_dirs_for_worktree(
     let ignored_paths = git_ignored_paths(&worktree.path, &candidates)?;
     let tracked_paths = git_tracked_paths(&worktree.path, &candidates)?;
     let open_generated_dirs = if policy.check_in_use {
-        dirs_with_open_handles(candidates.iter().map(|candidate| candidate.path.as_path()))
+        dirs_with_open_handles(
+            candidates.iter().map(|candidate| candidate.path.as_path()),
+            policy.open_handle_snapshot,
+        )
     } else {
         HashSet::new()
     };
@@ -2322,22 +2367,96 @@ fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
     newest
 }
 
-// Best-effort open-handle probe. `lsof +D` walks the whole tree, which is
-// too slow for multi-gigabyte caches, so this probes the directory and its
-// immediate children (`+d`). That catches the common live-dev-server shapes
-// (a held lockfile, trace file, or cache subdirectory handle) without the
-// full walk. Candidate sets are chunked below the OS argument limit. A failed
-// batch retries one directory at a time and keeps any individually unprobeable
+// Planning captures one process-wide `lsof` snapshot and matches generated
+// candidates against it in memory. This observes handles at any depth without
+// recursively probing every cache in every repository. The path-scoped
+// fallback remains for isolated callers. Candidate sets are chunked below the
+// OS argument limit; a failed batch retries one directory at a time and keeps
+// any individually unprobeable
 // directory protected; an unavailable lsof still degrades to mtime-only
 // judgment on supported platforms.
 #[cfg(unix)]
-fn dirs_with_open_handles<'a>(paths: impl Iterator<Item = &'a Path>) -> HashSet<PathBuf> {
-    const LSOF_PATH_CHUNK_SIZE: usize = 64;
+fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
+    let output = match Command::new("lsof")
+        .arg("-Fn")
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return OpenHandleSnapshot::Unavailable;
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: failed to capture global lsof snapshot ({error}); keeping all generated paths protected"
+            );
+            return OpenHandleSnapshot::Indeterminate;
+        }
+    };
+    if let Some(error) = lsof_probe_error(
+        output.status.success(),
+        output.status.code(),
+        &output.stderr,
+        &[],
+    ) {
+        eprintln!(
+            "warning: global lsof snapshot failed ({error}); keeping all generated paths protected"
+        );
+        return OpenHandleSnapshot::Indeterminate;
+    }
 
+    OpenHandleSnapshot::Available(
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_prefix(b"n"))
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .collect(),
+    )
+}
+
+#[cfg(unix)]
+fn dirs_with_open_handles<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    snapshot: Option<&OpenHandleSnapshot>,
+) -> HashSet<PathBuf> {
     let paths = paths.map(Path::to_path_buf).collect::<Vec<_>>();
     if paths.is_empty() {
         return HashSet::new();
     }
+    if let Some(snapshot) = snapshot {
+        return match snapshot {
+            OpenHandleSnapshot::Available(open_paths) => {
+                match_open_handle_paths(&paths, open_paths)
+            }
+            OpenHandleSnapshot::Unavailable => HashSet::new(),
+            OpenHandleSnapshot::Indeterminate => paths.into_iter().collect(),
+        };
+    }
+
+    dirs_with_open_handles_fresh(&paths)
+}
+
+#[cfg(unix)]
+fn match_open_handle_paths(
+    candidates: &[PathBuf],
+    open_paths: &HashSet<PathBuf>,
+) -> HashSet<PathBuf> {
+    let candidates = candidates.iter().cloned().collect::<HashSet<_>>();
+    open_paths
+        .iter()
+        .flat_map(|open_path| open_path.ancestors())
+        .filter(|ancestor| candidates.contains(*ancestor))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+#[cfg(unix)]
+fn dirs_with_open_handles_fresh(paths: &[PathBuf]) -> HashSet<PathBuf> {
+    const LSOF_PATH_CHUNK_SIZE: usize = 64;
+
     let mut open = HashSet::new();
     for chunk in paths.chunks(LSOF_PATH_CHUNK_SIZE) {
         match probe_open_handles(chunk) {
@@ -2431,7 +2550,15 @@ fn lsof_probe_error(
 }
 
 #[cfg(not(unix))]
-fn dirs_with_open_handles<'a>(_paths: impl Iterator<Item = &'a Path>) -> HashSet<PathBuf> {
+fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
+    OpenHandleSnapshot::Unavailable
+}
+
+#[cfg(not(unix))]
+fn dirs_with_open_handles<'a>(
+    _paths: impl Iterator<Item = &'a Path>,
+    _snapshot: Option<&OpenHandleSnapshot>,
+) -> HashSet<PathBuf> {
     HashSet::new()
 }
 
@@ -2829,6 +2956,7 @@ fn execute_cleanup(
         manifest.generated_at.replace([':', '.'], "-"),
         std::process::id()
     );
+    let execution_open_handles = manifest.check_in_use.then(capture_open_handle_snapshot);
 
     eprintln!(
         "executing {pass:?} cleanup: {} worktrees, {} generated dirs, {} sweeps",
@@ -2868,6 +2996,18 @@ fn execute_cleanup(
         }
 
         if decision.action != GeneratedDirAction::Delete {
+            continue;
+        }
+        if !dirs_with_open_handles(
+            std::iter::once(decision.path.as_path()),
+            execution_open_handles.as_ref(),
+        )
+        .is_empty()
+        {
+            eprintln!(
+                "  keeping {} because a running process has open files inside it",
+                decision.path.display()
+            );
             continue;
         }
         let result = match with_protection_guard(&decision.path, SystemTime::now(), || {
@@ -4727,9 +4867,39 @@ mod tests {
         fs::write(held_path.join("held.lock"), "held")?;
         let _held = fs::File::open(held_path.join("held.lock"))?;
 
-        let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path));
+        let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path), None);
         assert!(open.contains(held_path));
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_handle_snapshot_matches_descendants_without_string_prefix_aliases() {
+        let candidate = PathBuf::from("/tmp/worktree-gc-cache");
+        let sibling = PathBuf::from("/tmp/worktree-gc-cache-other");
+        let snapshot = OpenHandleSnapshot::Available(HashSet::from([
+            candidate.join("deep/held.lock"),
+            PathBuf::from("/tmp/worktree-gc-cache-otherish/file"),
+        ]));
+        let candidates = [candidate.clone(), sibling];
+
+        let open = dirs_with_open_handles(candidates.iter().map(PathBuf::as_path), Some(&snapshot));
+
+        assert_eq!(open, HashSet::from([candidate]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indeterminate_open_handle_snapshot_protects_every_candidate() {
+        let candidates = [
+            PathBuf::from("/tmp/worktree-gc-first"),
+            PathBuf::from("/tmp/worktree-gc-second"),
+        ];
+        let snapshot = OpenHandleSnapshot::Indeterminate;
+
+        let open = dirs_with_open_handles(candidates.iter().map(PathBuf::as_path), Some(&snapshot));
+
+        assert_eq!(open, candidates.into_iter().collect());
     }
 
     #[cfg(unix)]
@@ -5290,6 +5460,7 @@ mod tests {
                 generated_days: 0,
                 generated_activity_only: true,
                 check_in_use: false,
+                open_handle_snapshot: None,
                 now: now(),
                 pressure: None,
             },
@@ -5490,6 +5661,7 @@ mod tests {
                 now: now(),
             },
             &[],
+            None,
         )?;
         assert!(run
             .manifest
@@ -5544,6 +5716,7 @@ mod tests {
                 now: now(),
             },
             &[],
+            None,
         )?;
         let external = repo
             .parent()
@@ -5591,6 +5764,7 @@ mod tests {
                 now: now(),
             },
             &[],
+            None,
         )?;
         let candidate = run
             .manifest
@@ -5679,6 +5853,58 @@ mod tests {
         cleanup(Some(&repo), options)?;
 
         assert!(!repo.join("node_modules").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_rechecks_open_handles_after_planning() -> Result<()> {
+        if Command::new("lsof")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: lsof unavailable");
+            return Ok(());
+        }
+
+        let (_temp, repo) = init_repo()?;
+        let generated = repo.join("node_modules");
+        fs::create_dir(&generated)?;
+        fs::write(generated.join("held.lock"), "held")?;
+        let expected = fs::canonicalize(&generated)?;
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 10_000,
+                generated_days: 0,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+            &[],
+            None,
+        )?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == expected)
+            .context("missing generated delete decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+
+        let _held = fs::File::open(generated.join("held.lock"))?;
+        run.manifest.check_in_use = true;
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
+
+        assert!(generated.exists());
         Ok(())
     }
 
