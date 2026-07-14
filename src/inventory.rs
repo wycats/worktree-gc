@@ -327,7 +327,7 @@ fn scan_root(
                 break;
             };
             let directory = &pending.path;
-            let directory_metadata = match fs::metadata(directory) {
+            let directory_metadata = match fs::symlink_metadata(directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     record_error(&mut aggregates, directory, &error.to_string());
@@ -336,6 +336,13 @@ fn scan_root(
                     continue;
                 }
             };
+            if !directory_metadata.is_dir() {
+                let message = "queued inventory directory is no longer a directory";
+                record_error(&mut aggregates, directory, message);
+                push_error(&mut errors, directory, message.to_string());
+                complete = false;
+                continue;
+            }
             pending.device = metadata_device(&directory_metadata);
             if options.one_filesystem && pending.device != root_device {
                 continue;
@@ -824,7 +831,7 @@ mod portable {
                         continue;
                     }
                 };
-                let metadata = match entry.metadata() {
+                let metadata = match fs::symlink_metadata(entry.path()) {
                     Ok(metadata) => metadata,
                     Err(error) => {
                         visitor(Err(io::Error::new(
@@ -1358,6 +1365,27 @@ mod tests {
 
         let error = inventory(&[link], InventoryOptions::default()).unwrap_err();
         assert!(error.to_string().contains("inventory root is a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_does_not_follow_a_nested_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let external = temp.path().join("external");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&external).unwrap();
+        write_bytes(&external.join("data"), 4096);
+        symlink(&external, root.join("external-link")).unwrap();
+
+        let report = inventory(&[root], InventoryOptions::default()).unwrap();
+
+        assert!(report.roots[0].complete);
+        assert_eq!(report.roots[0].metrics.files, 0);
+        assert_eq!(report.roots[0].metrics.logical_bytes, 0);
+        assert_eq!(report.roots[0].metrics.directories, 1);
     }
 
     #[test]
