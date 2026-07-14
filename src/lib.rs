@@ -1,4 +1,5 @@
 mod activity_age;
+mod bambu;
 mod cargo_incremental;
 mod cargo_profile_collect;
 mod cargo_profiles;
@@ -32,6 +33,11 @@ use time::OffsetDateTime;
 use walkdir::WalkDir;
 
 pub use activity_age::{ActivityAgeEvidence, WEEKDAY_CALENDAR_ID};
+pub use bambu::{
+    collect_bambu, print_bambu_collect, BambuCollectManifest, BambuCollectOptions, BambuCollectRun,
+    BambuIdentity, BambuLogAction, BambuLogFile, BambuLogPlan, BambuLogRoot, BambuPolicy,
+    BambuPruneOutcome,
+};
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profile_collect::{
     collect_cargo_profiles, print_cargo_profile_collect, CargoProfileCollectAction,

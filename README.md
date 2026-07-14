@@ -253,8 +253,8 @@ first free-space projection. Broad generated-root allocation and rebuild
 opportunities remain non-additive orientation evidence. Exact pnpm,
 Lima-retirement, Chromium-component, and Cargo-profile plans can become
 approval-ready when their owner manifests provide the required execution
-handoff. Bambu evidence remains review-required until its owner executor lands
-in the same release.
+handoff. Bambu diagnostic-log plans can also become approval-ready now that the
+same release contains their digest-bound owner executor.
 
 Parallels VM private bytes, allocated bytes, and owner compaction estimates are
 three overlapping views of durable VM state; they remain report-only until an
@@ -343,6 +343,41 @@ worktree-gc collect cargo-profiles \
 
 This remains a manual pressure/rebuild decision and does not widen unattended
 cleanup or interpret Cargo's private fingerprint graph.
+
+## Bambu Studio diagnostic-log collection
+
+Bambu Studio stores encrypted diagnostic captures beside durable application
+state. The manual collector recognizes only the stable, beta, and legacy suite
+`log` roots and Bambu's known rotated log names:
+
+```sh
+worktree-gc collect bambu
+worktree-gc collect bambu --retention-days 14 --max-entries 100000
+```
+
+Recognized regular logs older than the retention window are APFS-measured;
+recent logs remain retained. Unknown files, directories, symlinks, presets,
+plugins, projects, printers, and user state are outside the reclaim claim.
+Symlinked product or log roots fail closed. The collector records active Bambu
+process trees, one bounded machine-wide open-handle snapshot, recursive
+protections, and a digest of exact candidate identities and measurements.
+Missing liveness or private-byte evidence fails closed.
+
+Complete, inactive, single-filesystem plans are approval-ready but never
+unattended. Execution regenerates the exact retention plan under the collector
+and protection locks, requires the reviewed digest, and atomically moves only
+the named files into hidden same-filesystem quarantine directories. It checks
+processes and open handles again after the rename, restores files if ownership
+changed, and only then removes the exact quarantined files:
+
+```sh
+worktree-gc collect bambu --retention-days 14 --execute \
+  --approved-digest sha256:<digest-from-reviewed-manifest>
+```
+
+Interrupted quarantine fails subsequent plans closed for explicit recovery
+review. Custom roots are inventory-only and cannot be executed. Diagnostic
+contents may be sensitive, but are not an export prerequisite for deletion.
 
 ## pnpm shared-store collection
 

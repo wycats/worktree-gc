@@ -776,7 +776,7 @@ fn cargo_profile_evidence(
             .first()
             .and_then(|owner_path| filesystem_for_path(owner_path, inventory))
     });
-    let reviewable = envelope.mode == "dry_run"
+    let approval_ready = envelope.mode == "dry_run"
         && complete
         && private_complete
         && action == "report_only"
@@ -815,16 +815,16 @@ fn cargo_profile_evidence(
             label: "Explicitly reviewed rebuildable Cargo profiles".into(),
             bytes,
             kind: StorageClaimKind::ApfsPrivateReclaim,
-            readiness: if reviewable {
+            readiness: if approval_ready {
                 StorageClaimReadiness::ApprovalReady
             } else {
                 StorageClaimReadiness::ReportOnly
             },
-            additive: reviewable,
+            additive: approval_ready,
             overlap_group: None,
             filesystem,
             approval_digest,
-            execution_command: reviewable.then_some(execution_command).flatten(),
+            execution_command: approval_ready.then_some(execution_command).flatten(),
             evidence: format!(
                 "{} direct debug/release profiles derived from generated manifest {} ({source_sha256}); profile identities, APFS measurements, open handles, protections, and Cargo locks are revalidated",
                 candidates.len(),
@@ -876,6 +876,8 @@ fn bambu_evidence(
     )?;
     let approval_digest = optional_string_at(&envelope.plan, &["eligibility_digest"]);
     let valid_approval_digest = approval_digest.as_deref().is_some_and(valid_sha256_digest);
+    let retention_days = u64_at(&envelope.policy, &["retention_days"])?;
+    let max_entries = u64_at(&envelope.policy, &["max_entries"])?;
 
     let mut owner_paths = log_roots
         .iter()
@@ -899,7 +901,7 @@ fn bambu_evidence(
     let execution_compatible = candidate_filesystems.len() == 1
         && !candidate_filesystems.contains("unknown")
         && owner_declared_default_roots;
-    let reviewable = envelope.mode == "dry_run"
+    let approval_ready = envelope.mode == "dry_run"
         && complete
         && private_complete
         && action == "report_only"
@@ -909,7 +911,7 @@ fn bambu_evidence(
     let mut warnings = vec![
         "only recognized encrypted diagnostic-log names are included; application state, presets, plugins, projects, and printers are excluded"
             .into(),
-        "this stack can compose Bambu diagnostics evidence but does not yet include the Bambu owner executor; claims remain review-required"
+        "execution remains manual and must reproduce the exact owner, liveness, protection, file-identity, filesystem, and APFS-private evidence bound by the reviewed digest"
             .into(),
     ];
     if !owner_declared_default_roots {
@@ -927,6 +929,20 @@ fn bambu_evidence(
         owner_paths
             .first()
             .and_then(|owner_path| filesystem_for_path(owner_path, inventory))
+    });
+    let execution_command = approval_digest.as_ref().map(|digest| {
+        vec![
+            "worktree-gc".into(),
+            "collect".into(),
+            "bambu".into(),
+            "--retention-days".into(),
+            retention_days.to_string(),
+            "--max-entries".into(),
+            max_entries.to_string(),
+            "--execute".into(),
+            "--approved-digest".into(),
+            digest.clone(),
+        ]
     });
 
     Ok(StorageCollectorEvidence {
@@ -946,16 +962,16 @@ fn bambu_evidence(
             label: "Expired Bambu Studio encrypted diagnostic logs".into(),
             bytes,
             kind: StorageClaimKind::ApfsPrivateReclaim,
-            readiness: if reviewable {
-                StorageClaimReadiness::ReviewRequired
+            readiness: if approval_ready {
+                StorageClaimReadiness::ApprovalReady
             } else {
                 StorageClaimReadiness::ReportOnly
             },
-            additive: reviewable,
+            additive: approval_ready,
             overlap_group: None,
             filesystem: claim_filesystem,
             approval_digest,
-            execution_command: None,
+            execution_command: approval_ready.then_some(execution_command).flatten(),
             evidence: format!(
                 "{} exact expired files, complete process/open-handle/protection/APFS evidence required",
                 candidates.len()
@@ -2422,7 +2438,7 @@ mod tests {
     }
 
     #[test]
-    fn bambu_diagnostics_remain_review_required_without_the_owner_executor() -> Result<()> {
+    fn bambu_diagnostics_become_approval_ready_with_the_owner_executor() -> Result<()> {
         let envelope: CollectorEnvelope = serde_json::from_value(serde_json::json!({
             "manifest_version": 4,
             "collector": "bambu-logs",
@@ -2457,10 +2473,26 @@ mod tests {
         assert_eq!(evidence.claims[0].bytes, 800);
         assert_eq!(
             evidence.claims[0].readiness,
-            StorageClaimReadiness::ReviewRequired
+            StorageClaimReadiness::ApprovalReady
         );
         assert!(evidence.claims[0].additive);
-        assert!(evidence.claims[0].execution_command.is_none());
+        assert_eq!(
+            evidence.claims[0].execution_command.as_deref(),
+            Some(
+                &[
+                    "worktree-gc".to_string(),
+                    "collect".to_string(),
+                    "bambu".to_string(),
+                    "--retention-days".to_string(),
+                    "14".to_string(),
+                    "--max-entries".to_string(),
+                    "100000".to_string(),
+                    "--execute".to_string(),
+                    "--approved-digest".to_string(),
+                    format!("sha256:{}", "a".repeat(64)),
+                ][..]
+            )
+        );
         Ok(())
     }
 

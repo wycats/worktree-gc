@@ -290,7 +290,13 @@ The implementation order is intentionally useful after every merge:
    into the reviewed dry-run digest; age alone cannot supply that intent.
    Execution remains manual because Lima exposes no instance/download handoff
    lock, and the exact plan must reproduce after the final guarded replan.
-9. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
+9. **Owner-declared diagnostic caches.** Recognize only the owning
+   application's bounded diagnostic namespace, retain recent files, and require
+   complete process, open-handle, protection, and APFS-private evidence before
+   a digest-bound plan becomes approval-ready. Bambu Studio's encrypted rotated
+   logs are the first implementation; presets, plugins, projects, printers, and
+   other user state remain outside the collector.
+10. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
    and application stores begin report-only. Activity must come from the
    owning application's task/database model rather than generic file mtimes
    when the owner rewrites or reindexes old content. A domain graduates to

@@ -6,12 +6,13 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup_repositories_with_parallelism, cleanup_roots_with_parallelism,
-    cleanup_with_parallelism, collect_cargo_profiles, collect_chromium_components,
+    cleanup_with_parallelism, collect_bambu, collect_cargo_profiles, collect_chromium_components,
     collect_generated, collect_lima, collect_pnpm, discover_repositories_bounded, inventory,
-    list_protections, print_cargo_profile_collect, print_chromium_component_collect, print_cleanup,
-    print_generated_collect, print_inventory, print_lima_collect, print_pnpm_collect,
-    print_root_cleanup, print_root_triage, print_storage_survey, print_triage, remove_protection,
-    renew_protection, storage_survey, triage_roots_with_parallelism, triage_with_parallelism,
+    list_protections, print_bambu_collect, print_cargo_profile_collect,
+    print_chromium_component_collect, print_cleanup, print_generated_collect, print_inventory,
+    print_lima_collect, print_pnpm_collect, print_root_cleanup, print_root_triage,
+    print_storage_survey, print_triage, remove_protection, renew_protection, storage_survey,
+    triage_roots_with_parallelism, triage_with_parallelism, BambuCollectOptions,
     CargoProfileCollectOptions, ChromiumComponentCollectOptions, CleanupOptions,
     GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, LimaCollectOptions,
     PnpmCollectOptions, PressurePolicy, StorageSurveyOptions, SweepLimit, SweepStrategy, SweepTool,
@@ -204,6 +205,34 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CollectorCommand {
+    /// Inventory expired Bambu Studio encrypted diagnostic logs
+    Bambu {
+        #[arg(long, help = "Revalidate and delete only an approved dry-run plan")]
+        execute: bool,
+
+        #[arg(
+            long,
+            value_name = "SHA256",
+            requires = "execute",
+            help = "Execute only the exact eligibility digest from a reviewed dry-run"
+        )]
+        approved_digest: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = 14,
+            help = "Retain recognized diagnostic logs modified within this many days"
+        )]
+        retention_days: u64,
+
+        #[arg(
+            long,
+            default_value_t = 100_000,
+            help = "Maximum file entries to APFS-measure across Bambu log roots"
+        )]
+        max_entries: u64,
+    },
+
     /// Inventory whole re-downloadable Chromium component roots for a manual cache reset
     ChromiumComponents {
         #[arg(long, help = "Revalidate and delete only an approved dry-run plan")]
@@ -753,6 +782,22 @@ fn main() -> Result<()> {
                 "collect takes domain roots as positional arguments; do not pass --repo or --root"
             );
             match command {
+                CollectorCommand::Bambu {
+                    execute,
+                    approved_digest,
+                    retention_days,
+                    max_entries,
+                } => {
+                    let run = collect_bambu(BambuCollectOptions {
+                        execute,
+                        approved_digest,
+                        roots: Vec::new(),
+                        retention_days,
+                        max_entries,
+                        now,
+                    })?;
+                    print_bambu_collect(&run);
+                }
                 CollectorCommand::ChromiumComponents {
                     execute,
                     approved_digest,
@@ -1721,6 +1766,62 @@ stale_days = 7
                 assert_eq!(target_free, ["100GiB", "150GiB"]);
                 assert_eq!(approval_max_age_minutes, 15);
                 assert!(json);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn bambu_collector_cli_is_digest_bound_and_bounded() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "bambu",
+            "--retention-days",
+            "30",
+            "--max-entries",
+            "123",
+        ])
+        .expect("Bambu collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Bambu {
+                        execute,
+                        approved_digest,
+                        retention_days,
+                        max_entries,
+                    },
+            } => {
+                assert!(!execute);
+                assert_eq!(approved_digest, None);
+                assert_eq!(retention_days, 30);
+                assert_eq!(max_entries, 123);
+            }
+            _ => unreachable!(),
+        }
+
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let execute = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "bambu",
+            "--execute",
+            "--approved-digest",
+            &digest,
+        ])
+        .expect("digest-bound Bambu execution CLI should parse");
+        match execute.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Bambu {
+                        execute,
+                        approved_digest,
+                        ..
+                    },
+            } => {
+                assert!(execute);
+                assert_eq!(approved_digest.as_deref(), Some(digest.as_str()));
             }
             _ => unreachable!(),
         }
