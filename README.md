@@ -248,10 +248,10 @@ into `approval_ready`, `review_required`, and `report_only`. Only additive
 APFS-private claims with an exact owner execution handoff contribute to the
 first free-space projection. Broad generated-root allocation and rebuild
 opportunities remain non-additive orientation evidence. Exact pnpm,
-Lima-retirement, and Chromium-component plans can become approval-ready when
-their owner manifests provide the required execution handoff. Cargo-profile
-and Bambu evidence remains review-required until their owner executors land in
-the same release.
+Lima-retirement, Chromium-component, and Cargo-profile plans can become
+approval-ready when their owner manifests provide the required execution
+handoff. Bambu evidence remains review-required until its owner executor lands
+in the same release.
 
 Additive claims default to a 15-minute evidence lifetime. Older or future-dated
 manifests remain visible but become non-additive report-only evidence with no

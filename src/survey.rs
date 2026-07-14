@@ -755,6 +755,7 @@ fn cargo_profile_evidence(
     let invalid_approval_digest = approval_digest.is_some() && !valid_approval_digest;
     let generated_manifest = path_at(&envelope.source, &["generated_manifest"])?;
     let source_sha256 = string_at(&envelope.source, &["generated_manifest_sha256"])?;
+    let max_entries = u64_at(&envelope.policy, &["max_entries"])?;
     let mut owner_paths = candidates
         .iter()
         .map(|candidate| path_at(candidate, &["profile_path"]))
@@ -778,6 +779,20 @@ fn cargo_profile_evidence(
         && filesystems.len() == 1
         && !filesystems.contains("unknown")
         && valid_approval_digest;
+    let execution_command = approval_digest.as_ref().map(|digest| {
+        vec![
+            "worktree-gc".into(),
+            "collect".into(),
+            "cargo-profiles".into(),
+            "--generated-manifest".into(),
+            generated_manifest.display().to_string(),
+            "--max-entries".into(),
+            max_entries.to_string(),
+            "--execute".into(),
+            "--approved-digest".into(),
+            digest.clone(),
+        ]
+    });
     Ok(StorageCollectorEvidence {
         collector: envelope.collector,
         manifest_path: path.to_path_buf(),
@@ -796,7 +811,7 @@ fn cargo_profile_evidence(
             bytes,
             kind: StorageClaimKind::ApfsPrivateReclaim,
             readiness: if reviewable {
-                StorageClaimReadiness::ReviewRequired
+                StorageClaimReadiness::ApprovalReady
             } else {
                 StorageClaimReadiness::ReportOnly
             },
@@ -804,7 +819,7 @@ fn cargo_profile_evidence(
             overlap_group: None,
             filesystem,
             approval_digest,
-            execution_command: None,
+            execution_command: reviewable.then_some(execution_command).flatten(),
             evidence: format!(
                 "{} direct debug/release profiles derived from generated manifest {} ({source_sha256}); profile identities, APFS measurements, open handles, protections, and Cargo locks are revalidated",
                 candidates.len(),
@@ -817,7 +832,7 @@ fn cargo_profile_evidence(
                     .into(),
                 "explicit approval accepts rebuild cost even when profile activity is newer than routine TTL policy"
                     .into(),
-                "this stack can compose Cargo-profile evidence but does not yet include the explicit profile-plan executor; claims remain review-required"
+                "execution remains manual: approve one exact dry-run digest, then revalidate source-manifest identity, Git ownership, profile identity, open handles, protections, and Cargo locks"
                     .into(),
             ];
             if invalid_approval_digest {
@@ -2130,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_profiles_remain_review_required_without_the_profile_executor() -> Result<()> {
+    fn cargo_profiles_become_approval_ready_with_the_profile_executor() -> Result<()> {
         let envelope: CollectorEnvelope = serde_json::from_value(serde_json::json!({
             "manifest_version": 1,
             "collector": "cargo-profile-opportunities",
@@ -2163,11 +2178,32 @@ mod tests {
 
         assert_eq!(
             evidence.claims[0].readiness,
-            StorageClaimReadiness::ReviewRequired
+            StorageClaimReadiness::ApprovalReady
         );
         assert!(evidence.claims[0].additive);
         assert_eq!(evidence.claims[0].bytes, 900);
-        assert!(evidence.claims[0].execution_command.is_none());
+        assert_eq!(
+            evidence.claims[0].execution_command.as_deref(),
+            Some(
+                [
+                    "worktree-gc",
+                    "collect",
+                    "cargo-profiles",
+                    "--generated-manifest",
+                    "/tmp/generated.json",
+                    "--max-entries",
+                    "100000",
+                    "--execute",
+                    "--approved-digest",
+                    concat!(
+                        "sha256:",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                ]
+                .map(str::to_owned)
+                .as_slice()
+            )
+        );
         Ok(())
     }
 
