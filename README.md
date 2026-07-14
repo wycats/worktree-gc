@@ -238,10 +238,11 @@ worktree-gc collect generated ~/Code --max-entries 2000000
 ```
 
 The collector discovers Git repositories and linked worktrees with one worker,
-takes one machine-wide open-handle snapshot using `lsof`, and reuses cleanup's
-tracked-file, ignore, activity, and recursive-protection classification. It
-then APFS-measures each discovered `target`, `.next`, `.turbo`, `node_modules`,
-and report-only `dist` root under one fair global entry budget.
+takes one bounded machine-wide open-handle snapshot (native on macOS, with the
+portable Unix fallback elsewhere), and reuses cleanup's tracked-file, ignore,
+activity, and recursive-protection classification. It then APFS-measures each
+discovered `target`, `.next`, `.turbo`, `node_modules`, and report-only `dist`
+root under one fair global entry budget.
 
 Measurement is retained even when a root is active or protected because size
 evidence is not deletion permission. The manifest separately reports

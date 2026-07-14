@@ -183,8 +183,8 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
     anyhow::ensure!(options.max_entries > 0, "max_entries must be at least 1");
 
     // Repository planning is deliberately serialized. The collector is a
-    // background orientation surface, not a reason to fan Git and lsof work
-    // out across every checkout at once.
+    // background orientation surface, not a reason to fan Git and process
+    // ownership work out across every checkout at once.
     let triage = triage_roots_with_parallelism(
         &options.roots,
         TriageOptions {

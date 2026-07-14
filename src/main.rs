@@ -961,6 +961,40 @@ mod tests {
     }
 
     #[test]
+    fn generated_collector_accepts_bounded_multi_root_options() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "generated",
+            "/tmp/one",
+            "/tmp/two",
+            "--generated-days",
+            "3",
+            "--max-entries",
+            "99",
+        ])
+        .expect("generated collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Generated {
+                        roots,
+                        generated_days,
+                        max_entries,
+                    },
+            } => {
+                assert_eq!(
+                    roots,
+                    [PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
+                );
+                assert_eq!(generated_days, 3);
+                assert_eq!(max_entries, 99);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
     fn default_sweep_can_be_overridden_and_composed() {
         let config = cleanup_config(&[
             "--sweep",
