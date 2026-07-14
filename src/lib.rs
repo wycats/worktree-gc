@@ -1,8 +1,8 @@
 mod cargo_incremental;
 mod cargo_profiles;
+mod inventory;
 #[cfg(target_os = "macos")]
 mod macos_open_handles;
-mod inventory;
 mod protection;
 
 use anyhow::{bail, Context, Result};
