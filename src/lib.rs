@@ -1,5 +1,6 @@
 mod activity_age;
 mod cargo_incremental;
+mod cargo_profile_collect;
 mod cargo_profiles;
 mod chromium_components;
 mod generated;
@@ -32,6 +33,12 @@ use walkdir::WalkDir;
 
 pub use activity_age::{ActivityAgeEvidence, WEEKDAY_CALENDAR_ID};
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
+pub use cargo_profile_collect::{
+    collect_cargo_profiles, print_cargo_profile_collect, CargoProfileCollectAction,
+    CargoProfileCollectManifest, CargoProfileCollectOptions, CargoProfileCollectOutcome,
+    CargoProfileCollectPlan, CargoProfileCollectRun, CargoProfilePolicy,
+    CargoProfileResetCandidate, CargoProfileSource,
+};
 pub use cargo_profiles::CargoProfileCandidateDecision;
 pub use chromium_components::{
     collect_chromium_components, print_chromium_component_collect, ChromiumComponentAction,
@@ -3470,6 +3477,7 @@ fn run_sweeps(
                     &sweep.limit,
                     run_id,
                     cargo_lock_timeout,
+                    None,
                 )?;
             }
             // External cargo-sweep failures remain non-fatal so the rest of

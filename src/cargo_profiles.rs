@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use cargo_metadata::MetadataCommand;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -192,6 +193,7 @@ pub(crate) fn execute_cargo_profile_reset(
     limit: &SweepLimit,
     run_id: &str,
     timeout: Option<Duration>,
+    expected_identities: Option<&BTreeMap<PathBuf, String>>,
 ) -> Result<()> {
     let target_dir = fs::canonicalize(target_dir)
         .with_context(|| format!("failed to resolve {}", target_dir.display()))?;
@@ -255,6 +257,15 @@ pub(crate) fn execute_cargo_profile_reset(
                         candidate.path.display()
                     );
                 }
+                if let Some(expected_identity) =
+                    expected_identities.and_then(|identities| identities.get(&candidate.path))
+                {
+                    anyhow::ensure!(
+                        cargo_profile_file_identity(&metadata) == *expected_identity,
+                        "Cargo profile identity changed before quarantine: {}",
+                        candidate.path.display()
+                    );
+                }
                 let run_trash = trash_root.join(run_id);
                 fs::create_dir_all(&run_trash)?;
                 let destination = run_trash.join(
@@ -285,6 +296,37 @@ pub(crate) fn execute_cargo_profile_reset(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn cargo_profile_file_identity(metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!(
+        "device:{}:inode:{}:mtime:{}:{}:ctime:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    )
+}
+
+#[cfg(not(unix))]
+pub(crate) fn cargo_profile_file_identity(metadata: &fs::Metadata) -> String {
+    format!(
+        "modified:{}:created:{}",
+        metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_unix)
+            .unwrap_or_default(),
+        metadata
+            .created()
+            .ok()
+            .and_then(system_time_to_unix)
+            .unwrap_or_default()
+    )
 }
 
 fn remove_quarantine_entry(path: &Path) -> Result<()> {
@@ -663,6 +705,7 @@ mod tests {
             &limit,
             "test-run",
             Some(Duration::from_secs(10)),
+            None,
         )?;
 
         assert!(!profile.exists());
@@ -685,10 +728,45 @@ mod tests {
             &limit,
             "test-run",
             Some(Duration::from_secs(10)),
+            None,
         )?;
 
         assert!(!profile.exists());
         assert!(repo.join("Cargo.toml").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_reset_rejects_a_replaced_profile_identity() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture(&profile)?;
+        let target = repo.join("target");
+        let limit = elapsed_days(7);
+        let plan = plan_cargo_profile_sweep(&target, &repo, &limit, SystemTime::now())?;
+        let canonical_profile = fs::canonicalize(&profile)?;
+        let expected_identity = cargo_profile_file_identity(&fs::symlink_metadata(&profile)?);
+
+        fs::remove_dir_all(&profile)?;
+        fs::create_dir_all(profile.join("deps"))?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        fs::write(profile.join("deps/libfixture-old.rlib"), "replacement")?;
+        age_fixture(&profile)?;
+
+        let expected = BTreeMap::from([(canonical_profile, expected_identity)]);
+        let error = execute_cargo_profile_reset(
+            &target,
+            &repo,
+            &plan.candidates,
+            &limit,
+            "test-run",
+            Some(Duration::from_secs(10)),
+            Some(&expected),
+        )
+        .expect_err("a replaced Cargo profile must not be quarantined");
+
+        assert!(error.to_string().contains("identity changed"));
+        assert!(profile.join("deps/libfixture-old.rlib").is_file());
+        assert!(!repo.join("target/.worktree-gc-trash").exists());
         Ok(())
     }
 
@@ -708,6 +786,7 @@ mod tests {
             &limit,
             "test-run",
             Some(Duration::from_secs(10)),
+            None,
         )?;
 
         assert!(profile.is_dir());
@@ -784,6 +863,7 @@ mod tests {
             &limit,
             "test-run",
             Some(Duration::from_secs(2)),
+            None,
         )?;
         refresher.join().expect("refresher thread panicked")?;
 
@@ -812,6 +892,7 @@ mod tests {
             &limit,
             "test-run",
             Some(Duration::from_millis(20)),
+            None,
         )
         .expect_err("contended Cargo profile should time out");
         assert!(crate::cargo_incremental::is_cargo_lock_timeout(&error));
@@ -841,6 +922,7 @@ mod tests {
             &limit,
             "test-run",
             Some(Duration::from_secs(10)),
+            None,
         )?;
         assert!(!repo.join("target/.worktree-gc-trash").exists());
         Ok(())

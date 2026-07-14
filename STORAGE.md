@@ -235,7 +235,13 @@ The implementation order is intentionally useful after every merge:
    such as Codex-managed Git worktrees can then reuse the existing generated
    collectors; task metadata is advisory, while protections, Git state, open
    handles, Cargo locks, and execution-time revalidation remain authoritative.
-5. **Shared package-store collectors.** Discover pnpm's canonical content store
+5. **Pressure-aware Cargo profiles.** Convert one exact generated-root manifest
+   into digest-bound direct `target/debug` and `target/release` reset plans.
+   Revalidate Git ownership, ignored/tracked state, open handles, recursive
+   protections, filesystem and profile identity, then use Cargo profile locks
+   and same-filesystem quarantine. This accepts a bounded rebuild without
+   deleting whole target trees or interpreting private fingerprints.
+6. **Shared package-store collectors.** Discover pnpm's canonical content store
    through pnpm and wrap official prune semantics with preflight, protections,
    measurement, and verification. Treat pnpm's metadata and `dlx` caches as a
    separate candidate domain: their path allocation can be mostly shared on
@@ -249,14 +255,14 @@ The implementation order is intentionally useful after every merge:
    then delegates to the reviewed pnpm `store prune` operation. pnpm exposes no
    interprocess prune lock, so this handoff remains explicitly user-approved
    rather than scheduled.
-6. **Closed browser component caches.** Treat a Chromium profile root as mixed
+7. **Closed browser component caches.** Treat a Chromium profile root as mixed
    durable state, then admit only a closed list of whole re-downloadable model
    directories. Explicit profile identity, browser-process ownership, one
    bounded open-handle snapshot, recursive protections, APFS-private bytes,
    and exact component identities must all revalidate. This is a manual
    whole-component reset with explicit download cost; profile data and unknown
    roots never enter the claim.
-7. **Container/VM collectors.** Treat Docker/OrbStack, Lima, and Parallels as
+8. **Container/VM collectors.** Treat Docker/OrbStack, Lima, and Parallels as
    separate domains. Use their public inventory/prune/compact interfaces and
    surface running or suspended state. VM deletion or archival remains an
    explicit user decision.
@@ -275,7 +281,7 @@ The implementation order is intentionally useful after every merge:
    into the reviewed dry-run digest; age alone cannot supply that intent.
    Execution remains manual because Lima exposes no instance/download handoff
    lock, and the exact plan must reproduce after the final guarded replan.
-8. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
+9. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
    and application stores begin report-only. Activity must come from the
    owning application's task/database model rather than generic file mtimes
    when the owner rewrites or reindexes old content. A domain graduates to

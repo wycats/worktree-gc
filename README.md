@@ -300,6 +300,39 @@ The collector also records the scheduled three-workday retention window for
 `target`, `.next`, and `.turbo`, including timezone/calendar evidence.
 `--generated-days` retains elapsed-day meaning for other artifact classes.
 
+### Explicit Cargo profile opportunity resets
+
+The generated collector intentionally reports complete, owner-free,
+unprotected `target` roots even when routine retention keeps them. A second
+collector converts only those explicit observations into direct host `debug`
+and `release` profile candidates:
+
+```sh
+worktree-gc collect cargo-profiles \
+  --generated-manifest ~/.local/state/worktree-gc/collectors/<run>-generated-dry-run.json
+```
+
+The plan binds the source manifest hash, current Git worktree and HEAD, exact
+profile paths and identities, Cargo profile names, filesystem identities, and
+APFS-private measurements into a SHA-256 approval digest. It excludes
+nested/custom targets, incomplete measurements, tracked or unignored content,
+open owners, and recursive protections. Whole `target` deletion is never
+inferred.
+
+Explicit execution regenerates the exact plan, requires the approved digest,
+rechecks protections and open handles, and atomically quarantines only the
+named profiles while holding Cargo's profile locks. Busy locks fail
+immediately:
+
+```sh
+worktree-gc collect cargo-profiles \
+  --generated-manifest <same-generated-manifest> \
+  --execute --approved-digest sha256:<reviewed-digest>
+```
+
+This remains a manual pressure/rebuild decision and does not widen unattended
+cleanup or interpret Cargo's private fingerprint graph.
+
 ## pnpm shared-store collection
 
 The first machine-wide owner collector wraps pnpm's maintained prune operation.

@@ -6,17 +6,18 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup_repositories_with_parallelism, cleanup_roots_with_parallelism,
-    cleanup_with_parallelism, collect_chromium_components, collect_generated, collect_lima,
-    collect_pnpm, discover_repositories_bounded, inventory, list_protections,
-    print_chromium_component_collect, print_cleanup, print_generated_collect, print_inventory,
-    print_lima_collect, print_pnpm_collect, print_root_cleanup, print_root_triage,
-    print_storage_survey, print_triage, remove_protection, renew_protection, storage_survey,
-    triage_roots_with_parallelism, triage_with_parallelism, ChromiumComponentCollectOptions,
-    CleanupOptions, GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions,
-    LimaCollectOptions, PnpmCollectOptions, PressurePolicy, StorageSurveyOptions, SweepLimit,
-    SweepStrategy, SweepTool, TriageOptions, DEFAULT_APPROVAL_MAX_AGE_SECONDS,
-    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS,
-    DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    cleanup_with_parallelism, collect_cargo_profiles, collect_chromium_components,
+    collect_generated, collect_lima, collect_pnpm, discover_repositories_bounded, inventory,
+    list_protections, print_cargo_profile_collect, print_chromium_component_collect, print_cleanup,
+    print_generated_collect, print_inventory, print_lima_collect, print_pnpm_collect,
+    print_root_cleanup, print_root_triage, print_storage_survey, print_triage, remove_protection,
+    renew_protection, storage_survey, triage_roots_with_parallelism, triage_with_parallelism,
+    CargoProfileCollectOptions, ChromiumComponentCollectOptions, CleanupOptions,
+    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, LimaCollectOptions,
+    PnpmCollectOptions, PressurePolicy, StorageSurveyOptions, SweepLimit, SweepStrategy, SweepTool,
+    TriageOptions, DEFAULT_APPROVAL_MAX_AGE_SECONDS, DEFAULT_GENERATED_DAYS,
+    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -323,6 +324,34 @@ enum CollectorCommand {
             long,
             default_value_t = 2_000_000,
             help = "Maximum entries to APFS-measure across all generated roots"
+        )]
+        max_entries: u64,
+    },
+
+    /// Convert complete generated target observations into atomic Cargo profile reset plans
+    CargoProfiles {
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Explicit generated collector manifest containing rebuildable target opportunities"
+        )]
+        generated_manifest: PathBuf,
+
+        #[arg(long, help = "Revalidate and reset only an approved dry-run plan")]
+        execute: bool,
+
+        #[arg(
+            long,
+            value_name = "SHA256",
+            requires = "execute",
+            help = "Execute only the exact eligibility digest from a reviewed dry-run"
+        )]
+        approved_digest: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = 2_000_000,
+            help = "Maximum entries to APFS-measure across selected Cargo profiles"
         )]
         max_entries: u64,
     },
@@ -785,6 +814,21 @@ fn main() -> Result<()> {
                         now,
                     })?;
                     print_generated_collect(&run);
+                }
+                CollectorCommand::CargoProfiles {
+                    generated_manifest,
+                    execute,
+                    approved_digest,
+                    max_entries,
+                } => {
+                    let run = collect_cargo_profiles(CargoProfileCollectOptions {
+                        execute,
+                        approved_digest,
+                        generated_manifest,
+                        max_entries,
+                        now,
+                    })?;
+                    print_cargo_profile_collect(&run);
                 }
             }
         }
