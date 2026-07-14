@@ -142,7 +142,7 @@ struct PendingHardlink {
     expected_links: u64,
     observed_links: u64,
     common_parent: PathBuf,
-    private_reclaimable_bytes: Option<u64>,
+    file: FileMeasurement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +373,7 @@ fn scan_root(
         .unwrap_or(u64::MAX);
         let directory_budget = directory_visit_budget(*remaining_entries, queued_directories);
         let directory_device = pending.device;
+        let mut yielded_entries = 0u64;
         let visit = pending
             .reader
             .as_mut()
@@ -380,6 +381,7 @@ fn scan_root(
             .visit(directory, directory_budget, &mut |result: io::Result<
                 DirectoryEntryMeasurement,
             >| {
+                yielded_entries = yielded_entries.saturating_add(1);
                 let entry = match result {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -416,16 +418,6 @@ fn scan_root(
                             }
                         } else if let Some(file) = entry.file {
                             if entry.link_count.unwrap_or(1) > 1 {
-                                let private_reclaimable_bytes = file.private_reclaimable_bytes;
-                                add_file(
-                                    &mut aggregates,
-                                    &path,
-                                    &FileMeasurement {
-                                        private_reclaimable_bytes: private_reclaimable_bytes
-                                            .map(|_| 0),
-                                        ..file
-                                    },
-                                );
                                 if let Some(file_key) = file_key {
                                     pending_hardlinks.insert(
                                         file_key,
@@ -436,7 +428,18 @@ fn scan_root(
                                                 .parent()
                                                 .expect("file has a parent")
                                                 .to_path_buf(),
-                                            private_reclaimable_bytes,
+                                            file,
+                                        },
+                                    );
+                                } else {
+                                    add_file(
+                                        &mut aggregates,
+                                        &path,
+                                        &FileMeasurement {
+                                            private_reclaimable_bytes: file
+                                                .private_reclaimable_bytes
+                                                .map(|_| 0),
+                                            ..file
                                         },
                                     );
                                 }
@@ -453,6 +456,12 @@ fn scan_root(
                     EntryKind::Other => {}
                 }
             });
+        let visit = charge_directory_visit(
+            visit,
+            yielded_entries,
+            &mut visited_entries,
+            remaining_entries,
+        );
         let visit = match visit {
             Ok(visit) => visit,
             Err(error) => {
@@ -462,19 +471,25 @@ fn scan_root(
                 continue;
             }
         };
-        visited_entries = visited_entries.saturating_add(visit.visited_entries);
-        *remaining_entries = remaining_entries.saturating_sub(visit.visited_entries);
         if !visit.exhausted {
             open_directory_readers.push_back(pending);
         }
     }
 
     for pending in pending_hardlinks.into_values() {
-        if pending.observed_links >= pending.expected_links {
-            if let Some(private) = pending.private_reclaimable_bytes {
-                add_private_reclaimable(&mut aggregates, &pending.common_parent, private);
-            }
-        }
+        let private_reclaimable_bytes = if pending.observed_links >= pending.expected_links {
+            pending.file.private_reclaimable_bytes
+        } else {
+            pending.file.private_reclaimable_bytes.map(|_| 0)
+        };
+        add_file(
+            &mut aggregates,
+            &pending.common_parent,
+            &FileMeasurement {
+                private_reclaimable_bytes,
+                ..pending.file
+            },
+        );
     }
 
     let root_metrics = aggregates
@@ -491,6 +506,20 @@ fn scan_root(
         entries,
         errors,
     })
+}
+
+fn charge_directory_visit(
+    visit: io::Result<DirectoryVisit>,
+    yielded_entries: u64,
+    visited_entries: &mut u64,
+    remaining_entries: &mut u64,
+) -> io::Result<DirectoryVisit> {
+    if let Ok(completed) = &visit {
+        debug_assert_eq!(completed.visited_entries, yielded_entries);
+    }
+    *visited_entries = visited_entries.saturating_add(yielded_entries);
+    *remaining_entries = remaining_entries.saturating_sub(yielded_entries);
+    visit
 }
 
 fn directory_visit_budget(remaining_entries: u64, queued_directories: u64) -> u64 {
@@ -571,17 +600,6 @@ fn add_file(
         } else {
             metrics.private_unknown_files += 1;
         }
-    }
-}
-
-fn add_private_reclaimable(
-    aggregates: &mut BTreeMap<PathBuf, MetricsAccumulator>,
-    path: &Path,
-    bytes: u64,
-) {
-    for key in aggregate_keys(aggregates, path) {
-        let metrics = aggregates.get_mut(&key).expect("aggregate key exists");
-        metrics.private_reclaimable_bytes = metrics.private_reclaimable_bytes.saturating_add(bytes);
     }
 }
 
@@ -1172,12 +1190,14 @@ mod macos {
         } else {
             None
         };
-        let logical_bytes = if returned.fileattr & ATTR_FILE_TOTALSIZE != 0 {
+        let has_logical_bytes = returned.fileattr & ATTR_FILE_TOTALSIZE != 0;
+        let logical_bytes = if has_logical_bytes {
             read_value::<i64>(buffer, &mut offset)?.max(0) as u64
         } else {
             0
         };
-        let allocated_bytes = if returned.fileattr & ATTR_FILE_ALLOCSIZE != 0 {
+        let has_allocated_bytes = returned.fileattr & ATTR_FILE_ALLOCSIZE != 0;
+        let allocated_bytes = if has_allocated_bytes {
             read_value::<i64>(buffer, &mut offset)?.max(0) as u64
         } else {
             0
@@ -1192,6 +1212,7 @@ mod macos {
             VDIR => EntryKind::Directory,
             _ => EntryKind::Other,
         };
+        validate_file_size_attrs(kind, has_logical_bytes, has_allocated_bytes)?;
         Ok(DirectoryEntryMeasurement {
             name,
             kind,
@@ -1203,6 +1224,20 @@ mod macos {
                 private_reclaimable_bytes,
             }),
         })
+    }
+
+    fn validate_file_size_attrs(
+        kind: EntryKind,
+        has_logical_bytes: bool,
+        has_allocated_bytes: bool,
+    ) -> io::Result<()> {
+        if kind == EntryKind::File && (!has_logical_bytes || !has_allocated_bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "getattrlistbulk omitted required file size attributes",
+            ));
+        }
+        Ok(())
     }
 
     fn read_value<T: Copy>(buffer: &[u8], offset: &mut usize) -> io::Result<T> {
@@ -1219,6 +1254,19 @@ mod macos {
         *offset = end;
         Ok(value)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn regular_files_require_both_size_attributes() {
+            assert!(validate_file_size_attrs(EntryKind::File, true, true).is_ok());
+            assert!(validate_file_size_attrs(EntryKind::File, false, true).is_err());
+            assert!(validate_file_size_attrs(EntryKind::File, true, false).is_err());
+            assert!(validate_file_size_attrs(EntryKind::Directory, false, false).is_ok());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1231,6 +1279,23 @@ mod tests {
     fn directory_budget_preserves_fair_slices() {
         assert_eq!(directory_visit_budget(1_000, 100), 10);
         assert_eq!(directory_visit_budget(1_000, 1), 1_000);
+    }
+
+    #[test]
+    fn failed_directory_visits_still_consume_yielded_entry_budget() {
+        let mut visited_entries = 7;
+        let mut remaining_entries = 5;
+        let error = charge_directory_visit(
+            Err(io::Error::other("reader failed after yielding entries")),
+            3,
+            &mut visited_entries,
+            &mut remaining_entries,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "reader failed after yielding entries");
+        assert_eq!(visited_entries, 10);
+        assert_eq!(remaining_entries, 2);
     }
 
     #[test]
@@ -1516,6 +1581,36 @@ mod tests {
         assert_eq!(metrics.hardlink_duplicates, 1);
         #[cfg(target_os = "macos")]
         assert_eq!(metrics.private_reclaimable_bytes, metrics.allocated_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_attributes_hardlinked_bytes_to_their_common_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_dir = temp.path().join("first-dir");
+        let second_dir = temp.path().join("second-dir");
+        fs::create_dir(&first_dir).unwrap();
+        fs::create_dir(&second_dir).unwrap();
+        let first = first_dir.join("blob");
+        write_bytes(&first, 4096);
+        fs::hard_link(&first, second_dir.join("blob")).unwrap();
+
+        let report = inventory(
+            &[temp.path().to_path_buf()],
+            InventoryOptions {
+                display_depth: 1,
+                ..InventoryOptions::default()
+            },
+        )
+        .unwrap();
+        let root = &report.roots[0];
+        assert_eq!(root.metrics.files, 1);
+        assert!(root.metrics.allocated_bytes >= 4096);
+        for child in &root.entries {
+            assert_eq!(child.metrics.files, 0);
+            assert_eq!(child.metrics.logical_bytes, 0);
+            assert_eq!(child.metrics.allocated_bytes, 0);
+        }
     }
 
     #[cfg(target_os = "macos")]

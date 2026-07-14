@@ -2256,11 +2256,17 @@ fn lsof_probe_error(
     stderr: &[u8],
     scoped_paths: Option<&[PathBuf]>,
 ) -> Option<io::Error> {
+    let stderr = String::from_utf8_lossy(stderr);
+    if scoped_paths.is_none() && !stderr.trim().is_empty() {
+        return Some(io::Error::other(format!(
+            "global lsof snapshot reported incomplete output: {}",
+            stderr.trim()
+        )));
+    }
     if success {
         return None;
     }
 
-    let stderr = String::from_utf8_lossy(stderr);
     let failed_path = scoped_paths.into_iter().flatten().any(|path| {
         let path = path.to_string_lossy();
         !path.is_empty() && stderr.contains(path.as_ref())
@@ -4735,6 +4741,19 @@ mod tests {
             None,
         )
         .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_lsof_success_with_a_warning_is_still_incomplete() {
+        assert!(lsof_probe_error(
+            true,
+            Some(0),
+            b"lsof: WARNING: output information may be incomplete\n",
+            None,
+        )
+        .is_some());
+        assert!(lsof_probe_error(true, Some(0), b"", None).is_none());
     }
 
     #[test]
