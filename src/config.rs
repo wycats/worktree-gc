@@ -21,6 +21,7 @@ pub(crate) struct CleanupConfig {
     pub stale_days: u64,
     pub generated_days: u64,
     pub generated_windows: BTreeMap<String, u64>,
+    pub generated_workday_windows: BTreeMap<String, u64>,
     pub generated_activity_only: bool,
     pub check_in_use: bool,
     pub cargo_lock_timeout_minutes: u64,
@@ -67,6 +68,10 @@ impl Default for CleanupConfig {
             stale_days: 14,
             generated_days: 7,
             generated_windows: BTreeMap::new(),
+            generated_workday_windows: worktree_gc::DEFAULT_GENERATED_WORKDAY_NAMES
+                .iter()
+                .map(|name| ((*name).to_string(), worktree_gc::DEFAULT_GENERATED_WORKDAYS))
+                .collect(),
             generated_activity_only: true,
             check_in_use: true,
             cargo_lock_timeout_minutes: 30,

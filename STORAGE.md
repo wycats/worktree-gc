@@ -168,7 +168,7 @@ remains the stop condition.
 Generated-directory cleanup applies the inventory primitive only after safety
 classification. Delete candidates share one sequential global entry budget
 and a smaller per-candidate slice; their complete or partial measurements are
-persisted in manifest version 5. When the evidence budget cannot cover every
+persisted in manifest version 6. When the evidence budget cannot cover every
 candidate, pressure candidates and lower rebuild-cost classes are measured
 first.
 Pressure execution preserves rebuild-cost classes, orders exact candidates
@@ -192,9 +192,10 @@ The implementation order is intentionally useful after every merge:
    rebuild-cost tiers.
 3. **Workday-aware artifact retention.** Add explicit timezone, calendar,
    elapsed-age, and workday-age evidence without changing existing elapsed-day
-   flags. Apply the three-workday routine default first to ordinary rebuildable
-   Cargo profiles, then let other collectors adopt class-specific windows as
-   their owner activity and rebuild costs become reliable.
+   flags. Apply the three-workday routine default to owner-free `target`,
+   `.next`, and `.turbo` roots. Keep dependency installs and other higher-cost
+   classes on their explicit elapsed or owner-specific windows until their
+   recovery contracts become equally reliable.
 4. **Bounded scheduling and first activation.** Make repository concurrency an
    explicit scheduled-mode setting, retain hard inventory/measurement budgets,
    and validate a complete dry-run manifest before enabling execution. Roots

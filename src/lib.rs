@@ -54,7 +54,9 @@ pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", "
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
 pub const DEFAULT_CARGO_PROFILE_SWEEP_DAYS: u64 = 7;
-pub const MANIFEST_VERSION: u64 = 5;
+pub const DEFAULT_GENERATED_WORKDAYS: u64 = 3;
+pub const DEFAULT_GENERATED_WORKDAY_NAMES: &[&str] = &[".next", ".turbo", "target"];
+pub const MANIFEST_VERSION: u64 = 6;
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -232,6 +234,9 @@ pub struct GeneratedDirInfo {
     pub mtime_unix: Option<i64>,
     pub mtime: Option<String>,
     pub effective_days: u64,
+    pub retention_window: GeneratedRetentionWindow,
+    pub activity_age_days: Option<u64>,
+    pub workday_age: Option<ActivityAgeEvidence>,
     pub in_use: bool,
     pub open_handle_evidence: OpenHandleEvidence,
     pub protection: Option<ProtectionMatch>,
@@ -289,6 +294,40 @@ pub enum CleanupClass {
     Pressure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "unit", rename_all = "snake_case")]
+pub enum GeneratedRetentionWindow {
+    ElapsedDays { days: u64 },
+    Workdays { workdays: u64 },
+}
+
+impl GeneratedRetentionWindow {
+    fn threshold(self) -> u64 {
+        match self {
+            Self::ElapsedDays { days } => days,
+            Self::Workdays { workdays } => workdays,
+        }
+    }
+
+    fn is_recent(
+        self,
+        elapsed_days: Option<u64>,
+        workday_age: Option<&ActivityAgeEvidence>,
+    ) -> bool {
+        match self {
+            Self::ElapsedDays { days } => elapsed_days.is_some_and(|age| age < days),
+            Self::Workdays { workdays } => workday_age.is_none_or(|age| age.workdays < workdays),
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::ElapsedDays { days } => format!("{days} elapsed days"),
+            Self::Workdays { workdays } => format!("{workdays} workdays"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GeneratedDirDecision {
     pub path: PathBuf,
@@ -297,6 +336,9 @@ pub struct GeneratedDirDecision {
     pub mtime: Option<String>,
     pub mtime_unix: Option<i64>,
     pub effective_days: u64,
+    pub retention_window: GeneratedRetentionWindow,
+    pub activity_age_days: Option<u64>,
+    pub workday_age: Option<ActivityAgeEvidence>,
     pub in_use: bool,
     pub protection: Option<ProtectionMatch>,
     pub cleanup_class: CleanupClass,
@@ -326,6 +368,7 @@ pub struct GeneratedDirConfig {
     pub delete_names: Vec<String>,
     pub report_only_names: Vec<String>,
     pub window_overrides: Vec<GeneratedWindowOverride>,
+    pub workday_window_overrides: Vec<GeneratedWorkdayWindowOverride>,
     pub sweep_strategies: Vec<SweepStrategy>,
 }
 
@@ -397,6 +440,12 @@ impl SweepDecision {
 pub struct GeneratedWindowOverride {
     pub name: String,
     pub days: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedWorkdayWindowOverride {
+    pub name: String,
+    pub workdays: u64,
 }
 
 impl Default for GeneratedDirConfig {
@@ -494,8 +543,23 @@ impl GeneratedDirConfig {
             delete_names: normalize_names(delete),
             report_only_names: normalize_names(report_only),
             window_overrides: windows,
+            workday_window_overrides: Vec::new(),
             sweep_strategies: normalize_sweep_strategies(sweeps),
         }
+    }
+
+    pub fn with_workday_windows(mut self, windows: Vec<(String, u64)>) -> Self {
+        let workday_names = windows
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<HashSet<_>>();
+        self.window_overrides
+            .retain(|override_| !workday_names.contains(override_.name.as_str()));
+        self.workday_window_overrides = windows
+            .into_iter()
+            .map(|(name, workdays)| GeneratedWorkdayWindowOverride { name, workdays })
+            .collect();
+        self
     }
 
     // Later entries win so custom overrides shadow the build-cache defaults.
@@ -506,6 +570,32 @@ impl GeneratedDirConfig {
             .find(|override_| override_.name == name)
             .map(|override_| override_.days)
             .unwrap_or(generated_days)
+    }
+
+    pub fn effective_retention(&self, name: &str, generated_days: u64) -> GeneratedRetentionWindow {
+        if let Some(override_) = self
+            .window_overrides
+            .iter()
+            .rev()
+            .find(|override_| override_.name == name)
+        {
+            return GeneratedRetentionWindow::ElapsedDays {
+                days: override_.days,
+            };
+        }
+        if let Some(override_) = self
+            .workday_window_overrides
+            .iter()
+            .rev()
+            .find(|override_| override_.name == name)
+        {
+            return GeneratedRetentionWindow::Workdays {
+                workdays: override_.workdays,
+            };
+        }
+        GeneratedRetentionWindow::ElapsedDays {
+            days: self.effective_days(name, generated_days),
+        }
     }
 
     pub fn sweep_strategies(&self, name: &str) -> Vec<&SweepStrategy> {
@@ -602,7 +692,7 @@ fn open_handle_evidence(
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
     let protections = active_protections(options.now)?;
     let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
-    triage_with_protections(repo, options, &protections, open_handles.as_ref())
+    triage_with_protections(repo, options, &protections, open_handles.as_ref(), None)
 }
 
 pub fn triage_with_parallelism(
@@ -618,9 +708,17 @@ fn triage_with_protections(
     options: TriageOptions,
     protections: &[ProtectionLease],
     open_handles: Option<&OpenHandleSnapshot>,
+    roots: Option<&[PathBuf]>,
 ) -> Result<TriageReport> {
     let context = repo_context(repo)?;
-    let worktrees = inspect_worktrees(&context, options.now)?;
+    let mut worktrees = inspect_worktrees(&context, options.now)?;
+    if let Some(roots) = roots {
+        worktrees.retain(|worktree| {
+            roots
+                .iter()
+                .any(|root| worktree.path == *root || worktree.path.starts_with(root))
+        });
+    }
     let worktree_decisions = plan_worktree_cleanup(
         &worktrees,
         options.stale_days,
@@ -747,6 +845,9 @@ fn plan_cleanup_with_protections(
             mtime: dir.mtime.clone(),
             mtime_unix: dir.mtime_unix,
             effective_days: dir.effective_days,
+            retention_window: dir.retention_window,
+            activity_age_days: dir.activity_age_days,
+            workday_age: dir.workday_age.clone(),
             in_use: dir.in_use,
             protection: dir.protection.clone(),
             cleanup_class: dir.cleanup_class,
@@ -940,7 +1041,7 @@ fn measure_cleanup_runs_matching(
 pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTriageReport> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
-    triage_repositories(&roots, &repositories, options)
+    triage_repositories(&roots, &repositories, options, None)
 }
 
 pub fn triage_roots_with_parallelism(
@@ -951,7 +1052,7 @@ pub fn triage_roots_with_parallelism(
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories_bounded(&roots, max_parallelism)?;
     with_parallelism(max_parallelism, || {
-        triage_repositories(&roots, &repositories, options)
+        triage_repositories(&roots, &repositories, options, None)
     })
 }
 
@@ -960,30 +1061,18 @@ pub(crate) fn triage_exact_roots_with_parallelism(
     options: TriageOptions,
     max_parallelism: usize,
 ) -> Result<RootTriageReport> {
-    let canonical_roots = canonicalize_roots(roots)?;
-    let mut report = triage_roots_with_parallelism(&canonical_roots, options, max_parallelism)?;
-    for repository in &mut report.repositories {
-        repository.worktrees.retain(|worktree| {
-            canonical_roots
-                .iter()
-                .any(|root| worktree.path == root.as_path())
-        });
-        repository.generated_dirs.retain(|dir| {
-            canonical_roots
-                .iter()
-                .any(|root| dir.path.starts_with(root))
-        });
-    }
-    report.repositories.retain(|repository| {
-        !repository.worktrees.is_empty() || !repository.generated_dirs.is_empty()
-    });
-    Ok(report)
+    let roots = canonicalize_roots(roots)?;
+    let repositories = discover_repositories_bounded(&roots, max_parallelism)?;
+    with_parallelism(max_parallelism, || {
+        triage_repositories(&roots, &repositories, options, Some(&roots))
+    })
 }
 
 fn triage_repositories(
     roots: &[PathBuf],
     repositories: &[PathBuf],
     options: TriageOptions,
+    worktree_roots: Option<&[PathBuf]>,
 ) -> Result<RootTriageReport> {
     let protections = active_protections(options.now)?;
     let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
@@ -995,6 +1084,7 @@ fn triage_repositories(
                 options.clone(),
                 &protections,
                 open_handles.as_ref(),
+                worktree_roots,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1344,6 +1434,13 @@ fn pressure_generated_candidate_order(
             std::cmp::Reverse(
                 measurement
                     .map(|measurement| measurement.metrics.allocated_bytes)
+                    .unwrap_or_default(),
+            ),
+            std::cmp::Reverse(
+                decision
+                    .workday_age
+                    .as_ref()
+                    .map(|age| age.workdays)
                     .unwrap_or_default(),
             ),
             decision.mtime_unix.unwrap_or(i64::MAX),
@@ -2194,45 +2291,61 @@ fn scan_generated_dirs_for_worktree(
 
     for candidate in candidates {
         let protection = protection_for_path(&candidate.path, protections);
-        let routine_days = config.effective_days(&candidate.name, policy.generated_days);
+        let routine_retention = config.effective_retention(&candidate.name, policy.generated_days);
         let pressure_applies = pressure_applies(&candidate.path, policy.pressure)?;
-        let effective_days = if pressure_applies {
-            routine_days.min(
-                policy
-                    .pressure
-                    .expect("pressure applies only with a policy")
-                    .generated_days,
-            )
+        let effective_retention = if pressure_applies {
+            let pressure_days = policy
+                .pressure
+                .expect("pressure applies only with a policy")
+                .generated_days;
+            match routine_retention {
+                GeneratedRetentionWindow::ElapsedDays { days } => {
+                    GeneratedRetentionWindow::ElapsedDays {
+                        days: days.min(pressure_days),
+                    }
+                }
+                GeneratedRetentionWindow::Workdays { .. } => {
+                    GeneratedRetentionWindow::ElapsedDays {
+                        days: pressure_days,
+                    }
+                }
+            }
         } else {
-            routine_days
+            routine_retention
         };
+        let effective_days = effective_retention.threshold();
+        let worktree_workday_age = worktree
+            .activity_unix
+            .and_then(|unix| activity_age::system_local_activity_age(policy.now, unix));
         let worktree_recent = !policy.generated_activity_only
             && (worktree.is_current
-                || worktree
-                    .activity_age_days
-                    .is_some_and(|days| days < effective_days));
+                || effective_retention
+                    .is_recent(worktree.activity_age_days, worktree_workday_age.as_ref()));
         let relative_key = path_key(&candidate.relative);
         let ignored = ignored_paths.contains(&relative_key);
         let has_tracked_files = tracked_paths
             .iter()
             .any(|tracked| path_is_under(tracked, &relative_key));
         let mtime_unix = sampled_mtime_unix(&candidate.path, GENERATED_MTIME_SAMPLE_DEPTH);
-        let dir_recent = mtime_unix
-            .and_then(|unix| age_days(policy.now, unix))
-            .is_some_and(|days| days < effective_days);
+        let activity_age_days =
+            mtime_unix.and_then(|unix| activity_age::elapsed_age_days(policy.now, unix));
+        let workday_age =
+            mtime_unix.and_then(|unix| activity_age::system_local_activity_age(policy.now, unix));
+        let dir_recent = effective_retention.is_recent(activity_age_days, workday_age.as_ref());
         let routine_worktree_recent = !policy.generated_activity_only
             && (worktree.is_current
-                || worktree
-                    .activity_age_days
-                    .is_some_and(|days| days < routine_days));
-        let routine_dir_recent = mtime_unix
-            .and_then(|unix| age_days(policy.now, unix))
-            .is_some_and(|days| days < routine_days);
+                || routine_retention
+                    .is_recent(worktree.activity_age_days, worktree_workday_age.as_ref()));
+        let routine_dir_recent =
+            routine_retention.is_recent(activity_age_days, workday_age.as_ref());
         let routine_active = routine_worktree_recent || routine_dir_recent;
+        let workday_evidence_missing =
+            matches!(routine_retention, GeneratedRetentionWindow::Workdays { .. })
+                && workday_age.is_none();
 
         let in_use = open_generated_dirs.contains(&candidate.path);
         let sweep_strategies = config.sweep_strategies(&candidate.name);
-        let active = worktree_recent || dir_recent;
+        let active = worktree_recent || dir_recent || workday_evidence_missing;
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
             && protection.is_none()
             && (routine_active || candidate.action == GeneratedCandidateAction::SweepOnly)
@@ -2324,11 +2437,17 @@ fn scan_generated_dirs_for_worktree(
                     GeneratedDirAction::Skip,
                     if !planned_reason.is_empty() {
                         planned_reason
+                    } else if workday_evidence_missing {
+                        "workday activity evidence is unavailable".to_string()
                     } else if policy.generated_activity_only {
-                        format!("generated directory activity is newer than {effective_days} days")
+                        format!(
+                            "generated directory activity is newer than {}",
+                            effective_retention.describe()
+                        )
                     } else {
                         format!(
-                            "worktree or generated directory activity is newer than {effective_days} days"
+                            "worktree or generated directory activity is newer than {}",
+                            effective_retention.describe()
                         )
                     },
                 )
@@ -2349,17 +2468,17 @@ fn scan_generated_dirs_for_worktree(
                 "untracked generated directory".to_string(),
             )
         };
-        let cleanup_class = if action == GeneratedDirAction::Delete
-            && pressure_applies
-            && effective_days < routine_days
-            && routine_active
-        {
-            CleanupClass::Pressure
-        } else {
-            CleanupClass::Routine
-        };
+        let cleanup_class =
+            if action == GeneratedDirAction::Delete && pressure_applies && routine_active {
+                CleanupClass::Pressure
+            } else {
+                CleanupClass::Routine
+            };
         let reason = if cleanup_class == CleanupClass::Pressure {
-            format!("pressure cleanup below the {routine_days}-day routine window: {reason}")
+            format!(
+                "pressure cleanup below the {} routine window: {reason}",
+                routine_retention.describe()
+            )
         } else {
             reason
         };
@@ -2373,6 +2492,9 @@ fn scan_generated_dirs_for_worktree(
             mtime_unix,
             mtime: mtime_unix.map(format_unix_time),
             effective_days,
+            retention_window: effective_retention,
+            activity_age_days,
+            workday_age,
             in_use,
             open_handle_evidence,
             protection,
@@ -2944,6 +3066,13 @@ fn sort_generated_deletions(
             generated_rebuild_rank(&decision.name),
             std::cmp::Reverse(pressure_private),
             std::cmp::Reverse(pressure_allocated),
+            std::cmp::Reverse(
+                decision
+                    .workday_age
+                    .as_ref()
+                    .map(|age| age.workdays)
+                    .unwrap_or_default(),
+            ),
             decision.mtime_unix.unwrap_or(i64::MAX),
             decision.path.clone(),
         )
@@ -4899,6 +5028,9 @@ mod tests {
             mtime: None,
             mtime_unix: None,
             effective_days: 3,
+            retention_window: GeneratedRetentionWindow::ElapsedDays { days: 3 },
+            activity_age_days: None,
+            workday_age: None,
             in_use: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
@@ -4933,6 +5065,9 @@ mod tests {
             mtime: None,
             mtime_unix: None,
             effective_days: 3,
+            retention_window: GeneratedRetentionWindow::ElapsedDays { days: 3 },
+            activity_age_days: None,
+            workday_age: None,
             in_use: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
@@ -5004,6 +5139,68 @@ mod tests {
         assert_eq!(node_modules.action, GeneratedDirAction::Skip);
         assert_eq!(node_modules.effective_days, 7);
         Ok(())
+    }
+
+    #[test]
+    fn generated_workday_window_skips_the_weekend_and_records_evidence() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("workday-window");
+        add_worktree(&repo, &worktree, "workday-window-branch")?;
+        fs::create_dir_all(worktree.join(".next/cache"))?;
+        fs::write(worktree.join(".next/cache/entry"), "cache\n")?;
+        let activity = 1_783_684_800_i64; // 2026-07-10T12:00:00Z, Friday
+        for relative in [".next/cache/entry", ".next/cache", ".next"] {
+            set_mtime(&worktree.join(relative), activity)?;
+        }
+        let config =
+            GeneratedDirConfig::default().with_workday_windows(vec![(".next".to_string(), 3)]);
+        let observe = |now_unix: u64| -> Result<GeneratedDirInfo> {
+            let now = UNIX_EPOCH + Duration::from_secs(now_unix);
+            let report = triage(
+                Some(&repo),
+                TriageOptions {
+                    stale_days: 10_000,
+                    generated_days: 7,
+                    generated_activity_only: true,
+                    check_in_use: false,
+                    generated_config: config.clone(),
+                    now,
+                },
+            )?;
+            report
+                .generated_dirs
+                .into_iter()
+                .find(|dir| dir.path.ends_with(".next"))
+                .context("missing .next workday fixture")
+        };
+
+        let monday = observe(1_783_944_000)?; // 2026-07-13T12:00:00Z
+        assert_eq!(monday.action, GeneratedDirAction::Skip);
+        assert_eq!(
+            monday.retention_window,
+            GeneratedRetentionWindow::Workdays { workdays: 3 }
+        );
+        assert!(monday
+            .workday_age
+            .as_ref()
+            .is_some_and(|age| age.workdays < 3));
+        assert_eq!(
+            monday.workday_age.as_ref().map(|age| age.calendar),
+            Some(WEEKDAY_CALENDAR_ID)
+        );
+
+        let wednesday = observe(1_784_116_800)?; // 2026-07-15T12:00:00Z
+        assert_eq!(wednesday.action, GeneratedDirAction::Delete);
+        assert!(wednesday
+            .workday_age
+            .as_ref()
+            .is_some_and(|age| age.workdays >= 3));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_workday_window_fails_closed_without_calendar_evidence() {
+        assert!(GeneratedRetentionWindow::Workdays { workdays: 3 }.is_recent(Some(30), None));
     }
 
     #[cfg(unix)]
@@ -5318,6 +5515,9 @@ mod tests {
             mtime: None,
             mtime_unix: None,
             effective_days: 3,
+            retention_window: GeneratedRetentionWindow::ElapsedDays { days: 3 },
+            activity_age_days: None,
+            workday_age: None,
             in_use: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
@@ -5466,6 +5666,9 @@ mod tests {
                     mtime: None,
                     mtime_unix: Some(mtime_unix),
                     effective_days: 1,
+                    retention_window: GeneratedRetentionWindow::ElapsedDays { days: 1 },
+                    activity_age_days: None,
+                    workday_age: None,
                     in_use: false,
                     protection: None,
                     cleanup_class: CleanupClass::Pressure,
@@ -5587,6 +5790,9 @@ mod tests {
             mtime: None,
             mtime_unix: Some(1),
             effective_days: 1,
+            retention_window: GeneratedRetentionWindow::ElapsedDays { days: 1 },
+            activity_age_days: None,
+            workday_age: None,
             in_use: false,
             protection: None,
             cleanup_class: CleanupClass::Pressure,

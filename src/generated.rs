@@ -2,8 +2,9 @@ use crate::inventory::{inventory, InventoryMetrics, InventoryOptions};
 use crate::{
     discover_repositories_bounded, format_bytes, triage_exact_roots_with_parallelism,
     triage_roots_with_parallelism, CleanupClass, CleanupMode, GeneratedDirAction,
-    GeneratedDirConfig, GeneratedDirInfo, OpenHandleEvidence, ProtectionMatch, TriageOptions,
-    TriageReport, DEFAULT_GENERATED_DAYS, DEFAULT_STALE_DAYS,
+    GeneratedDirConfig, GeneratedDirInfo, GeneratedRetentionWindow, OpenHandleEvidence,
+    ProtectionMatch, TriageOptions, TriageReport, DEFAULT_GENERATED_DAYS,
+    DEFAULT_GENERATED_WORKDAYS, DEFAULT_GENERATED_WORKDAY_NAMES, DEFAULT_STALE_DAYS,
 };
 use anyhow::{Context, Result};
 use atomic_write_file::AtomicWriteFile;
@@ -14,7 +15,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GENERATED_COLLECT_MANIFEST_VERSION: u64 = 3;
+const GENERATED_COLLECT_MANIFEST_VERSION: u64 = 4;
 const MAX_ENTRIES_PER_ARTIFACT: u64 = 250_000;
 
 #[derive(Debug, Clone)]
@@ -63,6 +64,7 @@ pub struct GeneratedCollectPolicy {
     pub execution: &'static str,
     pub unattended_execution_supported: bool,
     pub generated_days: u64,
+    pub generated_workday_windows: BTreeMap<String, u64>,
     pub generated_activity_only: bool,
     pub check_in_use: bool,
     pub max_entries: u64,
@@ -113,6 +115,9 @@ pub struct GeneratedArtifactObservation {
     pub reason: String,
     pub mtime_unix: Option<i64>,
     pub effective_days: u64,
+    pub retention_window: GeneratedRetentionWindow,
+    pub activity_age_days: Option<u64>,
+    pub workday_age: Option<crate::ActivityAgeEvidence>,
     pub in_use: bool,
     pub open_handle_evidence: OpenHandleEvidence,
     pub protection: Option<ProtectionMatch>,
@@ -203,12 +208,22 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
     // Repository planning is deliberately serialized. The collector is a
     // background orientation surface, not a reason to fan Git and process
     // ownership work out across every checkout at once.
+    let generated_workday_windows = DEFAULT_GENERATED_WORKDAY_NAMES
+        .iter()
+        .map(|name| ((*name).to_string(), DEFAULT_GENERATED_WORKDAYS))
+        .collect::<BTreeMap<_, _>>();
+    let generated_config = GeneratedDirConfig::default().with_workday_windows(
+        generated_workday_windows
+            .iter()
+            .map(|(name, workdays)| (name.clone(), *workdays))
+            .collect(),
+    );
     let triage_options = TriageOptions {
         stale_days: DEFAULT_STALE_DAYS,
         generated_days: options.generated_days,
         generated_activity_only: true,
         check_in_use: true,
-        generated_config: GeneratedDirConfig::default(),
+        generated_config,
         now: options.now,
     };
     let triage = if discovery_mode {
@@ -286,6 +301,7 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
             execution: "report-only; generate a fresh cleanup manifest before any mutation",
             unattended_execution_supported: false,
             generated_days: options.generated_days,
+            generated_workday_windows,
             generated_activity_only: true,
             check_in_use: true,
             max_entries: options.max_entries,
@@ -439,6 +455,9 @@ fn observation(repository: PathBuf, artifact: GeneratedDirInfo) -> GeneratedArti
         reason: artifact.reason,
         mtime_unix: artifact.mtime_unix,
         effective_days: artifact.effective_days,
+        retention_window: artifact.retention_window,
+        activity_age_days: artifact.activity_age_days,
+        workday_age: artifact.workday_age,
         in_use: artifact.in_use,
         open_handle_evidence: artifact.open_handle_evidence,
         protection: artifact.protection,
@@ -783,6 +802,9 @@ mod tests {
             mtime_unix: None,
             mtime: None,
             effective_days: 3,
+            retention_window: GeneratedRetentionWindow::ElapsedDays { days: 3 },
+            activity_age_days: None,
+            workday_age: None,
             in_use: false,
             open_handle_evidence,
             protection: None,
@@ -809,6 +831,9 @@ mod tests {
             reason: "fixture".to_string(),
             mtime_unix: None,
             effective_days: 3,
+            retention_window: GeneratedRetentionWindow::ElapsedDays { days: 3 },
+            activity_age_days: None,
+            workday_age: None,
             in_use: false,
             open_handle_evidence: OpenHandleEvidence::Complete,
             protection: None,
