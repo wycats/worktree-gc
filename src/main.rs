@@ -5,11 +5,12 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories_with_parallelism, cleanup_roots,
-    discover_repositories_bounded, inventory, list_protections, print_cleanup, print_inventory,
-    print_root_cleanup, print_root_triage, print_triage, remove_protection, renew_protection,
-    triage, triage_roots, CleanupOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy,
-    SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
+    add_protection, cleanup_repositories_with_parallelism, cleanup_roots_with_parallelism,
+    cleanup_with_parallelism, discover_repositories_bounded, inventory, list_protections,
+    print_cleanup, print_inventory, print_root_cleanup, print_root_triage, print_triage,
+    remove_protection, renew_protection, triage_roots_with_parallelism, triage_with_parallelism,
+    CleanupOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit,
+    SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
     DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
     MAX_PROTECTION_TTL_DAYS,
 };
@@ -68,6 +69,13 @@ enum Command {
     },
     #[command(visible_alias = "audit")]
     Triage {
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Maximum worker threads used by repository and generated-directory scans"
+        )]
+        max_parallelism: usize,
+
         #[arg(long, default_value_t = DEFAULT_STALE_DAYS)]
         stale_days: u64,
 
@@ -90,6 +98,13 @@ enum Command {
         generated: GeneratedArgs,
     },
     Cleanup {
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Maximum worker threads used by repository and generated-directory scans"
+        )]
+        max_parallelism: usize,
+
         #[arg(long)]
         execute: bool,
 
@@ -447,12 +462,14 @@ fn main() -> Result<()> {
             }
         }
         Command::Triage {
+            max_parallelism,
             stale_days,
             generated_days,
             generated_activity_only,
             check_in_use,
             generated,
         } => {
+            anyhow::ensure!(max_parallelism > 0, "--max-parallelism must be at least 1");
             let options = TriageOptions {
                 stale_days,
                 generated_days,
@@ -462,14 +479,15 @@ fn main() -> Result<()> {
                 now,
             };
             if roots.is_empty() {
-                let report = triage(repo.as_deref(), options)?;
+                let report = triage_with_parallelism(repo.as_deref(), options, max_parallelism)?;
                 print_triage(&report);
             } else {
-                let report = triage_roots(&roots, options)?;
+                let report = triage_roots_with_parallelism(&roots, options, max_parallelism)?;
                 print_root_triage(&report);
             }
         }
         Command::Cleanup {
+            max_parallelism,
             execute,
             stale_days,
             generated_days,
@@ -477,6 +495,7 @@ fn main() -> Result<()> {
             check_in_use,
             generated,
         } => {
+            anyhow::ensure!(max_parallelism > 0, "--max-parallelism must be at least 1");
             let options = CleanupOptions {
                 execute,
                 stale_days,
@@ -490,10 +509,10 @@ fn main() -> Result<()> {
                 now,
             };
             if roots.is_empty() {
-                let run = cleanup(repo.as_deref(), options)?;
+                let run = cleanup_with_parallelism(repo.as_deref(), options, max_parallelism)?;
                 print_cleanup(&run);
             } else {
-                let run = cleanup_roots(&roots, options)?;
+                let run = cleanup_roots_with_parallelism(&roots, options, max_parallelism)?;
                 print_root_cleanup(&run);
             }
         }
@@ -1144,6 +1163,30 @@ stale_days = 7
             cli.root,
             vec![PathBuf::from("/tmp/code"), PathBuf::from("/tmp/plugins")]
         );
+        assert!(matches!(
+            cli.command,
+            Command::Cleanup {
+                max_parallelism: 1,
+                ..
+            }
+        ));
+
+        let parallel = Cli::try_parse_from([
+            "worktree-gc",
+            "--root",
+            "/tmp/code",
+            "triage",
+            "--max-parallelism",
+            "3",
+        ])
+        .expect("manual parallelism should parse");
+        assert!(matches!(
+            parallel.command,
+            Command::Triage {
+                max_parallelism: 3,
+                ..
+            }
+        ));
         assert!(Cli::try_parse_from([
             "worktree-gc",
             "--repo",

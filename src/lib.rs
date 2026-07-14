@@ -570,6 +570,14 @@ pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageRepor
     triage_with_protections(repo, options, &protections, open_handles.as_ref())
 }
 
+pub fn triage_with_parallelism(
+    repo: Option<&Path>,
+    options: TriageOptions,
+    max_parallelism: usize,
+) -> Result<TriageReport> {
+    with_parallelism(max_parallelism, || triage(repo, options))
+}
+
 fn triage_with_protections(
     repo: Option<&Path>,
     options: TriageOptions,
@@ -655,6 +663,14 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
         }
     }
     Ok(run)
+}
+
+pub fn cleanup_with_parallelism(
+    repo: Option<&Path>,
+    options: CleanupOptions,
+    max_parallelism: usize,
+) -> Result<CleanupRun> {
+    with_parallelism(max_parallelism, || cleanup(repo, options))
 }
 
 fn plan_cleanup_with_protections(
@@ -909,10 +925,51 @@ pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTri
     })
 }
 
+pub fn triage_roots_with_parallelism(
+    roots: &[PathBuf],
+    options: TriageOptions,
+    max_parallelism: usize,
+) -> Result<RootTriageReport> {
+    with_parallelism(max_parallelism, || {
+        let roots = canonicalize_roots(roots)?;
+        let repositories = discover_repositories_bounded(&roots, max_parallelism)?;
+        let protections = active_protections(options.now)?;
+        let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
+        let repositories = repositories
+            .par_iter()
+            .map(|repo| {
+                triage_with_protections(
+                    Some(repo),
+                    options.clone(),
+                    &protections,
+                    open_handles.as_ref(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(RootTriageReport {
+            roots,
+            repositories,
+        })
+    })
+}
+
 pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootCleanupRun> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
     cleanup_repositories(&roots, &repositories, options)
+}
+
+pub fn cleanup_roots_with_parallelism(
+    roots: &[PathBuf],
+    options: CleanupOptions,
+    max_parallelism: usize,
+) -> Result<RootCleanupRun> {
+    with_parallelism(max_parallelism, || {
+        let roots = canonicalize_roots(roots)?;
+        let repositories = discover_repositories_bounded(&roots, max_parallelism)?;
+        cleanup_repositories(&roots, &repositories, options)
+    })
 }
 
 pub fn cleanup_repositories_with_parallelism(
@@ -3928,6 +3985,26 @@ mod tests {
             format!("{error:#}").contains("cleanup.max_parallelism must be at least 1"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn manual_parallelism_uses_the_same_nested_worker_budget() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let report = triage_with_parallelism(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+            1,
+        )?;
+
+        assert_eq!(report.repo_root, fs::canonicalize(repo)?);
+        Ok(())
     }
 
     #[test]
