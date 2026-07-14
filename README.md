@@ -227,6 +227,32 @@ incomplete instead of hiding every later sibling.
 The durable collector contract and incremental delivery order are documented
 in [`STORAGE.md`](STORAGE.md).
 
+### Generated build-state inventory
+
+Use the report-only `generated` collector when a broad inventory shows that
+repository storage is large but does not explain how much belongs to
+rebuildable state:
+
+```sh
+worktree-gc collect generated ~/Code --max-entries 2000000
+```
+
+The collector discovers Git repositories and linked worktrees with one worker,
+takes one machine-wide open-handle snapshot using `lsof`, and reuses cleanup's
+tracked-file, ignore, activity, and recursive-protection classification. It
+then APFS-measures each discovered `target`, `.next`, `.turbo`, `node_modules`,
+and report-only `dist` root under one fair global entry budget.
+
+Measurement is retained even when a root is active or protected because size
+evidence is not deletion permission. The manifest separately reports
+**rebuildable-now opportunities**: configured roots with no tracked files,
+recursive protection, or open owner and a complete handle snapshot. These are
+not described as stale. They are explicit rebuild trades grouped into low
+(`.next`, `.turbo`), medium (`target`), and high (`node_modules` and other)
+cost tiers, with a cumulative APFS-private reclaim floor per filesystem.
+Incomplete ownership evidence fails closed. The collector remains report-only;
+run a fresh `cleanup` dry-run before proposing any mutation.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but
