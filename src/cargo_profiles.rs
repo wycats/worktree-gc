@@ -9,8 +9,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use walkdir::WalkDir;
 
+use crate::activity_age::{elapsed_age_days, system_local_activity_age};
 use crate::cargo_incremental::{with_cargo_profile_locks_timeout, TRASH_DIR_NAME};
-use crate::SweepCandidateAction;
+use crate::{ActivityAgeEvidence, SweepCandidateAction, SweepLimit};
 
 // Cargo build-script outputs commonly live below build/<unit>/out, and
 // generated files can add another directory or two. Keep this bounded while
@@ -25,6 +26,7 @@ pub struct CargoProfileCandidateDecision {
     pub last_activity_unix: Option<i64>,
     pub last_activity: Option<String>,
     pub activity_age_days: Option<u64>,
+    pub workday_age: Option<ActivityAgeEvidence>,
     pub action: SweepCandidateAction,
     pub reason: String,
 }
@@ -37,7 +39,7 @@ pub(crate) struct CargoProfilePlan {
 pub(crate) fn plan_cargo_profile_sweep(
     target_dir: &Path,
     worktree: &Path,
-    days: u64,
+    limit: &SweepLimit,
     now: SystemTime,
 ) -> Result<CargoProfilePlan> {
     let context = match resolve_build_context(target_dir, worktree)? {
@@ -71,7 +73,9 @@ pub(crate) fn plan_cargo_profile_sweep(
                 cargo_profile: None,
                 last_activity_unix,
                 last_activity: last_activity_unix.map(format_unix_time),
-                activity_age_days: last_activity_unix.and_then(|unix| age_days(now, unix)),
+                activity_age_days: last_activity_unix.and_then(|unix| elapsed_age_days(now, unix)),
+                workday_age: last_activity_unix
+                    .and_then(|unix| system_local_activity_age(now, unix)),
                 action: SweepCandidateAction::RecoverTrash,
                 reason: "recover profile quarantine from an interrupted run".to_string(),
             });
@@ -151,21 +155,9 @@ pub(crate) fn plan_cargo_profile_sweep(
         }
         .to_string();
         let last_activity_unix = sampled_activity(&profile_dir)?;
-        let activity_age_days = last_activity_unix.and_then(|unix| age_days(now, unix));
-        let action = if activity_age_days.is_some_and(|age| age >= days) {
-            SweepCandidateAction::Delete
-        } else {
-            SweepCandidateAction::Keep
-        };
-        let reason = match action {
-            SweepCandidateAction::Delete => {
-                format!("Cargo profile has been inactive for at least {days} days")
-            }
-            SweepCandidateAction::Keep => {
-                format!("Cargo profile activity is newer than {days} days")
-            }
-            _ => unreachable!(),
-        };
+        let activity_age_days = last_activity_unix.and_then(|unix| elapsed_age_days(now, unix));
+        let workday_age = last_activity_unix.and_then(|unix| system_local_activity_age(now, unix));
+        let (action, reason) = retention_decision(limit, activity_age_days, workday_age.as_ref())?;
         candidates.push(CargoProfileCandidateDecision {
             path: profile_dir,
             lock_path,
@@ -173,6 +165,7 @@ pub(crate) fn plan_cargo_profile_sweep(
             last_activity_unix,
             last_activity: last_activity_unix.map(format_unix_time),
             activity_age_days,
+            workday_age,
             action,
             reason,
         });
@@ -196,7 +189,7 @@ pub(crate) fn execute_cargo_profile_reset(
     target_dir: &Path,
     worktree: &Path,
     candidates: &[CargoProfileCandidateDecision],
-    days: u64,
+    limit: &SweepLimit,
     run_id: &str,
     timeout: Option<Duration>,
 ) -> Result<()> {
@@ -228,7 +221,7 @@ pub(crate) fn execute_cargo_profile_reset(
         if !candidate.path.exists() {
             continue;
         }
-        if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
+        if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, limit)? {
             eprintln!(
                 "  keeping refreshed Cargo profile {}",
                 candidate.path.display()
@@ -241,7 +234,7 @@ pub(crate) fn execute_cargo_profile_reset(
             worktree,
             timeout,
             || -> Result<Option<PathBuf>> {
-                if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
+                if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, limit)? {
                     eprintln!(
                         "  keeping Cargo profile refreshed while waiting for its lock {}",
                         candidate.path.display()
@@ -340,14 +333,57 @@ fn profile_is_stale(
     worktree: &Path,
     candidate_path: &Path,
     profile: &str,
-    days: u64,
+    limit: &SweepLimit,
 ) -> Result<bool> {
-    let refreshed = plan_cargo_profile_sweep(target_dir, worktree, days, SystemTime::now())?;
+    let refreshed = plan_cargo_profile_sweep(target_dir, worktree, limit, SystemTime::now())?;
     Ok(refreshed.candidates.iter().any(|refreshed| {
         refreshed.path == candidate_path
             && refreshed.cargo_profile.as_deref() == Some(profile)
             && refreshed.action == SweepCandidateAction::Delete
     }))
+}
+
+fn retention_decision(
+    limit: &SweepLimit,
+    elapsed_days: Option<u64>,
+    workday_age: Option<&ActivityAgeEvidence>,
+) -> Result<(SweepCandidateAction, String)> {
+    match limit {
+        SweepLimit::AgeDays { days } => {
+            let stale = elapsed_days.is_some_and(|age| age >= *days);
+            Ok(if stale {
+                (
+                    SweepCandidateAction::Delete,
+                    format!("Cargo profile has been inactive for at least {days} elapsed days"),
+                )
+            } else {
+                (
+                    SweepCandidateAction::Keep,
+                    format!("Cargo profile activity is newer than {days} elapsed days"),
+                )
+            })
+        }
+        SweepLimit::AgeWorkdays { workdays } => {
+            let Some(age) = workday_age else {
+                return Ok((
+                    SweepCandidateAction::Keep,
+                    "Cargo profile workday age is unavailable; keeping it".to_string(),
+                ));
+            };
+            Ok(if age.workdays >= *workdays {
+                (
+                    SweepCandidateAction::Delete,
+                    format!("Cargo profile has been inactive for at least {workdays} workdays"),
+                )
+            } else {
+                (
+                    SweepCandidateAction::Keep,
+                    format!("Cargo profile activity is newer than {workdays} workdays"),
+                )
+            })
+        }
+        SweepLimit::MaxSize { .. } => bail!("Cargo profile reset requires an age limit"),
+    }
 }
 
 struct BuildContext {
@@ -466,6 +502,7 @@ fn skipped_candidate(
         last_activity_unix: None,
         last_activity: None,
         activity_age_days: None,
+        workday_age: None,
         action: SweepCandidateAction::Skip,
         reason: reason.to_string(),
     }
@@ -491,15 +528,6 @@ fn canonicalize_if_present(path: &Path) -> Option<PathBuf> {
     path.exists().then(|| fs::canonicalize(path).ok()).flatten()
 }
 
-fn age_days(now: SystemTime, unix: i64) -> Option<u64> {
-    let then = if unix >= 0 {
-        UNIX_EPOCH.checked_add(Duration::from_secs(unix as u64))?
-    } else {
-        UNIX_EPOCH.checked_sub(Duration::from_secs(unix.unsigned_abs()))?
-    };
-    Some(now.duration_since(then).unwrap_or(Duration::ZERO).as_secs() / 86_400)
-}
-
 fn system_time_to_unix(time: SystemTime) -> Option<i64> {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_secs()).ok(),
@@ -520,6 +548,10 @@ mod tests {
     use std::fs::File;
     use std::thread;
     use tempfile::TempDir;
+
+    fn elapsed_days(days: u64) -> SweepLimit {
+        SweepLimit::AgeDays { days }
+    }
 
     fn fixture() -> Result<(TempDir, PathBuf, PathBuf)> {
         let temp = TempDir::new()?;
@@ -555,7 +587,12 @@ mod tests {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
 
-        let plan = plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, SystemTime::now())?;
+        let plan = plan_cargo_profile_sweep(
+            &repo.join("target"),
+            &repo,
+            &elapsed_days(7),
+            SystemTime::now(),
+        )?;
         let candidate = plan
             .candidates
             .iter()
@@ -568,17 +605,84 @@ mod tests {
     }
 
     #[test]
+    fn plans_workday_retention_with_reproducible_evidence() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture(&profile)?;
+
+        let plan = plan_cargo_profile_sweep(
+            &repo.join("target"),
+            &repo,
+            &SweepLimit::AgeWorkdays { workdays: 3 },
+            SystemTime::now(),
+        )?;
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&profile).unwrap())
+            .context("missing debug profile")?;
+        let evidence = candidate
+            .workday_age
+            .as_ref()
+            .context("missing local workday evidence")?;
+
+        assert_eq!(candidate.action, SweepCandidateAction::Delete);
+        assert!(evidence.workdays >= 3);
+        assert_eq!(evidence.calendar, crate::WEEKDAY_CALENDAR_ID);
+        assert!(!evidence.timezone.is_empty());
+        assert!(!evidence.activity_local_date.is_empty());
+        assert!(!evidence.observation_local_date.is_empty());
+        let serialized = serde_json::to_value(candidate)?;
+        assert_eq!(serialized["workday_age"]["calendar"], "weekday-v1");
+        assert!(serialized["workday_age"]["workdays"].is_u64());
+        assert!(serialized["workday_age"]["timezone"].is_string());
+        Ok(())
+    }
+
+    #[test]
+    fn workday_retention_fails_closed_without_calendar_evidence() -> Result<()> {
+        let (action, reason) =
+            retention_decision(&SweepLimit::AgeWorkdays { workdays: 3 }, Some(30), None)?;
+
+        assert_eq!(action, SweepCandidateAction::Keep);
+        assert!(reason.contains("unavailable"));
+        Ok(())
+    }
+
+    #[test]
     fn atomically_resets_a_stale_profile() -> Result<()> {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let limit = elapsed_days(7);
+        let plan = plan_cargo_profile_sweep(&target, &repo, &limit, SystemTime::now())?;
 
         execute_cargo_profile_reset(
             &target,
             &repo,
             &plan.candidates,
-            7,
+            &limit,
+            "test-run",
+            Some(Duration::from_secs(10)),
+        )?;
+
+        assert!(!profile.exists());
+        assert!(repo.join("Cargo.toml").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn atomically_resets_a_stale_workday_profile() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture(&profile)?;
+        let target = repo.join("target");
+        let limit = SweepLimit::AgeWorkdays { workdays: 3 };
+        let plan = plan_cargo_profile_sweep(&target, &repo, &limit, SystemTime::now())?;
+
+        execute_cargo_profile_reset(
+            &target,
+            &repo,
+            &plan.candidates,
+            &limit,
             "test-run",
             Some(Duration::from_secs(10)),
         )?;
@@ -593,14 +697,15 @@ mod tests {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let limit = elapsed_days(7);
+        let plan = plan_cargo_profile_sweep(&target, &repo, &limit, SystemTime::now())?;
         fs::write(profile.join("deps/new.rlib"), "new artifact")?;
 
         execute_cargo_profile_reset(
             &target,
             &repo,
             &plan.candidates,
-            7,
+            &limit,
             "test-run",
             Some(Duration::from_secs(10)),
         )?;
@@ -630,7 +735,12 @@ mod tests {
 
         // Rewriting an existing output does not refresh its ancestors.
         fs::write(&output, "fresh output")?;
-        let plan = plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, SystemTime::now())?;
+        let plan = plan_cargo_profile_sweep(
+            &repo.join("target"),
+            &repo,
+            &elapsed_days(7),
+            SystemTime::now(),
+        )?;
         let candidate = plan
             .candidates
             .iter()
@@ -652,7 +762,8 @@ mod tests {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let limit = elapsed_days(7);
+        let plan = plan_cargo_profile_sweep(&target, &repo, &limit, SystemTime::now())?;
         let held = File::options()
             .read(true)
             .write(true)
@@ -670,7 +781,7 @@ mod tests {
             &target,
             &repo,
             &plan.candidates,
-            7,
+            &limit,
             "test-run",
             Some(Duration::from_secs(2)),
         )?;
@@ -686,7 +797,8 @@ mod tests {
         let (_temp, repo, profile) = fixture()?;
         age_fixture(&profile)?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let limit = elapsed_days(7);
+        let plan = plan_cargo_profile_sweep(&target, &repo, &limit, SystemTime::now())?;
         let held = File::options()
             .read(true)
             .write(true)
@@ -697,7 +809,7 @@ mod tests {
             &target,
             &repo,
             &plan.candidates,
-            7,
+            &limit,
             "test-run",
             Some(Duration::from_millis(20)),
         )
@@ -715,7 +827,8 @@ mod tests {
         fs::create_dir_all(&trash)?;
         fs::write(trash.join("artifact"), "old")?;
         let target = repo.join("target");
-        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let limit = elapsed_days(7);
+        let plan = plan_cargo_profile_sweep(&target, &repo, &limit, SystemTime::now())?;
         assert!(plan
             .candidates
             .iter()
@@ -725,7 +838,7 @@ mod tests {
             &target,
             &repo,
             &plan.candidates,
-            7,
+            &limit,
             "test-run",
             Some(Duration::from_secs(10)),
         )?;
@@ -742,7 +855,12 @@ mod tests {
             fs::write(profile.join(".cargo-lock"), "")?;
         }
 
-        let plan = plan_cargo_profile_sweep(&repo.join("target"), &repo, 0, SystemTime::now())?;
+        let plan = plan_cargo_profile_sweep(
+            &repo.join("target"),
+            &repo,
+            &elapsed_days(0),
+            SystemTime::now(),
+        )?;
         let skipped = plan
             .candidates
             .iter()

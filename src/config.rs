@@ -25,6 +25,7 @@ pub(crate) struct CleanupConfig {
     pub generated_activity_only: bool,
     pub check_in_use: bool,
     pub cargo_lock_timeout_minutes: u64,
+    pub cargo_profile_workdays: u64,
     pub cargo_sweep_max_size: Option<String>,
 }
 
@@ -75,6 +76,7 @@ impl Default for CleanupConfig {
             generated_activity_only: true,
             check_in_use: true,
             cargo_lock_timeout_minutes: 30,
+            cargo_profile_workdays: worktree_gc::DEFAULT_CARGO_PROFILE_SWEEP_WORKDAYS,
             cargo_sweep_max_size: None,
         }
     }
@@ -187,6 +189,7 @@ stale_days = 12
 generated_days = 9
 generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
 cargo_lock_timeout_minutes = 45
+cargo_profile_workdays = 4
 cargo_sweep_max_size = "50GB"
 
 [pressure]
@@ -209,6 +212,7 @@ retention_days = 120
         assert_eq!(config.cleanup.generated_windows["target"], 9);
         assert_eq!(config.cleanup.generated_windows["node_modules"], 10);
         assert_eq!(config.cleanup.cargo_lock_timeout_minutes, 45);
+        assert_eq!(config.cleanup.cargo_profile_workdays, 4);
         let pressure = config.pressure;
         assert_eq!(pressure.enter_free_space.as_deref(), Some("100GiB"));
         assert_eq!(pressure.target_free_space.as_deref(), Some("150GiB"));

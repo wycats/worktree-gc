@@ -273,7 +273,7 @@ struct GeneratedArgs {
         value_name = "NAME=TOOL:LIMIT",
         value_delimiter = ',',
         value_parser = parse_sweep_strategy,
-        help = "In-place pruning for active dirs (e.g. target=rustc-incremental:14, target=cargo-profile-reset:7, or target=cargo-sweep:max-size=50GB); repeat or comma-separate"
+        help = "In-place pruning for active dirs (e.g. target=rustc-incremental:14, target=cargo-profile-reset:3wd, or target=cargo-sweep:max-size=50GB); repeat or comma-separate"
     )]
     sweep: Vec<SweepStrategy>,
 
@@ -342,6 +342,19 @@ fn parse_sweep_strategy(raw: &str) -> Result<SweepStrategy, String> {
         let bytes = parse_size::parse_size(size)
             .map_err(|error| format!("invalid max size in '{raw}': {error}"))?;
         SweepLimit::MaxSize { bytes }
+    } else if let Some(workdays) = limit.trim().strip_suffix("wd") {
+        if tool != SweepTool::CargoProfileReset {
+            return Err(format!(
+                "workday limits are only supported by cargo-profile-reset in '{raw}'"
+            ));
+        }
+        let workdays = workdays
+            .parse::<u64>()
+            .map_err(|_| format!("invalid workday count in '{raw}'"))?;
+        if workdays == 0 {
+            return Err(format!("workday count must be at least 1 in '{raw}'"));
+        }
+        SweepLimit::AgeWorkdays { workdays }
     } else {
         let days = limit
             .trim()
@@ -425,6 +438,17 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
     // allowing the scheduled defaults to adopt workday-aware build caches.
     generated_workday_windows.retain(|name, _| !generated_windows.contains_key(name));
     let mut sweeps = Vec::new();
+    anyhow::ensure!(
+        cleanup.cargo_profile_workdays > 0,
+        "cleanup.cargo_profile_workdays must be at least 1"
+    );
+    sweeps.push(SweepStrategy {
+        name: "target".to_string(),
+        tool: SweepTool::CargoProfileReset,
+        limit: SweepLimit::AgeWorkdays {
+            workdays: cleanup.cargo_profile_workdays,
+        },
+    });
     if let Some(size) = &cleanup.cargo_sweep_max_size {
         let bytes = parse_size::parse_size(size)?;
         sweeps.push(SweepStrategy {
@@ -1057,8 +1081,8 @@ mod tests {
                 .iter()
                 .find(|strategy| strategy.tool == SweepTool::CargoProfileReset)
                 .map(|strategy| &strategy.limit),
-            Some(&SweepLimit::AgeDays {
-                days: worktree_gc::DEFAULT_CARGO_PROFILE_SWEEP_DAYS
+            Some(&SweepLimit::AgeWorkdays {
+                workdays: worktree_gc::DEFAULT_CARGO_PROFILE_SWEEP_WORKDAYS
             })
         );
         assert_eq!(
@@ -1096,6 +1120,12 @@ mod tests {
             .expect("Cargo profile strategy should parse");
         assert_eq!(strategy.tool, SweepTool::CargoProfileReset);
         assert_eq!(strategy.limit, SweepLimit::AgeDays { days: 9 });
+
+        let strategy = parse_sweep_strategy("target=cargo-profile-reset:3wd")
+            .expect("Cargo profile workday strategy should parse");
+        assert_eq!(strategy.limit, SweepLimit::AgeWorkdays { workdays: 3 });
+        assert!(parse_sweep_strategy("target=cargo-profile-reset:0wd").is_err());
+        assert!(parse_sweep_strategy("target=rustc-incremental:3wd").is_err());
         assert!(parse_sweep_strategy("target=cargo-profile-reset:max-size=1GB").is_err());
     }
 
@@ -1105,6 +1135,7 @@ mod tests {
             r#"
 generated_days = 14
 generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
+cargo_profile_workdays = 4
 "#,
         )?;
         let generated = scheduled_generated_config(&cleanup)?;
@@ -1130,6 +1161,12 @@ generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
             generated.effective_retention("target", cleanup.generated_days),
             worktree_gc::GeneratedRetentionWindow::ElapsedDays { days: 9 }
         );
+        let profile_reset = generated
+            .sweep_strategies("target")
+            .into_iter()
+            .find(|strategy| strategy.tool == SweepTool::CargoProfileReset)
+            .context("missing scheduled Cargo profile reset")?;
+        assert_eq!(profile_reset.limit, SweepLimit::AgeWorkdays { workdays: 4 });
         Ok(())
     }
 
@@ -1155,6 +1192,12 @@ generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
     fn scheduled_generated_config_rejects_zero_generated_workdays() {
         let cleanup: config::CleanupConfig =
             toml::from_str("generated_workday_windows = { target = 0 }").unwrap();
+        assert!(scheduled_generated_config(&cleanup).is_err());
+    }
+
+    #[test]
+    fn scheduled_generated_config_rejects_zero_profile_workdays() {
+        let cleanup: config::CleanupConfig = toml::from_str("cargo_profile_workdays = 0").unwrap();
         assert!(scheduled_generated_config(&cleanup).is_err());
     }
 

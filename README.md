@@ -101,11 +101,16 @@ Active Rust `target` directories receive a built-in incremental-cache sweep
 during ordinary cleanup planning. They also receive an atomic profile-reset
 pass. Rustc incremental roots with no session activity for 14 days are
 selected for in-place pruning; host Cargo profiles such as `debug` and
-`release` that have been inactive for 7 days are reset as a unit while holding
-their Cargo profile locks. A whole `target` directory that has been inactive for
-3 days remains a wholesale deletion candidate. The dry run records every
-incremental root and Cargo profile, including its path, newest activity, age,
-and planned action.
+`release` that have been inactive for 3 workdays are reset as a unit while
+holding their Cargo profile locks. Workdays use the machine's local calendar,
+exclude Saturdays and Sundays, and currently do not exclude holidays. Scheduled
+cleanup also treats a whole `target` directory as a wholesale deletion candidate
+after 3 workdays; explicit CLI day windows retain elapsed-day meaning. The dry
+run records every incremental root and Cargo profile, including its path, newest
+activity, age, and planned action. Cargo profile records include the timezone,
+local activity and observation dates, UTC offsets, workday-calendar identifier,
+and both elapsed- and workday-age evidence so a reviewed decision can be
+reproduced.
 
 Override the built-in incremental window with an explicit strategy:
 
@@ -113,9 +118,11 @@ Override the built-in incremental window with an explicit strategy:
 cargo run -- cleanup --repo /path/to/repo --sweep target=rustc-incremental:7 --execute
 ```
 
-Override the Cargo profile window independently:
+Override the Cargo profile window independently. The `wd` suffix selects the
+workday calendar; a bare number retains the existing elapsed-day meaning:
 
 ```sh
+cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-profile-reset:5wd --execute
 cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-profile-reset:14 --execute
 ```
 
@@ -160,7 +167,7 @@ Generated directory defaults are:
 - delete candidates: `node_modules`, `.next`, `.turbo`, `target`
 - report-only candidates: `dist`
 - in-place sweeps: `target=rustc-incremental:14`
-- Atomic Cargo profile reset: `target=cargo-profile-reset:7`
+- atomic Cargo profile reset: `target=cargo-profile-reset:3wd`
 
 You can add repo-specific generated directory names:
 
@@ -304,6 +311,8 @@ generated_windows = { node_modules = 7 }
 generated_activity_only = true
 check_in_use = true
 cargo_lock_timeout_minutes = 30
+# Routine host debug/release reset window, measured in local workdays.
+cargo_profile_workdays = 3
 # Requires cargo-sweep; omit to use only the built-in Cargo sweeps.
 cargo_sweep_max_size = "50GB"
 

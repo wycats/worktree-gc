@@ -193,9 +193,10 @@ The implementation order is intentionally useful after every merge:
 3. **Workday-aware artifact retention.** Add explicit timezone, calendar,
    elapsed-age, and workday-age evidence without changing existing elapsed-day
    flags. Apply the three-workday routine default to owner-free `target`,
-   `.next`, and `.turbo` roots. Keep dependency installs and other higher-cost
-   classes on their explicit elapsed or owner-specific windows until their
-   recovery contracts become equally reliable.
+   `.next`, and `.turbo` roots, plus atomic host Cargo `debug`/`release` profile
+   resets. Keep dependency installs and other higher-cost classes on their
+   explicit elapsed or owner-specific windows until their recovery contracts
+   become equally reliable.
 4. **Bounded scheduling and first activation.** Make repository concurrency an
    explicit scheduled-mode setting, retain hard inventory/measurement budgets,
    and validate a complete dry-run manifest before enabling execution. Roots

@@ -51,7 +51,7 @@ pub const DEFAULT_GENERATED_DAYS: u64 = 7;
 pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", ".turbo", "target"];
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
-pub const DEFAULT_CARGO_PROFILE_SWEEP_DAYS: u64 = 7;
+pub const DEFAULT_CARGO_PROFILE_SWEEP_WORKDAYS: u64 = 3;
 pub const DEFAULT_GENERATED_WORKDAYS: u64 = 3;
 pub const DEFAULT_GENERATED_WORKDAY_NAMES: &[&str] = &[".next", ".turbo", "target"];
 pub const MANIFEST_VERSION: u64 = 6;
@@ -393,6 +393,7 @@ pub enum SweepTool {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SweepLimit {
     AgeDays { days: u64 },
+    AgeWorkdays { workdays: u64 },
     MaxSize { bytes: u64 },
 }
 
@@ -400,6 +401,7 @@ impl SweepLimit {
     fn age_days(&self) -> Option<u64> {
         match self {
             Self::AgeDays { days } => Some(*days),
+            Self::AgeWorkdays { .. } => None,
             Self::MaxSize { .. } => None,
         }
     }
@@ -522,8 +524,8 @@ impl GeneratedDirConfig {
             sweeps.push(SweepStrategy {
                 name: "target".to_string(),
                 tool: SweepTool::CargoProfileReset,
-                limit: SweepLimit::AgeDays {
-                    days: DEFAULT_CARGO_PROFILE_SWEEP_DAYS,
+                limit: SweepLimit::AgeWorkdays {
+                    workdays: DEFAULT_CARGO_PROFILE_SWEEP_WORKDAYS,
                 },
             });
         }
@@ -2533,11 +2535,14 @@ fn plan_sweep_decisions(
                 })
             }
             SweepTool::CargoProfileReset => {
-                let days = strategy
-                    .limit
-                    .age_days()
-                    .context("cargo-profile-reset requires an age-days limit")?;
-                let plan = plan_cargo_profile_sweep(target_dir, worktree, days, now)?;
+                anyhow::ensure!(
+                    matches!(
+                        strategy.limit,
+                        SweepLimit::AgeDays { .. } | SweepLimit::AgeWorkdays { .. }
+                    ),
+                    "cargo-profile-reset requires an age limit"
+                );
+                let plan = plan_cargo_profile_sweep(target_dir, worktree, &strategy.limit, now)?;
                 Ok(SweepDecision {
                     tool: SweepTool::CargoProfileReset,
                     limit: strategy.limit.clone(),
@@ -2548,23 +2553,30 @@ fn plan_sweep_decisions(
                     profile_candidates: plan.candidates,
                 })
             }
-            SweepTool::CargoSweep => Ok(SweepDecision {
-                tool: SweepTool::CargoSweep,
-                limit: strategy.limit.clone(),
-                delegated: true,
-                project_dir: cargo_project_dir(target_dir, worktree),
-                reason: match strategy.limit {
-                    SweepLimit::AgeDays { days } => {
-                        format!("delegate fingerprint-associated outputs older than {days} days")
-                    }
-                    SweepLimit::MaxSize { bytes } => format!(
-                        "delegate oldest fingerprint-associated outputs above {}",
-                        format_bytes(bytes)
-                    ),
-                },
-                candidates: Vec::new(),
-                profile_candidates: Vec::new(),
-            }),
+            SweepTool::CargoSweep => {
+                anyhow::ensure!(
+                    !matches!(strategy.limit, SweepLimit::AgeWorkdays { .. }),
+                    "cargo-sweep does not support workday limits"
+                );
+                Ok(SweepDecision {
+                    tool: SweepTool::CargoSweep,
+                    limit: strategy.limit.clone(),
+                    delegated: true,
+                    project_dir: cargo_project_dir(target_dir, worktree),
+                    reason: match strategy.limit {
+                        SweepLimit::AgeDays { days } => format!(
+                            "delegate fingerprint-associated outputs older than {days} days"
+                        ),
+                        SweepLimit::MaxSize { bytes } => format!(
+                            "delegate oldest fingerprint-associated outputs above {}",
+                            format_bytes(bytes)
+                        ),
+                        SweepLimit::AgeWorkdays { .. } => unreachable!(),
+                    },
+                    candidates: Vec::new(),
+                    profile_candidates: Vec::new(),
+                })
+            }
         })
         .collect()
 }
@@ -3406,15 +3418,11 @@ fn run_sweeps(
                 )?;
             }
             SweepTool::CargoProfileReset => {
-                let days = sweep
-                    .limit
-                    .age_days()
-                    .context("cargo-profile-reset requires an age-days limit")?;
                 execute_cargo_profile_reset(
                     &decision.path,
                     &decision.worktree_path,
                     &sweep.profile_candidates,
-                    days,
+                    &sweep.limit,
                     run_id,
                     cargo_lock_timeout,
                 )?;
@@ -3441,6 +3449,12 @@ fn run_sweeps(
                         match sweep.limit {
                             SweepLimit::AgeDays { days } => {
                                 command.arg("--time").arg(days.to_string());
+                            }
+                            SweepLimit::AgeWorkdays { .. } => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "cargo-sweep does not support workday limits",
+                                ));
                             }
                             SweepLimit::MaxSize { bytes } => {
                                 command.arg("--maxsize").arg(format!("{bytes}B"));
@@ -4161,8 +4175,8 @@ mod tests {
                 .iter()
                 .find(|strategy| strategy.tool == SweepTool::CargoProfileReset)
                 .map(|strategy| &strategy.limit),
-            Some(&SweepLimit::AgeDays {
-                days: DEFAULT_CARGO_PROFILE_SWEEP_DAYS
+            Some(&SweepLimit::AgeWorkdays {
+                workdays: DEFAULT_CARGO_PROFILE_SWEEP_WORKDAYS
             })
         );
         assert_eq!(
@@ -4401,8 +4415,8 @@ mod tests {
             .context("missing default Cargo profile sweep")?;
         assert_eq!(
             profile_sweep.limit,
-            SweepLimit::AgeDays {
-                days: DEFAULT_CARGO_PROFILE_SWEEP_DAYS
+            SweepLimit::AgeWorkdays {
+                workdays: DEFAULT_CARGO_PROFILE_SWEEP_WORKDAYS
             }
         );
         assert!(profile_sweep
