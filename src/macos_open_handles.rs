@@ -219,7 +219,11 @@ fn mapped_vnode_paths(
             };
         }
         let returned = usize::try_from(returned).unwrap_or(0);
-        let (next_address, path) = parse_region_path_payload(pid, address, &buffer, returned)?;
+        let Some((next_address, path)) =
+            parse_region_path_payload(pid, address, &buffer, returned)?
+        else {
+            return Ok(Some(paths));
+        };
         address = next_address;
         *regions_seen += 1;
         if let Some(path) = path {
@@ -236,7 +240,7 @@ fn parse_region_path_payload(
     requested_address: u64,
     buffer: &[u8],
     returned: usize,
-) -> io::Result<(u64, Option<PathBuf>)> {
+) -> io::Result<Option<(u64, Option<PathBuf>)>> {
     if returned > buffer.len() || returned < size_of::<ProcRegionInfo>().saturating_add(MAXPATHLEN)
     {
         return Err(io::Error::other(format!(
@@ -244,19 +248,28 @@ fn parse_region_path_payload(
         )));
     }
     let region = unsafe { ptr::read_unaligned(buffer.as_ptr().cast::<ProcRegionInfo>()) };
+    let path = trailing_vnode_path(buffer, returned)?;
+    if region.size == 0 {
+        if path.is_some() {
+            return Err(io::Error::other(format!(
+                "process {pid} returned a zero-length memory region with a vnode path"
+            )));
+        }
+        return Ok(None);
+    }
     let next_address = region.address.checked_add(region.size).ok_or_else(|| {
         io::Error::other(format!(
             "process {pid} returned overflowing memory region at {} with size {}",
             region.address, region.size
         ))
     })?;
-    if region.size == 0 || next_address <= requested_address {
+    if next_address <= requested_address {
         return Err(io::Error::other(format!(
             "process {pid} returned a non-advancing memory region at {} with size {}",
             region.address, region.size
         )));
     }
-    Ok((next_address, trailing_vnode_path(buffer, returned)?))
+    Ok(Some((next_address, path)))
 }
 
 /// Capture the process cwd and root vnode paths. Cwd is liveness evidence even
@@ -522,7 +535,9 @@ mod tests {
         let path_start = returned - MAXPATHLEN;
         payload[path_start..path_start + 7].copy_from_slice(b"/mapped");
 
-        let (next, path) = parse_region_path_payload(42, 0, &payload, returned).unwrap();
+        let (next, path) = parse_region_path_payload(42, 0, &payload, returned)
+            .unwrap()
+            .expect("ordinary region should advance");
 
         assert_eq!(next, 0x3_000);
         assert_eq!(path, Some(PathBuf::from("/mapped")));
@@ -544,6 +559,45 @@ mod tests {
         let error = parse_region_path_payload(42, 0x2_000, &payload, returned).unwrap_err();
 
         assert!(error.to_string().contains("non-advancing"));
+    }
+
+    #[test]
+    fn zero_length_mapped_region_without_a_path_is_end_of_address_space() {
+        let returned = REGION_PATH_BUFFER_BYTES;
+        let mut payload = vec![0_u8; returned];
+        let region = ProcRegionInfo {
+            address: 0x1_000,
+            size: 0,
+            ..ProcRegionInfo::default()
+        };
+        unsafe {
+            ptr::write_unaligned(payload.as_mut_ptr().cast::<ProcRegionInfo>(), region);
+        }
+
+        assert_eq!(
+            parse_region_path_payload(42, 0x1_000, &payload, returned).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_length_mapped_region_with_a_path_fails_closed() {
+        let returned = REGION_PATH_BUFFER_BYTES;
+        let mut payload = vec![0_u8; returned];
+        let region = ProcRegionInfo {
+            address: 0x1_000,
+            size: 0,
+            ..ProcRegionInfo::default()
+        };
+        unsafe {
+            ptr::write_unaligned(payload.as_mut_ptr().cast::<ProcRegionInfo>(), region);
+        }
+        let path_start = returned - MAXPATHLEN;
+        payload[path_start..path_start + 7].copy_from_slice(b"/mapped");
+
+        let error = parse_region_path_payload(42, 0x1_000, &payload, returned).unwrap_err();
+
+        assert!(error.to_string().contains("zero-length memory region"));
     }
 
     #[test]
