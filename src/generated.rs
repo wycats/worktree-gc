@@ -1,6 +1,7 @@
 use crate::inventory::{inventory, InventoryMetrics, InventoryOptions};
 use crate::{
-    format_bytes, triage_roots_with_parallelism, CleanupClass, CleanupMode, GeneratedDirAction,
+    discover_repositories_bounded, format_bytes, triage_exact_roots_with_parallelism,
+    triage_roots_with_parallelism, CleanupClass, CleanupMode, GeneratedDirAction,
     GeneratedDirConfig, GeneratedDirInfo, OpenHandleEvidence, ProtectionMatch, TriageOptions,
     TriageReport, DEFAULT_GENERATED_DAYS, DEFAULT_STALE_DAYS,
 };
@@ -13,12 +14,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GENERATED_COLLECT_MANIFEST_VERSION: u64 = 2;
+const GENERATED_COLLECT_MANIFEST_VERSION: u64 = 3;
 const MAX_ENTRIES_PER_ARTIFACT: u64 = 250_000;
 
 #[derive(Debug, Clone)]
 pub struct GeneratedCollectOptions {
     pub roots: Vec<PathBuf>,
+    pub discovery_roots: Vec<PathBuf>,
     pub generated_days: u64,
     pub max_entries: u64,
     pub now: SystemTime,
@@ -28,6 +30,7 @@ impl Default for GeneratedCollectOptions {
     fn default() -> Self {
         Self {
             roots: Vec::new(),
+            discovery_roots: Vec::new(),
             generated_days: DEFAULT_GENERATED_DAYS,
             max_entries: 2_000_000,
             now: SystemTime::now(),
@@ -49,6 +52,7 @@ pub struct GeneratedCollectManifest {
     pub mode: CleanupMode,
     pub generated_at_unix: u64,
     pub roots: Vec<PathBuf>,
+    pub discovery_roots: Vec<PathBuf>,
     pub policy: GeneratedCollectPolicy,
     pub plan: GeneratedCollectPlan,
 }
@@ -173,8 +177,8 @@ pub struct GeneratedRebuildCostSummary {
 
 pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCollectRun> {
     anyhow::ensure!(
-        !options.roots.is_empty(),
-        "generated collection requires at least one root"
+        !options.roots.is_empty() || !options.discovery_roots.is_empty(),
+        "generated collection requires an exact root or --discover-under"
     );
     anyhow::ensure!(
         options.generated_days > 0,
@@ -182,21 +186,40 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
     );
     anyhow::ensure!(options.max_entries > 0, "max_entries must be at least 1");
 
+    anyhow::ensure!(
+        options.roots.is_empty() || options.discovery_roots.is_empty(),
+        "exact generated roots cannot be combined with --discover-under"
+    );
+
+    let discovery_mode = !options.discovery_roots.is_empty();
+    let mut repository_roots = if discovery_mode {
+        discover_repositories_bounded(&options.discovery_roots, 1)?
+    } else {
+        options.roots.clone()
+    };
+    repository_roots.sort();
+    repository_roots.dedup();
+
     // Repository planning is deliberately serialized. The collector is a
     // background orientation surface, not a reason to fan Git and process
     // ownership work out across every checkout at once.
-    let triage = triage_roots_with_parallelism(
-        &options.roots,
-        TriageOptions {
-            stale_days: DEFAULT_STALE_DAYS,
-            generated_days: options.generated_days,
-            generated_activity_only: true,
-            check_in_use: true,
-            generated_config: GeneratedDirConfig::default(),
-            now: options.now,
-        },
-        1,
-    )?;
+    let triage_options = TriageOptions {
+        stale_days: DEFAULT_STALE_DAYS,
+        generated_days: options.generated_days,
+        generated_activity_only: true,
+        check_in_use: true,
+        generated_config: GeneratedDirConfig::default(),
+        now: options.now,
+    };
+    let triage = if discovery_mode {
+        // Discovered paths identify repository families, not just the checkout
+        // that happened to contain the .git marker. Include every linked
+        // worktree so large generated roots beside the primary checkout remain
+        // visible and retain their own activity and protection evidence.
+        triage_roots_with_parallelism(&repository_roots, triage_options, 1)?
+    } else {
+        triage_exact_roots_with_parallelism(&repository_roots, triage_options, 1)?
+    };
     let roots = triage.roots;
     let repositories = triage.repositories.len();
     let mut artifacts = observations_from_triage(triage.repositories);
@@ -257,6 +280,7 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
         mode: CleanupMode::DryRun,
         generated_at_unix: unix_seconds(options.now),
         roots,
+        discovery_roots: options.discovery_roots,
         policy: GeneratedCollectPolicy {
             owner_contract: "Git worktree ownership plus tracked/ignored state, domain-shaped activity, open handles, and recursive protection leases",
             execution: "report-only; generate a fresh cleanup manifest before any mutation",

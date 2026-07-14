@@ -234,10 +234,12 @@ repository storage is large but does not explain how much belongs to
 rebuildable state:
 
 ```sh
-worktree-gc collect generated ~/Code --max-entries 2000000
+worktree-gc collect generated --discover-under ~/Code --max-entries 2000000
 ```
 
-The collector discovers Git repositories and linked worktrees with one worker,
+The collector discovers Git repositories below each explicit
+`--discover-under` root and then expands their linked worktrees with one worker.
+Exact repository or worktree paths may instead be passed positionally. It
 takes one bounded machine-wide open-handle snapshot (native on macOS, with the
 portable Unix fallback elsewhere), and reuses cleanup's tracked-file, ignore,
 activity, and recursive-protection classification. It then APFS-measures each

@@ -167,8 +167,16 @@ enum Command {
 enum CollectorCommand {
     /// Inventory generated build and dependency roots across Git repositories
     Generated {
-        #[arg(value_name = "PATH", required = true)]
+        #[arg(value_name = "PATH")]
         roots: Vec<PathBuf>,
+
+        #[arg(
+            long = "discover-under",
+            value_name = "PATH",
+            conflicts_with = "roots",
+            help = "Boundedly discover Git repositories below this root; repeat for multiple roots"
+        )]
+        discovery_roots: Vec<PathBuf>,
 
         #[arg(
             long,
@@ -498,11 +506,13 @@ fn main() -> Result<()> {
             match command {
                 CollectorCommand::Generated {
                     roots,
+                    discovery_roots,
                     generated_days,
                     max_entries,
                 } => {
                     let run = collect_generated(GeneratedCollectOptions {
                         roots,
+                        discovery_roots,
                         generated_days,
                         max_entries,
                         now,
@@ -961,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_collector_accepts_bounded_multi_root_options() {
+    fn generated_collector_accepts_exact_multi_root_options() {
         let cli = Cli::try_parse_from([
             "worktree-gc",
             "collect",
@@ -979,6 +989,7 @@ mod tests {
                 command:
                     CollectorCommand::Generated {
                         roots,
+                        discovery_roots,
                         generated_days,
                         max_entries,
                     },
@@ -987,11 +998,56 @@ mod tests {
                     roots,
                     [PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
                 );
+                assert!(discovery_roots.is_empty());
                 assert_eq!(generated_days, 3);
                 assert_eq!(max_entries, 99);
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn generated_collector_accepts_bounded_repository_discovery() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "generated",
+            "--discover-under",
+            "/tmp/code",
+            "--max-entries",
+            "123",
+        ])
+        .expect("generated collector discovery CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Generated {
+                        roots,
+                        discovery_roots,
+                        max_entries,
+                        ..
+                    },
+            } => {
+                assert!(roots.is_empty());
+                assert_eq!(discovery_roots, [PathBuf::from("/tmp/code")]);
+                assert_eq!(max_entries, 123);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn generated_collector_keeps_exact_and_discovery_scopes_distinct() {
+        let error = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "generated",
+            "/tmp/exact",
+            "--discover-under",
+            "/tmp/code",
+        ])
+        .expect_err("exact and discovered generated scopes must not compose");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
