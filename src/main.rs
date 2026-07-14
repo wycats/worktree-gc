@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup_repositories_with_parallelism, cleanup_roots_with_parallelism,
-    cleanup_with_parallelism, collect_generated, discover_repositories_bounded, inventory,
-    list_protections, print_cleanup, print_generated_collect, print_inventory, print_root_cleanup,
-    print_root_triage, print_triage, remove_protection, renew_protection,
-    triage_roots_with_parallelism, triage_with_parallelism, CleanupOptions,
-    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit,
-    SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
+    cleanup_with_parallelism, collect_generated, collect_pnpm, discover_repositories_bounded,
+    inventory, list_protections, print_cleanup, print_generated_collect, print_inventory,
+    print_pnpm_collect, print_root_cleanup, print_root_triage, print_triage, remove_protection,
+    renew_protection, triage_roots_with_parallelism, triage_with_parallelism, CleanupOptions,
+    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, PnpmCollectOptions,
+    PressurePolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
     DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
     MAX_PROTECTION_TTL_DAYS,
 };
@@ -165,6 +165,50 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CollectorCommand {
+    /// Plan or delegate cleanup of pnpm's shared store and dlx cache
+    Pnpm {
+        #[arg(
+            long,
+            help = "Revalidate the manifest and run official pnpm store prune plus the exact approved dlx plan"
+        )]
+        execute: bool,
+
+        #[arg(
+            long,
+            help = "Ignore historical evidence and produce a current point-in-time dry-run"
+        )]
+        fresh: bool,
+
+        #[arg(
+            long,
+            value_name = "SHA256",
+            requires = "execute",
+            help = "Execute only the exact approval digest from a fresh dry-run"
+        )]
+        approved_digest: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = 7,
+            help = "Retain dlx entries used within this many days"
+        )]
+        dlx_days: u64,
+
+        #[arg(
+            long,
+            default_value_t = 2_000_000,
+            help = "Maximum entries to inspect while planning"
+        )]
+        max_entries: u64,
+
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Maximum concurrent pnpm content-prefix scans"
+        )]
+        scan_threads: usize,
+    },
+
     /// Inventory generated build and dependency roots across Git repositories
     Generated {
         #[arg(value_name = "PATH")]
@@ -561,6 +605,25 @@ fn main() -> Result<()> {
                 "collect takes domain roots as positional arguments; do not pass --repo or --root"
             );
             match command {
+                CollectorCommand::Pnpm {
+                    execute,
+                    fresh,
+                    approved_digest,
+                    dlx_days,
+                    max_entries,
+                    scan_threads,
+                } => {
+                    let run = collect_pnpm(PnpmCollectOptions {
+                        execute,
+                        fresh,
+                        approved_digest,
+                        dlx_days,
+                        max_entries,
+                        scan_threads,
+                        now,
+                    })?;
+                    print_pnpm_collect(&run);
+                }
                 CollectorCommand::Generated {
                     roots,
                     discovery_roots,
@@ -1105,6 +1168,68 @@ mod tests {
         ])
         .expect_err("exact and discovered generated scopes must not compose");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn pnpm_collector_is_dry_run_by_default_and_digest_bound_for_execution() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "pnpm",
+            "--dlx-days",
+            "9",
+            "--max-entries",
+            "123",
+            "--scan-threads",
+            "2",
+        ])
+        .expect("pnpm dry-run CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Pnpm {
+                        execute,
+                        fresh,
+                        approved_digest,
+                        dlx_days,
+                        max_entries,
+                        scan_threads,
+                    },
+            } => {
+                assert!(!execute);
+                assert!(!fresh);
+                assert!(approved_digest.is_none());
+                assert_eq!(dlx_days, 9);
+                assert_eq!(max_entries, 123);
+                assert_eq!(scan_threads, 2);
+            }
+            _ => unreachable!(),
+        }
+
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "pnpm",
+            "--execute",
+            "--approved-digest",
+            &digest,
+        ])
+        .expect("pnpm digest-bound execution CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Pnpm {
+                        execute,
+                        approved_digest,
+                        ..
+                    },
+            } => {
+                assert!(execute);
+                assert_eq!(approved_digest.as_deref(), Some(digest.as_str()));
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

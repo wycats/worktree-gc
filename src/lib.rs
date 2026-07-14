@@ -5,6 +5,7 @@ mod generated;
 mod inventory;
 #[cfg(target_os = "macos")]
 mod macos_open_handles;
+mod pnpm;
 mod protection;
 
 use anyhow::{bail, Context, Result};
@@ -40,6 +41,11 @@ pub use generated::{
 pub use inventory::{
     inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
     InventoryReport, InventoryReportOptions, InventoryRoot, InventoryScanError, INVENTORY_VERSION,
+};
+pub use pnpm::{
+    collect_pnpm, print_pnpm_collect, PnpmCollectManifest, PnpmCollectOptions, PnpmCollectRun,
+    PnpmFilesystemObservation, PnpmFilesystemReclaim, PnpmIdentity, PnpmPolicy, PnpmPruneAction,
+    PnpmPruneOutcome, PnpmPrunePlan,
 };
 pub use protection::{
     active_protections, add_protection, list_protections, protection_for_path,

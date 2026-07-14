@@ -267,6 +267,62 @@ The collector also records the scheduled three-workday retention window for
 `target`, `.next`, and `.turbo`, including timezone/calendar evidence.
 `--generated-days` retains elapsed-day meaning for other artifact classes.
 
+## pnpm shared-store collection
+
+The first machine-wide owner collector wraps pnpm's maintained prune operation.
+A plain invocation is read-only:
+
+```sh
+worktree-gc collect pnpm
+worktree-gc collect pnpm --dlx-days 7 --max-entries 2000000 --scan-threads 1
+worktree-gc collect pnpm --fresh --max-entries 2000000
+```
+
+The collector asks pnpm for its canonical store, resolves pnpm's cache, and
+records a bounded advisory estimate of content, metadata, temporary, and
+expired/orphaned dlx surfaces maintained by `pnpm store prune`. The estimate is
+not deletion authority: pnpm's command decides what it removes. Because pnpm
+does not expose a dry-run or structured prune plan, the planner is tied to the
+locally reviewed pnpm 10.32.1 semantics and remains report-only for any other
+version. The manifest records this provenance beside the executable/version,
+eligibility digest, measurements, filesystem observations, protections, and
+active pnpm owners.
+
+Content prefixes are independent and support bounded parallelism. One scan
+thread is the deliberately low-load default. The global entry budget is divided
+deterministically across the active prefix batch, so concurrency cannot expand
+the scan. Completed prefixes are retained in an atomic evidence cache under the
+collector state directory. Later bounded runs reuse unchanged prefix
+observations and spend their budget on remaining prefixes, allowing a low-load
+schedule to converge. Prefix evidence expires after 24 hours.
+
+Cached coverage is advisory only. A project can add or remove a hard link to a
+content file without changing the store prefix directory, so cached evidence
+never authorizes deletion. `--fresh` bypasses the cache and produces one
+point-in-time plan plus an approval digest binding the exact candidate set,
+policy, owner paths, filesystem identities, and reclaim measurements.
+
+Execution remains explicit and digest-bound:
+
+```sh
+worktree-gc collect pnpm --fresh --dlx-days 7
+worktree-gc collect pnpm --dlx-days 7 --execute \
+  --approved-digest sha256:<digest-from-reviewed-fresh-manifest>
+```
+
+Execution creates a new fully fresh plan and refuses to continue unless its
+approval digest exactly matches the reviewed one. Under the collector and
+protection guards it reloads protections, repeats the bounded eligibility
+snapshot, and aborts if anything changed. Only then does it run pnpm's official
+`store prune` with the configured dlx TTL and record realized free-space change.
+An unsupported pnpm version, active owner, incomplete scan, active protection,
+or pnpm global virtual-store layout keeps the operation report-only.
+
+This collector is manual rather than scheduled: pnpm does not offer an
+interprocess prune lock that worktree-gc can acquire atomically with its owner
+checks. Manifests live under `$XDG_STATE_HOME/worktree-gc/collectors` (or
+`~/.local/state/worktree-gc/collectors`).
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but
