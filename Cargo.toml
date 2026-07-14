@@ -25,6 +25,7 @@ atomic-write-file = "0.3.0"
 cargo_metadata = "0.23.1"
 clap = { version = "4.5.28", features = ["derive"] }
 fs4 = "1.1.0"
+jiff = { version = "=0.2.23", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "perf-inline"] }
 parse-size = "1.1.0"
 rayon = "1.10.0"
 serde = { version = "1.0.217", features = ["derive"] }
