@@ -161,6 +161,15 @@ allocation, and rebuild opportunities stay report-only until a narrower owner
 plan exists. Claims known to describe one backing store share an overlap group
 and are never summed.
 
+Owner adapters may stop at attribution. Parallels VM APFS-private bytes, path
+allocation, and the owner's compaction estimate are overlapping report-only
+views of durable VM state. Codex session manifests attribute live and archived
+conversation storage but do not turn archive state into deletion permission.
+Codex worktree manifests attribute private and allocated storage and surface
+whole-worktree review candidates, while leaving all three views overlapping
+and report-only until Codex provides an owner release contract. Generated
+artifacts inside those worktrees stay with the generated/Cargo collectors.
+
 All additive evidence is fresh for 15 minutes by default and must not overlap
 another additive collector's owner paths. Approval-ready evidence must also
 carry a full SHA-256 approval digest and exact execution handoff. Stale,

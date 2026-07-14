@@ -239,6 +239,9 @@ worktree-gc survey \
   --collector-manifest ~/.local/state/worktree-gc/collectors/<pnpm>.json \
   --collector-manifest ~/.local/state/worktree-gc/collectors/<lima>.json \
   --collector-manifest ~/.local/state/worktree-gc/collectors/<chromium-components>.json \
+  --collector-manifest ~/.local/state/worktree-gc/collectors/<parallels>.json \
+  --collector-manifest ~/.local/state/worktree-gc/collectors/<codex-sessions>.json \
+  --collector-manifest ~/.local/state/worktree-gc/collectors/<codex-worktrees>.json \
   --target-free 100GiB --target-free 150GiB
 ```
 
@@ -252,6 +255,14 @@ Lima-retirement, Chromium-component, and Cargo-profile plans can become
 approval-ready when their owner manifests provide the required execution
 handoff. Bambu evidence remains review-required until its owner executor lands
 in the same release.
+
+Parallels VM private bytes, allocated bytes, and owner compaction estimates are
+three overlapping views of durable VM state; they remain report-only until an
+owner-mediated compact, move, archive, or deletion contract exists. Codex live
+and archived sessions are durable conversation storage and likewise remain
+report-only. Codex worktree totals and human-review candidates share one
+overlap group and expose no deletion command; generated artifacts inside a
+retained worktree continue to belong to the generated/Cargo collectors.
 
 Additive claims default to a 15-minute evidence lifetime. Older or future-dated
 manifests remain visible but become non-additive report-only evidence with no

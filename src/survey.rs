@@ -149,6 +149,8 @@ struct CollectorEnvelope {
     #[serde(default)]
     lima: Value,
     #[serde(default)]
+    identity: Value,
+    #[serde(default)]
     policy: Value,
     #[serde(default)]
     source: Value,
@@ -459,6 +461,9 @@ fn parse_collector_manifest(
         "generated" => generated_evidence(path, envelope, inventory, now_unix),
         "pnpm-store" => pnpm_evidence(path, envelope, now_unix),
         "lima" => lima_evidence(path, envelope, inventory, now_unix),
+        "parallels" => parallels_evidence(path, envelope, inventory, now_unix),
+        "codex-sessions" => codex_session_evidence(path, envelope, inventory, now_unix),
+        "codex-worktrees" => codex_worktree_evidence(path, envelope, inventory, now_unix),
         "docker" => docker_evidence(path, envelope, now_unix),
         other => bail!(
             "unsupported collector {other:?} in {}; add an explicit survey adapter before composing its claims",
@@ -1309,6 +1314,321 @@ fn docker_evidence(
                 .into(),
             "this stack can compose historical Docker evidence but does not include a Docker owner executor; all Docker claims remain non-additive"
                 .into(),
+        ],
+    })
+}
+
+fn parallels_evidence(
+    path: &Path,
+    envelope: CollectorEnvelope,
+    inventory: &InventoryReport,
+    now_unix: u64,
+) -> Result<StorageCollectorEvidence> {
+    anyhow::ensure!(
+        envelope.manifest_version == 2,
+        "Parallels manifest {} has unsupported version {}",
+        path.display(),
+        envelope.manifest_version
+    );
+    let complete = bool_at(&envelope.plan, &["complete"])?;
+    let action = string_at(&envelope.plan, &["action"])?;
+    let vms = array_at(&envelope.plan, &["vms"])?;
+    let private_bytes = u64_at(
+        &envelope.plan,
+        &["total_vm_metrics", "private_reclaimable_bytes"],
+    )?;
+    let allocated_bytes = u64_at(&envelope.plan, &["total_vm_metrics", "allocated_bytes"])?;
+    let private_complete = bool_at(
+        &envelope.plan,
+        &["total_vm_metrics", "private_reclaimable_complete"],
+    )?;
+    let compactable_bytes = u64_at(&envelope.plan, &["estimated_host_reclaim_bytes"])?;
+    let mut owner_paths = Vec::new();
+    let mut statuses = BTreeSet::new();
+    let mut non_stopped = 0usize;
+    for vm in vms {
+        owner_paths.push(path_at(vm, &["home"])?);
+        let status = string_at(vm, &["status"])?;
+        if !status.eq_ignore_ascii_case("stopped") {
+            non_stopped += 1;
+        }
+        statuses.insert(status);
+        for disk in array_at(vm, &["disks"])? {
+            owner_paths.push(path_at(disk, &["path"])?);
+        }
+    }
+    owner_paths.sort();
+    owner_paths.dedup();
+    let filesystems = owner_paths
+        .iter()
+        .map(|owner_path| filesystem_for_path(owner_path, inventory))
+        .collect::<Option<BTreeSet<_>>>();
+    let filesystem = filesystems
+        .as_ref()
+        .filter(|filesystems| filesystems.len() == 1)
+        .and_then(|filesystems| filesystems.iter().next().cloned());
+    let overlap_group = "parallels-vm-storage".to_string();
+    let mut warnings = vec![
+        "Parallels VM disks are durable owner state; this collector never stops, resumes, compacts, or deletes a VM".into(),
+        format!("{non_stopped} VMs are not stopped, so even owner-estimated compaction remains held"),
+        "APFS-private bytes, path allocation, and owner-estimated compactable bytes are overlapping evidence, not additive reclaim".into(),
+    ];
+    if !statuses.is_empty() {
+        warnings.push(format!(
+            "observed Parallels VM states: {}",
+            statuses.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if filesystem.is_none() {
+        warnings.push(
+            "not every Parallels owner path maps to one observed inventory filesystem".into(),
+        );
+    }
+    if !private_complete {
+        warnings.push("Parallels APFS-private storage is an incomplete lower bound".into());
+    }
+    Ok(StorageCollectorEvidence {
+        collector: envelope.collector,
+        manifest_path: path.to_path_buf(),
+        manifest_version: envelope.manifest_version,
+        generated_at_unix: envelope.generated_at_unix,
+        age_seconds: now_unix.saturating_sub(envelope.generated_at_unix),
+        mode: envelope.mode,
+        complete,
+        action,
+        reason: string_at(&envelope.plan, &["reason"])?,
+        owner_paths,
+        inventory_matches: Vec::new(),
+        claims: vec![
+            StorageClaim {
+                id: "parallels-vm-private-storage".into(),
+                label: format!("Parallels VM APFS-private storage ({} VMs)", vms.len()),
+                bytes: private_bytes,
+                kind: StorageClaimKind::ApfsPrivateReclaim,
+                readiness: StorageClaimReadiness::ReportOnly,
+                additive: false,
+                overlap_group: Some(overlap_group.clone()),
+                filesystem: filesystem.clone(),
+                approval_digest: None,
+                execution_command: None,
+                evidence: "bounded APFS measurement of durable Parallels-owned VM homes and disks; private storage is not deletion permission".into(),
+            },
+            StorageClaim {
+                id: "parallels-vm-allocated-storage".into(),
+                label: "Parallels VM path allocation".into(),
+                bytes: allocated_bytes,
+                kind: StorageClaimKind::AllocatedStorage,
+                readiness: StorageClaimReadiness::ReportOnly,
+                additive: false,
+                overlap_group: Some(overlap_group.clone()),
+                filesystem: filesystem.clone(),
+                approval_digest: None,
+                execution_command: None,
+                evidence: "path allocation is an orientation view of the same durable VM backing store and must not be added to APFS-private bytes".into(),
+            },
+            StorageClaim {
+                id: "parallels-owner-compaction-estimate".into(),
+                label: "Parallels owner-estimated compactable VM storage".into(),
+                bytes: compactable_bytes,
+                kind: StorageClaimKind::OwnerReportedReclaim,
+                readiness: StorageClaimReadiness::ReportOnly,
+                additive: false,
+                overlap_group: Some(overlap_group),
+                filesystem,
+                approval_digest: None,
+                execution_command: None,
+                evidence: "prl_disk_tool compact --info estimate capped by APFS-private bytes; no stop, compact, or delete operation is delegated".into(),
+            },
+        ],
+        warnings,
+    })
+}
+
+fn codex_session_evidence(
+    path: &Path,
+    envelope: CollectorEnvelope,
+    inventory: &InventoryReport,
+    now_unix: u64,
+) -> Result<StorageCollectorEvidence> {
+    anyhow::ensure!(
+        envelope.manifest_version == 1,
+        "Codex session manifest {} has unsupported version {}",
+        path.display(),
+        envelope.manifest_version
+    );
+    let action = string_at(&envelope.plan, &["action"])?;
+    let complete = bool_at(&envelope.plan, &["complete"])?;
+    let sessions_root = path_at(&envelope.identity, &["sessions_root"])?;
+    let archived_root = path_at(&envelope.identity, &["archived_sessions_root"])?;
+    let owner_paths = vec![sessions_root.clone(), archived_root.clone()];
+    let live_bytes = u64_at(&envelope.plan, &["live", "metrics", "allocated_bytes"])?;
+    let archived_bytes = u64_at(&envelope.plan, &["archived", "metrics", "allocated_bytes"])?;
+    let live_count = u64_at(&envelope.plan, &["live", "count"])?;
+    let archived_count = u64_at(&envelope.plan, &["archived", "count"])?;
+    let mut warnings = vec![
+        "Codex session transcripts are canonical user conversation state; file age and archive state do not authorize deletion"
+            .into(),
+        "the owner collector does not read transcript content and has no deletion executor; retention requires a Codex export or retention contract"
+            .into(),
+    ];
+    if !complete {
+        warnings.push("Codex session inventory is incomplete and remains a lower bound".into());
+    }
+    Ok(StorageCollectorEvidence {
+        collector: envelope.collector,
+        manifest_path: path.to_path_buf(),
+        manifest_version: envelope.manifest_version,
+        generated_at_unix: envelope.generated_at_unix,
+        age_seconds: now_unix.saturating_sub(envelope.generated_at_unix),
+        mode: envelope.mode,
+        complete,
+        action,
+        reason: string_at(&envelope.plan, &["reason"])?,
+        owner_paths,
+        inventory_matches: Vec::new(),
+        claims: vec![
+            StorageClaim {
+                id: "codex-live-sessions".into(),
+                label: format!("Codex live session storage ({live_count} sessions)"),
+                bytes: live_bytes,
+                kind: StorageClaimKind::AllocatedStorage,
+                readiness: StorageClaimReadiness::ReportOnly,
+                additive: false,
+                overlap_group: None,
+                filesystem: filesystem_for_path(&sessions_root, inventory),
+                approval_digest: None,
+                execution_command: None,
+                evidence: format!("allocated transcript storage below {}; transcript content was not read", sessions_root.display()),
+            },
+            StorageClaim {
+                id: "codex-archived-sessions".into(),
+                label: format!("Codex archived session storage ({archived_count} sessions)"),
+                bytes: archived_bytes,
+                kind: StorageClaimKind::AllocatedStorage,
+                readiness: StorageClaimReadiness::ReportOnly,
+                additive: false,
+                overlap_group: None,
+                filesystem: filesystem_for_path(&archived_root, inventory),
+                approval_digest: None,
+                execution_command: None,
+                evidence: format!("allocated archived transcript storage below {}; archive state is not deletion permission", archived_root.display()),
+            },
+        ],
+        warnings,
+    })
+}
+
+fn codex_worktree_evidence(
+    path: &Path,
+    envelope: CollectorEnvelope,
+    inventory: &InventoryReport,
+    now_unix: u64,
+) -> Result<StorageCollectorEvidence> {
+    anyhow::ensure!(
+        envelope.manifest_version == 1,
+        "Codex worktree manifest {} has unsupported version {}",
+        path.display(),
+        envelope.manifest_version
+    );
+    let complete = bool_at(&envelope.plan, &["complete"])?;
+    let worktrees = array_at(&envelope.plan, &["worktrees"])?;
+    let review_candidates = array_at(&envelope.plan, &["review_candidates"])?;
+    let mut owner_paths = worktrees
+        .iter()
+        .map(|worktree| path_at(worktree, &["path"]))
+        .collect::<Result<Vec<_>>>()?;
+    owner_paths.sort();
+    owner_paths.dedup();
+    let total_private = u64_at(
+        &envelope.plan,
+        &["total_metrics", "private_reclaimable_bytes"],
+    )?;
+    let total_allocated = u64_at(&envelope.plan, &["total_metrics", "allocated_bytes"])?;
+    let review_private = u64_at(
+        &envelope.plan,
+        &["review_candidate_metrics", "private_reclaimable_bytes"],
+    )?;
+    let filesystems = owner_paths
+        .iter()
+        .map(|owner_path| filesystem_for_path(owner_path, inventory))
+        .collect::<Option<BTreeSet<_>>>();
+    let filesystem = filesystems
+        .as_ref()
+        .filter(|filesystems| filesystems.len() == 1)
+        .and_then(|filesystems| filesystems.iter().next().cloned());
+    let overlap_group = "codex-worktree-storage".to_string();
+    let action = if !complete {
+        "incomplete"
+    } else if review_candidates.is_empty() {
+        "report_only"
+    } else {
+        "review_only"
+    };
+    let reason = if !complete {
+        "bounded Codex worktree evidence is incomplete; totals are lower bounds"
+    } else if review_candidates.is_empty() {
+        "Codex task, Git, process, and age evidence found no whole-worktree review candidates"
+    } else {
+        "clean Codex worktrees without active task or process ownership require human review"
+    };
+    Ok(StorageCollectorEvidence {
+        collector: envelope.collector,
+        manifest_path: path.to_path_buf(),
+        manifest_version: envelope.manifest_version,
+        generated_at_unix: envelope.generated_at_unix,
+        age_seconds: now_unix.saturating_sub(envelope.generated_at_unix),
+        mode: envelope.mode,
+        complete,
+        action: action.into(),
+        reason: reason.into(),
+        owner_paths,
+        inventory_matches: Vec::new(),
+        claims: vec![
+            StorageClaim {
+                id: "codex-worktree-private-storage".into(),
+                label: format!("Codex-managed worktree APFS-private storage ({} worktrees)", worktrees.len()),
+                bytes: total_private,
+                kind: StorageClaimKind::ApfsPrivateReclaim,
+                readiness: StorageClaimReadiness::ReportOnly,
+                additive: false,
+                overlap_group: Some(overlap_group.clone()),
+                filesystem: filesystem.clone(),
+                approval_digest: None,
+                execution_command: None,
+                evidence: "Codex state, Git, process, protection, and bounded APFS inventory evidence; total storage is not deletion permission".into(),
+            },
+            StorageClaim {
+                id: "codex-worktree-allocated-storage".into(),
+                label: "Codex-managed worktree path allocation".into(),
+                bytes: total_allocated,
+                kind: StorageClaimKind::AllocatedStorage,
+                readiness: StorageClaimReadiness::ReportOnly,
+                additive: false,
+                overlap_group: Some(overlap_group.clone()),
+                filesystem: filesystem.clone(),
+                approval_digest: None,
+                execution_command: None,
+                evidence: "path allocation is retained for orientation and may overstate APFS reclaim because of clones and hard links".into(),
+            },
+            StorageClaim {
+                id: "codex-worktree-review-private-storage".into(),
+                label: format!("Whole Codex worktrees eligible for human review ({})", review_candidates.len()),
+                bytes: review_private,
+                kind: StorageClaimKind::ApfsPrivateReclaim,
+                readiness: StorageClaimReadiness::ReportOnly,
+                additive: false,
+                overlap_group: Some(overlap_group),
+                filesystem,
+                approval_digest: None,
+                execution_command: None,
+                evidence: "task state, Git state, activity, open owners, protections, and measurement completeness are advisory inputs; whole removal remains owner-mediated".into(),
+            },
+        ],
+        warnings: vec![
+            "Codex worktree age and archive state are review signals, not unattended deletion authority".into(),
+            "generated artifacts inside retained worktrees belong to the generated/Cargo profile collectors and must not be added to this allocation"
+                .into(),
+            "all claims overlap and remain report-only until Codex owns a worktree release contract".into(),
         ],
     })
 }
@@ -2278,6 +2598,159 @@ mod tests {
             .claims
             .iter()
             .all(|claim| claim.execution_command.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn parallels_keeps_vm_allocation_separate_from_compaction_estimates() -> Result<()> {
+        let envelope: CollectorEnvelope = serde_json::from_value(serde_json::json!({
+            "manifest_version": 2,
+            "collector": "parallels",
+            "generated_at_unix": 100,
+            "mode": "dry_run",
+            "plan": {
+                "action": "in_use",
+                "reason": "the VM is suspended",
+                "complete": true,
+                "vms": [{
+                    "name": "Windows 11",
+                    "status": "suspended",
+                    "home": "/Users/test/Parallels/Windows 11.pvm",
+                    "disks": [{
+                        "path": "/Users/test/Parallels/Windows 11.pvm/harddisk.hdd"
+                    }]
+                }],
+                "total_vm_metrics": {
+                    "private_reclaimable_bytes": 180_000,
+                    "allocated_bytes": 190_000,
+                    "private_reclaimable_complete": true
+                },
+                "estimated_host_reclaim_bytes": 1_200
+            }
+        }))?;
+
+        let evidence = parallels_evidence(
+            Path::new("/tmp/parallels.json"),
+            envelope,
+            &complete_inventory("/Users/test"),
+            200,
+        )?;
+
+        assert_eq!(evidence.claims.len(), 3);
+        assert_eq!(
+            evidence.claims[0].kind,
+            StorageClaimKind::ApfsPrivateReclaim
+        );
+        assert_eq!(evidence.claims[0].bytes, 180_000);
+        assert_eq!(evidence.claims[1].kind, StorageClaimKind::AllocatedStorage);
+        assert_eq!(evidence.claims[1].bytes, 190_000);
+        assert_eq!(
+            evidence.claims[2].kind,
+            StorageClaimKind::OwnerReportedReclaim
+        );
+        assert_eq!(evidence.claims[2].bytes, 1_200);
+        assert!(evidence
+            .claims
+            .iter()
+            .all(|claim| claim.readiness == StorageClaimReadiness::ReportOnly));
+        assert!(!evidence.claims.iter().any(|claim| claim.additive));
+        assert_eq!(
+            evidence.claims[0].overlap_group,
+            evidence.claims[1].overlap_group
+        );
+        assert!(evidence
+            .claims
+            .iter()
+            .all(|claim| claim.execution_command.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_sessions_are_durable_report_only_storage() -> Result<()> {
+        let envelope: CollectorEnvelope = serde_json::from_value(serde_json::json!({
+            "manifest_version": 1,
+            "collector": "codex-sessions",
+            "generated_at_unix": 100,
+            "mode": "dry_run",
+            "identity": {
+                "sessions_root": "/Users/test/.codex/sessions",
+                "archived_sessions_root": "/Users/test/.codex/archived_sessions"
+            },
+            "plan": {
+                "action": "report_only",
+                "reason": "retention requires an owner contract",
+                "complete": true,
+                "live": {"count": 3, "metrics": {
+                    "allocated_bytes": 300,
+                    "private_reclaimable_bytes": 300,
+                    "private_reclaimable_complete": true
+                }},
+                "archived": {"count": 4, "metrics": {
+                    "allocated_bytes": 400,
+                    "private_reclaimable_bytes": 400,
+                    "private_reclaimable_complete": true
+                }}
+            }
+        }))?;
+
+        let evidence = codex_session_evidence(
+            Path::new("/tmp/codex-sessions.json"),
+            envelope,
+            &complete_inventory("/Users/test"),
+            200,
+        )?;
+
+        assert_eq!(evidence.claims[0].bytes, 300);
+        assert_eq!(evidence.claims[1].bytes, 400);
+        assert!(evidence.claims.iter().all(|claim| claim.kind
+            == StorageClaimKind::AllocatedStorage
+            && claim.readiness == StorageClaimReadiness::ReportOnly
+            && !claim.additive
+            && claim.execution_command.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_worktree_candidates_overlap_total_allocation_and_have_no_executor() -> Result<()> {
+        let envelope: CollectorEnvelope = serde_json::from_value(serde_json::json!({
+            "manifest_version": 1,
+            "collector": "codex-worktrees",
+            "generated_at_unix": 100,
+            "mode": "dry_run",
+            "plan": {
+                "complete": true,
+                "worktrees": [{"path": "/Users/test/.codex/worktrees/a/repo"}],
+                "review_candidates": [{"path": "/Users/test/.codex/worktrees/a/repo"}],
+                "total_metrics": {
+                    "private_reclaimable_bytes": 900,
+                    "allocated_bytes": 1_000
+                },
+                "review_candidate_metrics": {"private_reclaimable_bytes": 500}
+            }
+        }))?;
+
+        let evidence = codex_worktree_evidence(
+            Path::new("/tmp/codex-worktrees.json"),
+            envelope,
+            &complete_inventory("/Users/test"),
+            200,
+        )?;
+
+        assert_eq!(evidence.claims[0].bytes, 900);
+        assert_eq!(evidence.claims[1].bytes, 1_000);
+        assert_eq!(evidence.claims[2].bytes, 500);
+        assert!(evidence
+            .claims
+            .iter()
+            .all(|claim| claim.readiness == StorageClaimReadiness::ReportOnly));
+        assert_eq!(
+            evidence.claims[0].overlap_group,
+            evidence.claims[1].overlap_group
+        );
+        assert!(evidence
+            .claims
+            .iter()
+            .all(|claim| !claim.additive && claim.execution_command.is_none()));
         Ok(())
     }
 }
