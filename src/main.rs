@@ -397,7 +397,7 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
             "generated_windows keys normalize to duplicate name {normalized:?}"
         );
     }
-    let mut generated_workday_windows = std::collections::BTreeMap::new();
+    let mut configured_workday_windows = std::collections::BTreeMap::new();
     for (name, workdays) in &cleanup.generated_workday_windows {
         let normalized = name.trim();
         anyhow::ensure!(
@@ -414,12 +414,17 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
             "generated_workday_windows[{name:?}] must be at least 1"
         );
         anyhow::ensure!(
-            generated_workday_windows
+            configured_workday_windows
                 .insert(normalized.to_string(), *workdays)
                 .is_none(),
             "generated_workday_windows keys normalize to duplicate name {normalized:?}"
         );
     }
+    let mut generated_workday_windows = worktree_gc::DEFAULT_GENERATED_WORKDAY_NAMES
+        .iter()
+        .map(|name| ((*name).to_string(), worktree_gc::DEFAULT_GENERATED_WORKDAYS))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    generated_workday_windows.extend(configured_workday_windows);
     // Existing elapsed-day configuration remains authoritative for names that
     // opt into it explicitly. This preserves generated_windows semantics while
     // allowing the scheduled defaults to adopt workday-aware build caches.
@@ -1184,6 +1189,25 @@ generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
             generated.effective_retention("node_modules", cleanup.generated_days),
             worktree_gc::GeneratedRetentionWindow::ElapsedDays { days: 7 }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_workday_overrides_preserve_other_build_cache_defaults() -> Result<()> {
+        let cleanup: config::CleanupConfig =
+            toml::from_str("generated_workday_windows = { target = 5 }")?;
+        let generated = scheduled_generated_config(&cleanup)?;
+
+        assert_eq!(
+            generated.effective_retention("target", cleanup.generated_days),
+            worktree_gc::GeneratedRetentionWindow::Workdays { workdays: 5 }
+        );
+        for name in [".next", ".turbo"] {
+            assert_eq!(
+                generated.effective_retention(name, cleanup.generated_days),
+                worktree_gc::GeneratedRetentionWindow::Workdays { workdays: 3 }
+            );
+        }
         Ok(())
     }
 
