@@ -47,6 +47,15 @@ Other platforms use a portable directory iterator and mark private accounting
 incomplete. A filesystem that rejects the extended macOS attributes falls back
 to the portable path.
 
+The report-only generated-root collector is the repository-oriented drill-down
+between a broad inventory and a mutation manifest. It reuses cleanup's Git,
+activity, process, and protection classification and measures every configured
+generated root even when cleanup retains it. Complete owner-free roots are
+reported as explicit rebuild opportunities rather than relabeled as stale.
+Their cumulative low, medium, and high rebuild-cost curves are calculated per
+filesystem; incomplete open-handle evidence fails closed. A fresh cleanup dry
+run remains the only path to an executable candidate set.
+
 ## Collector contract
 
 A collector owns one storage domain. It progresses through five explicit
@@ -117,7 +126,10 @@ The implementation order is intentionally useful after every merge:
 2. **Measured generated candidates.** Reuse inventory measurements for the
    existing `target`, `.next`, `.turbo`, and `node_modules` collectors. Store
    measurements in manifests and rank safe pressure candidates by physical
-   benefit inside their rebuild-cost class.
+   benefit inside their rebuild-cost class. Separately report complete,
+   owner-free generated roots as explicit rebuild opportunities even when TTL
+   policy retains them, grouped into cumulative per-filesystem rebuild-cost
+   tiers.
 3. **Bounded scheduling and first activation.** Make repository concurrency an
    explicit scheduled-mode setting, retain hard inventory/measurement budgets,
    and validate a complete dry-run manifest before enabling execution. Roots

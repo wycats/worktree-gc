@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup_repositories_with_parallelism, cleanup_roots_with_parallelism,
-    cleanup_with_parallelism, discover_repositories_bounded, inventory, list_protections,
-    print_cleanup, print_inventory, print_root_cleanup, print_root_triage, print_triage,
-    remove_protection, renew_protection, triage_roots_with_parallelism, triage_with_parallelism,
-    CleanupOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit,
+    cleanup_with_parallelism, collect_generated, discover_repositories_bounded, inventory,
+    list_protections, print_cleanup, print_generated_collect, print_inventory, print_root_cleanup,
+    print_root_triage, print_triage, remove_protection, renew_protection,
+    triage_roots_with_parallelism, triage_with_parallelism, CleanupOptions,
+    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit,
     SweepStrategy, SweepTool, TriageOptions, DEFAULT_GENERATED_DAYS,
     DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
     MAX_PROTECTION_TTL_DAYS,
@@ -66,6 +67,11 @@ enum Command {
 
         #[arg(long, help = "Write the complete structured report as JSON")]
         json: bool,
+    },
+    /// Run a report-only domain collector
+    Collect {
+        #[command(subcommand)]
+        command: CollectorCommand,
     },
     #[command(visible_alias = "audit")]
     Triage {
@@ -154,6 +160,29 @@ enum Command {
     Protect {
         #[command(subcommand)]
         command: ProtectCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CollectorCommand {
+    /// Inventory generated build and dependency roots across Git repositories
+    Generated {
+        #[arg(value_name = "PATH", required = true)]
+        roots: Vec<PathBuf>,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_GENERATED_DAYS,
+            help = "Require this many inactive days before cleanup classifies a generated root as stale"
+        )]
+        generated_days: u64,
+
+        #[arg(
+            long,
+            default_value_t = 2_000_000,
+            help = "Maximum entries to APFS-measure across all generated roots"
+        )]
+        max_entries: u64,
     },
 }
 
@@ -459,6 +488,27 @@ fn main() -> Result<()> {
                 println!();
             } else {
                 print_inventory(&report);
+            }
+        }
+        Command::Collect { command } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "collect takes domain roots as positional arguments; do not pass --repo or --root"
+            );
+            match command {
+                CollectorCommand::Generated {
+                    roots,
+                    generated_days,
+                    max_entries,
+                } => {
+                    let run = collect_generated(GeneratedCollectOptions {
+                        roots,
+                        generated_days,
+                        max_entries,
+                        now,
+                    })?;
+                    print_generated_collect(&run);
+                }
             }
         }
         Command::Triage {

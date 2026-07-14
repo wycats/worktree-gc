@@ -1,5 +1,6 @@
 mod cargo_incremental;
 mod cargo_profiles;
+mod generated;
 mod inventory;
 mod protection;
 
@@ -26,6 +27,12 @@ use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
+pub use generated::{
+    collect_generated, print_generated_collect, GeneratedArtifactMeasurement,
+    GeneratedArtifactObservation, GeneratedArtifactSummary, GeneratedCollectAction,
+    GeneratedCollectManifest, GeneratedCollectOptions, GeneratedCollectPlan,
+    GeneratedCollectPolicy, GeneratedCollectRun, GeneratedRebuildCost, GeneratedRebuildCostSummary,
+};
 pub use inventory::{
     inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
     InventoryReport, InventoryReportOptions, InventoryRoot, InventoryScanError, INVENTORY_VERSION,
@@ -222,11 +229,22 @@ pub struct GeneratedDirInfo {
     pub mtime: Option<String>,
     pub effective_days: u64,
     pub in_use: bool,
+    pub open_handle_evidence: OpenHandleEvidence,
     pub protection: Option<ProtectionMatch>,
     pub cleanup_class: CleanupClass,
     pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenHandleEvidence {
+    Complete,
+    Unavailable,
+    Indeterminate,
+    NotChecked,
+    NotCaptured,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -560,6 +578,21 @@ enum OpenHandleSnapshot {
     Available(HashSet<PathBuf>),
     Unavailable,
     Indeterminate,
+}
+
+fn open_handle_evidence(
+    check_in_use: bool,
+    snapshot: Option<&OpenHandleSnapshot>,
+) -> OpenHandleEvidence {
+    if !check_in_use {
+        return OpenHandleEvidence::NotChecked;
+    }
+    match snapshot {
+        Some(OpenHandleSnapshot::Available(_)) => OpenHandleEvidence::Complete,
+        Some(OpenHandleSnapshot::Unavailable) => OpenHandleEvidence::Unavailable,
+        Some(OpenHandleSnapshot::Indeterminate) => OpenHandleEvidence::Indeterminate,
+        None => OpenHandleEvidence::NotCaptured,
+    }
 }
 
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
@@ -903,6 +936,26 @@ fn measure_cleanup_runs_matching(
 pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTriageReport> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
+    triage_repositories(&roots, &repositories, options)
+}
+
+pub fn triage_roots_with_parallelism(
+    roots: &[PathBuf],
+    options: TriageOptions,
+    max_parallelism: usize,
+) -> Result<RootTriageReport> {
+    let roots = canonicalize_roots(roots)?;
+    let repositories = discover_repositories_bounded(&roots, max_parallelism)?;
+    with_parallelism(max_parallelism, || {
+        triage_repositories(&roots, &repositories, options)
+    })
+}
+
+fn triage_repositories(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    options: TriageOptions,
+) -> Result<RootTriageReport> {
     let protections = active_protections(options.now)?;
     let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
     let repositories = repositories
@@ -918,7 +971,7 @@ pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTri
         .collect::<Result<Vec<_>>>()?;
 
     Ok(RootTriageReport {
-        roots,
+        roots: roots.to_vec(),
         repositories,
     })
 }
@@ -2136,6 +2189,8 @@ fn scan_generated_dirs_for_worktree(
     } else {
         HashSet::new()
     };
+    let open_handle_evidence =
+        open_handle_evidence(policy.check_in_use, policy.open_handle_snapshot);
 
     for candidate in candidates {
         let protection = protection_for_path(&candidate.path, protections);
@@ -2175,13 +2230,7 @@ fn scan_generated_dirs_for_worktree(
             .is_some_and(|days| days < routine_days);
         let routine_active = routine_worktree_recent || routine_dir_recent;
 
-        // Only pay for the open-handle probe when the directory would
-        // otherwise be deleted.
-        let deletable_so_far = candidate.action == GeneratedCandidateAction::Delete
-            && !worktree_recent
-            && !dir_recent
-            && !has_tracked_files;
-        let in_use = deletable_so_far && open_generated_dirs.contains(&candidate.path);
+        let in_use = open_generated_dirs.contains(&candidate.path);
         let sweep_strategies = config.sweep_strategies(&candidate.name);
         let active = worktree_recent || dir_recent;
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
@@ -2325,6 +2374,7 @@ fn scan_generated_dirs_for_worktree(
             mtime: mtime_unix.map(format_unix_time),
             effective_days,
             in_use,
+            open_handle_evidence,
             protection,
             cleanup_class,
             sweeps,
@@ -2450,14 +2500,11 @@ fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
             return OpenHandleSnapshot::Indeterminate;
         }
     };
-    if let Some(error) = lsof_probe_error(
-        output.status.success(),
-        output.status.code(),
-        &output.stderr,
-        &[],
-    ) {
+    if !output.status.success() {
         eprintln!(
-            "warning: global lsof snapshot failed ({error}); keeping all generated paths protected"
+            "warning: global lsof snapshot exited with {:?}: {}; keeping all generated paths protected",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
         );
         return OpenHandleSnapshot::Indeterminate;
     }
