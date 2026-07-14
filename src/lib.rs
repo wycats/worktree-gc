@@ -2573,93 +2573,23 @@ fn generated_candidates(
         return Ok(Vec::new());
     }
 
-    let mut paths = Vec::new();
-    paths.extend(git_generated_path_listing(
-        &worktree.path,
-        &["ls-files", "-z", "--cached"],
-        config,
-    )?);
-    paths.extend(git_generated_path_listing(
-        &worktree.path,
-        &[
-            "ls-files",
-            "-z",
-            "--others",
-            "--exclude-standard",
-            "--directory",
-            "--no-empty-directory",
-        ],
-        config,
-    )?);
-    paths.extend(git_generated_path_listing(
-        &worktree.path,
-        &[
-            "ls-files",
-            "-z",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-            "--no-empty-directory",
-        ],
-        config,
-    )?);
-
+    // Candidate names are a filesystem concern. Walking directory entries here
+    // avoids asking Git to enumerate its full tracked, untracked, and ignored
+    // views separately for every linked worktree. The later classification
+    // still asks Git whether each exact root is ignored or contains tracked
+    // files before any delete decision is possible.
     let mut candidates = BTreeMap::new();
-    for listed in paths {
-        let listed = Path::new(&listed);
-        let mut relative = PathBuf::new();
-        let mut matched = false;
-        for component in listed.components() {
-            relative.push(component.as_os_str());
-            let name = component.as_os_str().to_string_lossy();
-            let Some(action) = config.candidate_action(&name) else {
-                continue;
-            };
-            let path = worktree.path.join(&relative);
-            let is_real_dir = fs::symlink_metadata(&path)
-                .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-                .unwrap_or(false);
-            if is_real_dir && !is_repository_boundary(&path)? {
-                candidates
-                    .entry(relative.clone())
-                    .or_insert_with(|| GeneratedCandidate {
-                        path,
-                        relative: relative.clone(),
-                        name: name.into_owned(),
-                        action,
-                    });
-            }
-            matched = true;
-            break;
-        }
-        if !matched {
-            discover_generated_descendants(&worktree.path, listed, config, &mut candidates)?;
-        }
-    }
-
-    Ok(candidates.into_values().collect())
-}
-
-fn discover_generated_descendants(
-    worktree: &Path,
-    listed: &Path,
-    config: &GeneratedDirConfig,
-    candidates: &mut BTreeMap<PathBuf, GeneratedCandidate>,
-) -> Result<()> {
-    let root = worktree.join(listed);
-    let metadata = match fs::symlink_metadata(&root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Ok(());
-    }
-
-    let mut stack = vec![(root, listed.to_path_buf())];
+    let mut stack = vec![(worktree.path.clone(), PathBuf::new())];
     while let Some((directory, relative)) = stack.pop() {
-        if is_repository_boundary(&directory)? {
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        if !relative.as_os_str().is_empty() && is_repository_boundary(&directory)? {
             continue;
         }
 
@@ -2669,7 +2599,7 @@ fn discover_generated_descendants(
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "failed to inspect ignored directory {}",
+                        "failed to inspect worktree directory {}",
                         directory.display()
                     )
                 });
@@ -2677,12 +2607,12 @@ fn discover_generated_descendants(
         };
         for entry in entries {
             let entry = entry?;
-            let metadata = match fs::symlink_metadata(entry.path()) {
-                Ok(metadata) => metadata,
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            if file_type.is_symlink() || !file_type.is_dir() {
                 continue;
             }
             if is_repository_boundary(&entry.path())? {
@@ -2707,7 +2637,7 @@ fn discover_generated_descendants(
             }
         }
     }
-    Ok(())
+    Ok(candidates.into_values().collect())
 }
 
 fn is_repository_boundary(directory: &Path) -> Result<bool> {
@@ -2721,51 +2651,6 @@ fn is_repository_boundary(directory: &Path) -> Result<bool> {
             )
         }),
     }
-}
-
-fn git_generated_path_listing(
-    worktree: &Path,
-    args: &[&str],
-    config: &GeneratedDirConfig,
-) -> Result<Vec<String>> {
-    let mut command = Command::new("git");
-    command.args(args).arg("--");
-    for name in config
-        .delete_names
-        .iter()
-        .chain(&config.report_only_names)
-        .chain(
-            config
-                .sweep_strategies
-                .iter()
-                .map(|strategy| &strategy.name),
-        )
-    {
-        command.arg(format!(":(glob)**/{}/**", git_glob_escape(name)));
-    }
-    let output = command
-        .current_dir(worktree)
-        .output()
-        .with_context(|| format!("failed to list Git paths in {}", worktree.display()))?;
-    if !output.status.success() {
-        bail!(
-            "git path listing failed in {}: {}",
-            worktree.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(split_nul_strings(&output.stdout))
-}
-
-fn git_glob_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        if matches!(character, '\\' | '*' | '?' | '[' | ']') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
 }
 
 fn plan_worktree_cleanup(
@@ -4531,6 +4416,116 @@ mod tests {
             .find(|decision| decision.path == expected)
             .context("missing node_modules below ignored build ancestor")?;
         assert_eq!(decision.action, GeneratedDirAction::Delete);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_discovery_preserves_tracked_file_protection() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("target/debug"))?;
+        fs::write(repo.join("target/debug/fixture"), "tracked\n")?;
+        git_output(&repo, ["add", "-f", "target/debug/fixture"])?;
+        commit_with_date(&repo, "track generated fixture", "2025-01-02T00:00:00Z")?;
+        set_mtime(
+            &repo.join("target/debug/fixture"),
+            unix_days_before_now(400),
+        )?;
+        set_mtime(&repo.join("target/debug"), unix_days_before_now(400))?;
+        set_mtime(&repo.join("target"), unix_days_before_now(400))?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        let target = fs::canonicalize(repo.join("target"))?;
+        let decision = report
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == target)
+            .context("missing tracked target decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Skip);
+        assert_eq!(decision.reason, "directory contains tracked files");
+        Ok(())
+    }
+
+    #[test]
+    fn generated_discovery_honors_unignored_generated_descendants() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::write(
+            repo.join(".gitignore"),
+            "build/*\n!build/node_modules/\n!build/node_modules/**\n",
+        )?;
+        fs::create_dir_all(repo.join("build/node_modules/pkg"))?;
+        fs::write(repo.join("build/node_modules/pkg/index.js"), "fixture\n")?;
+        set_mtime(
+            &repo.join("build/node_modules/pkg/index.js"),
+            unix_days_before_now(400),
+        )?;
+        set_mtime(
+            &repo.join("build/node_modules/pkg"),
+            unix_days_before_now(400),
+        )?;
+        set_mtime(&repo.join("build/node_modules"), unix_days_before_now(400))?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        let node_modules = fs::canonicalize(repo.join("build/node_modules"))?;
+        let decision = report
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == node_modules)
+            .context("missing unignored node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert_eq!(decision.reason, "untracked generated directory");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_discovery_does_not_follow_directory_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, repo) = init_repo()?;
+        let external = repo.with_file_name("external-generated-tree");
+        fs::create_dir_all(external.join("node_modules/pkg"))?;
+        fs::write(external.join("node_modules/pkg/index.js"), "external\n")?;
+        symlink(&external, repo.join("linked"))?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 0,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        assert!(report
+            .generated_dirs
+            .iter()
+            .all(|decision| !decision.path.starts_with(&external)));
+        assert!(external.join("node_modules/pkg/index.js").is_file());
         Ok(())
     }
 

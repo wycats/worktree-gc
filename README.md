@@ -339,8 +339,11 @@ Repository discovery uses `.git` markers while pruning generated trees, then
 caches the owning-repository index for `repository_refresh_days`. Use
 `worktree-gc scheduled --refresh-repositories --dry-run` after adding or moving
 repositories when you want the index refreshed immediately. Generated
-directory discovery uses Git's index and collapsed ignored/untracked directory
-views; it does not recursively stat every file in a worktree.
+directory discovery walks worktree directory entries directly, stops at
+configured generated roots and nested repositories, then asks Git only whether
+the exact roots are ignored or contain tracked files. This avoids repeatedly
+enumerating large Git indexes while preserving Git as the deletion-safety
+authority.
 
 ## Releases
 
