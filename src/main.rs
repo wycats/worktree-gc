@@ -49,7 +49,7 @@ enum Command {
 
         #[arg(
             long,
-            help = "Skip generated dirs that a running process has open files in (uses lsof)"
+            help = "Skip generated dirs owned by running processes (native macOS snapshot with lsof fallback)"
         )]
         check_in_use: bool,
 
@@ -74,7 +74,7 @@ enum Command {
 
         #[arg(
             long,
-            help = "Skip generated dirs that a running process has open files in (uses lsof)"
+            help = "Skip generated dirs owned by running processes (native macOS snapshot with lsof fallback)"
         )]
         check_in_use: bool,
 

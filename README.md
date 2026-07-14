@@ -84,9 +84,17 @@ cargo run -- cleanup --repo /path/to/repo --generated-window .next=1 --generated
 ```
 
 To also skip directories that a running process holds open (a live dev server
-or package manager), add `--check-in-use`. The probe uses `lsof` on the
-directory and its immediate children; on platforms without `lsof` it silently
-degrades to mtime-only judgment:
+or package manager), add `--check-in-use`. On macOS, planning uses a bounded
+native `libproc` PID snapshot of cwd/root vnode paths, file-backed memory
+mappings, and vnode descriptors, then matches every path recursively against
+all generated candidates in memory. Other Unix platforms, or a native
+capability/API failure, use one machine-readable global `lsof` snapshot with
+NUL-delimited byte paths, so non-UTF-8 names are not silently dropped. Native
+time or resource-budget exhaustion instead fails closed without starting that
+second global scan. Every execution pass takes fresh evidence and rechecks each
+candidate before mutation. If neither backend is available or the snapshot is
+indeterminate, an explicitly requested ownership check retains all candidates
+rather than granting mtime-only deletion authority:
 
 ```sh
 cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-use --execute
