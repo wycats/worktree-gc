@@ -998,8 +998,18 @@ pub fn cleanup_repositories(
             .as_ref()
             .is_some_and(|pressure| pressure.active)
         {
+            let mut satisfied_filesystems = HashSet::new();
             for rank in 0..=4 {
                 for (index, path) in pressure_generated_candidate_order(&manifest, rank) {
+                    if !path.exists()
+                        || !root_pressure_should_continue(
+                            &manifest,
+                            &path,
+                            &mut satisfied_filesystems,
+                        )?
+                    {
+                        continue;
+                    }
                     refresh_and_execute_repository(
                         &mut manifest,
                         index,
@@ -1010,6 +1020,13 @@ pub fn cleanup_repositories(
                 }
             }
             for index in pressure_worktree_repository_order(&manifest) {
+                if !root_pressure_worktrees_should_continue(
+                    &manifest,
+                    &manifest.repositories[index],
+                    &mut satisfied_filesystems,
+                )? {
+                    continue;
+                }
                 refresh_and_execute_repository(
                     &mut manifest,
                     index,
@@ -1245,6 +1262,42 @@ fn pressure_worktree_repository_order(manifest: &RootCleanupManifest) -> Vec<usi
         )
     });
     order
+}
+
+fn root_pressure_should_continue(
+    manifest: &RootCleanupManifest,
+    path: &Path,
+    satisfied_filesystems: &mut HashSet<String>,
+) -> Result<bool> {
+    let policy = &manifest
+        .pressure
+        .as_ref()
+        .context("pressure candidate has no pressure policy")?
+        .policy;
+    pressure_policy_should_continue(policy, path, satisfied_filesystems)
+}
+
+fn root_pressure_worktrees_should_continue(
+    manifest: &RootCleanupManifest,
+    repository: &CleanupRun,
+    satisfied_filesystems: &mut HashSet<String>,
+) -> Result<bool> {
+    for path in repository
+        .manifest
+        .worktrees
+        .iter()
+        .filter(|decision| {
+            decision.path.exists()
+                && decision.action == WorktreeAction::Remove
+                && decision.cleanup_class == CleanupClass::Pressure
+        })
+        .map(|decision| decision.path.as_path())
+    {
+        if root_pressure_should_continue(manifest, path, satisfied_filesystems)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3167,6 +3220,14 @@ fn pressure_should_continue(
         .pressure
         .as_ref()
         .context("pressure candidate has no pressure policy")?;
+    pressure_policy_should_continue(policy, path, satisfied_filesystems)
+}
+
+fn pressure_policy_should_continue(
+    policy: &PressurePolicy,
+    path: &Path,
+    satisfied_filesystems: &mut HashSet<String>,
+) -> Result<bool> {
     let filesystem = filesystem_key(path)?;
     if !pressure_filesystem_entered(policy, &filesystem) {
         return Ok(false);
@@ -5480,6 +5541,50 @@ mod tests {
         activate_pressure_policy(&mut policy, &observations)?;
         assert_eq!(policy.entered_filesystems, vec!["pressured"]);
         assert!(policy.active);
+        Ok(())
+    }
+
+    #[test]
+    fn root_pressure_scheduler_shares_satisfied_filesystems_across_candidates() -> Result<()> {
+        let temp = TempDir::new()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        let filesystem = filesystem_key(&first)?;
+        let manifest = RootCleanupManifest {
+            manifest_version: MANIFEST_VERSION,
+            mode: CleanupMode::Execute,
+            generated_at: "fixture".to_string(),
+            roots: vec![temp.path().to_path_buf()],
+            pressure: Some(PressureRunDecision {
+                policy: PressurePolicy {
+                    enter_bytes: u64::MAX,
+                    target_bytes: 0,
+                    generated_days: 1,
+                    stale_days: 7,
+                    active: true,
+                    entered_filesystems: vec![filesystem.clone()],
+                },
+                observations: Vec::new(),
+                final_observations: None,
+            }),
+            repositories: Vec::new(),
+        };
+        let mut satisfied_filesystems = HashSet::new();
+
+        assert!(!root_pressure_should_continue(
+            &manifest,
+            &first,
+            &mut satisfied_filesystems,
+        )?);
+        assert!(satisfied_filesystems.contains(&filesystem));
+        assert!(!root_pressure_should_continue(
+            &manifest,
+            &second,
+            &mut satisfied_filesystems,
+        )?);
+
         Ok(())
     }
 
