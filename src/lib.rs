@@ -1,5 +1,8 @@
 mod cargo_incremental;
 mod cargo_profiles;
+mod inventory;
+#[cfg(target_os = "macos")]
+mod macos_open_handles;
 mod protection;
 
 use anyhow::{bail, Context, Result};
@@ -24,6 +27,10 @@ use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
+pub use inventory::{
+    inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
+    InventoryReport, InventoryReportOptions, InventoryRoot, InventoryScanError, INVENTORY_VERSION,
+};
 pub use protection::{
     active_protections, add_protection, list_protections, protection_for_path,
     protection_registry_path, remove_protection, renew_protection, with_protection_guard,
@@ -521,19 +528,29 @@ struct GeneratedScanPolicy<'a> {
     generated_days: u64,
     generated_activity_only: bool,
     check_in_use: bool,
+    open_handle_snapshot: Option<&'a OpenHandleSnapshot>,
     now: SystemTime,
     pressure: Option<&'a PressurePolicy>,
 }
 
+#[derive(Debug)]
+pub(crate) enum OpenHandleSnapshot {
+    Available(HashSet<PathBuf>),
+    Unavailable,
+    Indeterminate,
+}
+
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
     let protections = active_protections(options.now)?;
-    triage_with_protections(repo, options, &protections)
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
+    triage_with_protections(repo, options, &protections, open_handles.as_ref())
 }
 
 fn triage_with_protections(
     repo: Option<&Path>,
     options: TriageOptions,
     protections: &[ProtectionLease],
+    open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<TriageReport> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
@@ -552,6 +569,7 @@ fn triage_with_protections(
             generated_days: options.generated_days,
             generated_activity_only: options.generated_activity_only,
             check_in_use: options.check_in_use,
+            open_handle_snapshot: open_handles,
             now: options.now,
             pressure: None,
         },
@@ -591,7 +609,8 @@ pub fn audit(repo: Option<&Path>, generated_days: u64, now: SystemTime) -> Resul
 pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRun> {
     let execute = options.execute;
     let protections = active_protections(options.now)?;
-    let run = plan_cleanup_with_protections(repo, options, &protections)?;
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
+    let run = plan_cleanup_with_protections(repo, options, &protections, open_handles.as_ref())?;
     if execute {
         execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
         if run
@@ -613,6 +632,7 @@ fn plan_cleanup_with_protections(
     repo: Option<&Path>,
     options: CleanupOptions,
     protections: &[ProtectionLease],
+    open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<CleanupRun> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees(&context, options.now)?;
@@ -624,6 +644,7 @@ fn plan_cleanup_with_protections(
             generated_days: options.generated_days,
             generated_activity_only: options.generated_activity_only,
             check_in_use: options.check_in_use,
+            open_handle_snapshot: open_handles,
             now: options.now,
             pressure: options.pressure.as_ref(),
         },
@@ -693,9 +714,17 @@ pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTri
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
     let protections = active_protections(options.now)?;
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
     let repositories = repositories
         .par_iter()
-        .map(|repo| triage_with_protections(Some(repo), options.clone(), &protections))
+        .map(|repo| {
+            triage_with_protections(
+                Some(repo),
+                options.clone(),
+                &protections,
+                open_handles.as_ref(),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(RootTriageReport {
@@ -740,9 +769,17 @@ pub fn cleanup_repositories(
         CleanupMode::DryRun
     };
     let protections = active_protections(options.now)?;
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
     let repositories = repositories
         .par_iter()
-        .map(|repo| plan_cleanup_with_protections(Some(repo), options.clone(), &protections))
+        .map(|repo| {
+            plan_cleanup_with_protections(
+                Some(repo),
+                options.clone(),
+                &protections,
+                open_handles.as_ref(),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut manifest = RootCleanupManifest {
         manifest_version: MANIFEST_VERSION,
@@ -760,10 +797,14 @@ pub fn cleanup_repositories(
             let mut refreshed_options = options.clone();
             refreshed_options.now = SystemTime::now();
             let refreshed_protections = active_protections(refreshed_options.now)?;
+            let refreshed_open_handles = refreshed_options
+                .check_in_use
+                .then(capture_open_handle_snapshot);
             let refreshed = plan_cleanup_with_protections(
                 Some(&repo_root),
                 refreshed_options,
                 &refreshed_protections,
+                refreshed_open_handles.as_ref(),
             )?;
             manifest.repositories[index] = refreshed;
             write_root_manifest(&manifest)?;
@@ -910,8 +951,15 @@ fn refresh_and_execute_repository(
     let mut refreshed_options = options.clone();
     refreshed_options.now = SystemTime::now();
     let refreshed_protections = active_protections(refreshed_options.now)?;
-    let refreshed =
-        plan_cleanup_with_protections(Some(&repo_root), refreshed_options, &refreshed_protections)?;
+    let refreshed_open_handles = refreshed_options
+        .check_in_use
+        .then(capture_open_handle_snapshot);
+    let refreshed = plan_cleanup_with_protections(
+        Some(&repo_root),
+        refreshed_options,
+        &refreshed_protections,
+        refreshed_open_handles.as_ref(),
+    )?;
     manifest.repositories[index] = refreshed;
     write_root_manifest(manifest)?;
     execute_cleanup_manifest(&manifest.repositories[index].manifest, pass)
@@ -1689,7 +1737,10 @@ fn scan_generated_dirs_for_worktree(
     let ignored_paths = git_ignored_paths(&worktree.path, &candidates)?;
     let tracked_paths = git_tracked_paths(&worktree.path, &candidates)?;
     let open_generated_dirs = if policy.check_in_use {
-        dirs_with_open_handles(candidates.iter().map(|candidate| candidate.path.as_path()))
+        dirs_with_open_handles(
+            candidates.iter().map(|candidate| candidate.path.as_path()),
+            policy.open_handle_snapshot,
+        )
     } else {
         HashSet::new()
     };
@@ -1981,27 +2032,162 @@ fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
     newest
 }
 
-// Best-effort open-handle probe. `lsof +D` walks the whole tree, which is
-// too slow for multi-gigabyte caches, so this probes the directory and its
-// immediate children (`+d`). That catches the common live-dev-server shapes
-// (a held lockfile, trace file, or cache subdirectory handle) without the
-// full walk. Candidate sets are chunked below the OS argument limit. A failed
-// batch retries one directory at a time and keeps any individually unprobeable
-// directory protected; an unavailable lsof still degrades to mtime-only
-// judgment on supported platforms.
-#[cfg(unix)]
-fn dirs_with_open_handles<'a>(paths: impl Iterator<Item = &'a Path>) -> HashSet<PathBuf> {
-    const LSOF_PATH_CHUNK_SIZE: usize = 64;
+// Best-effort open-handle probe. On macOS, planning captures process cwd/root
+// vnode paths, file-backed memory mappings, and vnode descriptors through one
+// bounded native `libproc` snapshot. Other Unix platforms, or a native
+// capability/API failure, use one global `lsof` snapshot. Native resource
+// budget exhaustion fails closed without cascading into a second global scan.
+// Every generated candidate is matched against the captured
+// paths in memory, avoiding repeated directory walks while observing ownership
+// at any depth beneath a candidate. Every execution pass takes fresh evidence
+// and rechecks each candidate before mutation. The remaining path-scoped
+// fallback is chunked below the OS argument limit. A failed batch retries one
+// directory at a time and keeps any individually unprobeable directory
+// protected. If the ownership backend is unavailable, an explicitly requested
+// check keeps every candidate rather than degrading to mtime-only deletion
+// authority.
+#[cfg(target_os = "macos")]
+pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
+    match macos_open_handles::capture() {
+        Ok(paths) => OpenHandleSnapshot::Available(paths),
+        Err(error) if macos_open_handles::is_resource_limit(&error) => {
+            eprintln!(
+                "warning: native macOS open-handle snapshot exceeded its resource budget ({error}); keeping all generated paths protected"
+            );
+            OpenHandleSnapshot::Indeterminate
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: native macOS open-handle snapshot failed ({error}); falling back to one global lsof snapshot"
+            );
+            capture_lsof_open_handle_snapshot()
+        }
+    }
+}
 
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
+    capture_lsof_open_handle_snapshot()
+}
+
+#[cfg(unix)]
+fn capture_lsof_open_handle_snapshot() -> OpenHandleSnapshot {
+    let output = match Command::new("lsof")
+        .args(["-nP", "-F0n"])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return OpenHandleSnapshot::Unavailable;
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: failed to capture global lsof snapshot ({error}); keeping all generated paths protected"
+            );
+            return OpenHandleSnapshot::Indeterminate;
+        }
+    };
+    if let Some(error) = lsof_probe_error(
+        output.status.success(),
+        output.status.code(),
+        &output.stderr,
+        None,
+    ) {
+        eprintln!(
+            "warning: global lsof snapshot failed ({error}); keeping all generated paths protected"
+        );
+        return OpenHandleSnapshot::Indeterminate;
+    }
+
+    OpenHandleSnapshot::Available(parse_lsof_snapshot_paths(&output.stdout))
+}
+
+#[cfg(unix)]
+fn parse_lsof_snapshot_paths(output: &[u8]) -> HashSet<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    output
+        .split(|byte| *byte == b'\0')
+        .map(|field| field.strip_prefix(b"\n").unwrap_or(field))
+        .filter_map(|field| field.strip_prefix(b"n"))
+        .map(|line| PathBuf::from(std::ffi::OsString::from_vec(line.to_vec())))
+        .filter(|path| path.is_absolute())
+        .collect()
+}
+
+#[cfg(unix)]
+/// Capture one bounded ownership snapshot and match it against every candidate
+/// root. The boolean is false whenever ownership evidence is unavailable or
+/// incomplete; callers must then retain every candidate rather than infer
+/// safety from an empty path set.
+pub fn open_handle_evidence_for_paths(paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+    if paths.is_empty() {
+        return (HashSet::new(), true);
+    }
+    let snapshot = capture_open_handle_snapshot();
+    let complete = matches!(snapshot, OpenHandleSnapshot::Available(_));
+    let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path), Some(&snapshot));
+    (open, complete)
+}
+
+#[cfg(not(unix))]
+/// Return fail-closed ownership evidence on platforms without a supported
+/// open-handle snapshot backend.
+pub fn open_handle_evidence_for_paths(paths: &[PathBuf]) -> (HashSet<PathBuf>, bool) {
+    if paths.is_empty() {
+        return (HashSet::new(), true);
+    }
+    (paths.iter().cloned().collect(), false)
+}
+
+#[cfg(unix)]
+fn dirs_with_open_handles<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    snapshot: Option<&OpenHandleSnapshot>,
+) -> HashSet<PathBuf> {
     let paths = paths.map(Path::to_path_buf).collect::<Vec<_>>();
     if paths.is_empty() {
         return HashSet::new();
     }
+    if let Some(snapshot) = snapshot {
+        return match snapshot {
+            OpenHandleSnapshot::Available(open_paths) => {
+                match_open_handle_paths(&paths, open_paths)
+            }
+            OpenHandleSnapshot::Unavailable => paths.into_iter().collect(),
+            OpenHandleSnapshot::Indeterminate => paths.into_iter().collect(),
+        };
+    }
+
+    dirs_with_open_handles_fresh(&paths)
+}
+
+#[cfg(unix)]
+fn match_open_handle_paths(
+    candidates: &[PathBuf],
+    open_paths: &HashSet<PathBuf>,
+) -> HashSet<PathBuf> {
+    let candidates = candidates.iter().cloned().collect::<HashSet<_>>();
+    open_paths
+        .iter()
+        .flat_map(|open_path| open_path.ancestors())
+        .filter(|ancestor| candidates.contains(*ancestor))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+#[cfg(unix)]
+fn dirs_with_open_handles_fresh(paths: &[PathBuf]) -> HashSet<PathBuf> {
+    const LSOF_PATH_CHUNK_SIZE: usize = 64;
+
     let mut open = HashSet::new();
     for chunk in paths.chunks(LSOF_PATH_CHUNK_SIZE) {
         match probe_open_handles(chunk) {
             Ok(found) => open.extend(found),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return HashSet::new(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return paths.iter().cloned().collect();
+            }
             Err(error) => {
                 eprintln!(
                     "warning: batched lsof probe failed ({error}); retrying {} paths individually",
@@ -2013,7 +2199,7 @@ fn dirs_with_open_handles<'a>(paths: impl Iterator<Item = &'a Path>) -> HashSet<
                         Err(individual_error)
                             if individual_error.kind() == io::ErrorKind::NotFound =>
                         {
-                            return HashSet::new();
+                            return paths.iter().cloned().collect();
                         }
                         Err(individual_error) => {
                             eprintln!(
@@ -2043,7 +2229,7 @@ fn probe_open_handles(paths: &[PathBuf]) -> io::Result<HashSet<PathBuf>> {
         output.status.success(),
         output.status.code(),
         &output.stderr,
-        paths,
+        Some(paths),
     ) {
         return Err(error);
     }
@@ -2068,18 +2254,24 @@ fn lsof_probe_error(
     success: bool,
     status_code: Option<i32>,
     stderr: &[u8],
-    paths: &[PathBuf],
+    scoped_paths: Option<&[PathBuf]>,
 ) -> Option<io::Error> {
+    let stderr = String::from_utf8_lossy(stderr);
+    if scoped_paths.is_none() && !stderr.trim().is_empty() {
+        return Some(io::Error::other(format!(
+            "global lsof snapshot reported incomplete output: {}",
+            stderr.trim()
+        )));
+    }
     if success {
         return None;
     }
 
-    let stderr = String::from_utf8_lossy(stderr);
-    let failed_path = paths.iter().any(|path| {
+    let failed_path = scoped_paths.into_iter().flatten().any(|path| {
         let path = path.to_string_lossy();
         !path.is_empty() && stderr.contains(path.as_ref())
     });
-    if status_code == Some(1) && !failed_path {
+    if scoped_paths.is_some() && status_code == Some(1) && !failed_path {
         return None;
     }
 
@@ -2090,8 +2282,16 @@ fn lsof_probe_error(
 }
 
 #[cfg(not(unix))]
-fn dirs_with_open_handles<'a>(_paths: impl Iterator<Item = &'a Path>) -> HashSet<PathBuf> {
-    HashSet::new()
+pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
+    OpenHandleSnapshot::Unavailable
+}
+
+#[cfg(not(unix))]
+fn dirs_with_open_handles<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    _snapshot: Option<&OpenHandleSnapshot>,
+) -> HashSet<PathBuf> {
+    paths.map(Path::to_path_buf).collect()
 }
 
 fn generated_candidates(
@@ -2459,6 +2659,17 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
         manifest.generated_at.replace([':', '.'], "-"),
         std::process::id()
     );
+    let execution_open_handles = manifest.check_in_use.then(capture_open_handle_snapshot);
+    let execution_open_generated_dirs = if manifest.check_in_use {
+        dirs_with_open_handles(
+            generated_deletions
+                .iter()
+                .map(|decision| decision.path.as_path()),
+            execution_open_handles.as_ref(),
+        )
+    } else {
+        HashSet::new()
+    };
 
     eprintln!(
         "executing {pass:?} cleanup: {} worktrees, {} generated dirs, {} sweeps",
@@ -2498,6 +2709,13 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
         }
 
         if decision.action != GeneratedDirAction::Delete {
+            continue;
+        }
+        if execution_open_generated_dirs.contains(&decision.path) {
+            eprintln!(
+                "  keeping {} because a running process has open files inside it",
+                decision.path.display()
+            );
             continue;
         }
         let result = match with_protection_guard(&decision.path, SystemTime::now(), || {
@@ -4244,6 +4462,90 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn global_lsof_snapshot_preserves_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut output = b"p1\0n/tmp/cache-".to_vec();
+        output.push(0xff);
+        output.extend_from_slice(b"/held\0");
+        let expected = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/cache-\xff/held".to_vec(),
+        ));
+
+        assert_eq!(
+            parse_lsof_snapshot_paths(&output),
+            HashSet::from([expected])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_lsof_snapshot_preserves_newlines_inside_paths() {
+        let output = b"p1\0n/tmp/cache\nwith-newline/held\0\np2\0n/tmp/other\0";
+
+        assert_eq!(
+            parse_lsof_snapshot_paths(output),
+            HashSet::from([
+                PathBuf::from("/tmp/cache\nwith-newline/held"),
+                PathBuf::from("/tmp/other")
+            ])
+        );
+    }
+
+    #[test]
+    fn empty_open_handle_candidate_set_is_complete_without_a_snapshot() {
+        let (open, complete) = open_handle_evidence_for_paths(&[]);
+
+        assert!(open.is_empty());
+        assert!(complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_handle_snapshot_matches_descendants_without_string_prefix_aliases() {
+        let candidate = PathBuf::from("/tmp/worktree-gc-cache");
+        let sibling = PathBuf::from("/tmp/worktree-gc-cache-other");
+        let snapshot = OpenHandleSnapshot::Available(HashSet::from([
+            candidate.join("deep/held.lock"),
+            PathBuf::from("/tmp/worktree-gc-cache-otherish/file"),
+        ]));
+        let candidates = [candidate.clone(), sibling.clone()];
+
+        let open = dirs_with_open_handles(candidates.iter().map(PathBuf::as_path), Some(&snapshot));
+
+        assert_eq!(open, HashSet::from([candidate]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indeterminate_open_handle_snapshot_protects_every_candidate() {
+        let candidates = [
+            PathBuf::from("/tmp/worktree-gc-first"),
+            PathBuf::from("/tmp/worktree-gc-second"),
+        ];
+        let snapshot = OpenHandleSnapshot::Indeterminate;
+
+        let open = dirs_with_open_handles(candidates.iter().map(PathBuf::as_path), Some(&snapshot));
+
+        assert_eq!(open, candidates.into_iter().collect());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_open_handle_snapshot_protects_every_candidate() {
+        let candidates = [
+            PathBuf::from("/tmp/worktree-gc-first"),
+            PathBuf::from("/tmp/worktree-gc-second"),
+        ];
+        let snapshot = OpenHandleSnapshot::Unavailable;
+
+        let open = dirs_with_open_handles(candidates.iter().map(PathBuf::as_path), Some(&snapshot));
+
+        assert_eq!(open, candidates.into_iter().collect());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn open_handles_prevent_deletion() -> Result<()> {
         if Command::new("lsof")
             .arg("-v")
@@ -4303,6 +4605,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn execution_rechecks_open_handles_after_planning() -> Result<()> {
+        if Command::new("lsof")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: lsof unavailable");
+            return Ok(());
+        }
+
+        let (_temp, repo) = init_repo()?;
+        let generated = repo.join("node_modules");
+        let idle = repo.join(".next");
+        fs::create_dir(&generated)?;
+        fs::create_dir(&idle)?;
+        fs::write(generated.join("held.lock"), "held")?;
+        fs::write(idle.join("cache"), "idle")?;
+        let expected = fs::canonicalize(&generated)?;
+        let idle = fs::canonicalize(&idle)?;
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 10_000,
+                generated_days: 0,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+            &[],
+            None,
+        )?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == expected)
+            .context("missing generated delete decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+
+        let _held = fs::File::open(generated.join("held.lock"))?;
+        run.manifest.check_in_use = true;
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
+
+        assert!(generated.exists());
+        assert!(!idle.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn open_handle_probe_chunks_large_candidate_sets() -> Result<()> {
         if Command::new("lsof")
             .arg("-v")
@@ -4326,7 +4685,7 @@ mod tests {
         fs::write(held_path.join("held.lock"), "held")?;
         let _held = fs::File::open(held_path.join("held.lock"))?;
 
-        let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path));
+        let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path), None);
         assert!(open.contains(held_path));
         Ok(())
     }
@@ -4360,16 +4719,41 @@ mod tests {
             false,
             Some(1),
             b"lsof: WARNING: can't stat() fuse mount /unrelated\n",
-            std::slice::from_ref(&candidate),
+            Some(std::slice::from_ref(&candidate)),
         )
         .is_none());
         assert!(lsof_probe_error(
             false,
             Some(1),
             b"lsof: WARNING: can't stat /tmp/worktree-gc-candidate\n",
-            std::slice::from_ref(&candidate),
+            Some(std::slice::from_ref(&candidate)),
         )
         .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_lsof_status_one_is_incomplete_even_without_a_path_specific_error() {
+        assert!(lsof_probe_error(
+            false,
+            Some(1),
+            b"lsof: WARNING: can't stat() fuse mount /unrelated\n",
+            None,
+        )
+        .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_lsof_success_with_a_warning_is_still_incomplete() {
+        assert!(lsof_probe_error(
+            true,
+            Some(0),
+            b"lsof: WARNING: output information may be incomplete\n",
+            None,
+        )
+        .is_some());
+        assert!(lsof_probe_error(true, Some(0), b"", None).is_none());
     }
 
     #[test]
@@ -4787,6 +5171,7 @@ mod tests {
                 generated_days: 0,
                 generated_activity_only: true,
                 check_in_use: false,
+                open_handle_snapshot: None,
                 now: now(),
                 pressure: None,
             },

@@ -84,9 +84,17 @@ cargo run -- cleanup --repo /path/to/repo --generated-window .next=1 --generated
 ```
 
 To also skip directories that a running process holds open (a live dev server
-or package manager), add `--check-in-use`. The probe uses `lsof` on the
-directory and its immediate children; on platforms without `lsof` it silently
-degrades to mtime-only judgment:
+or package manager), add `--check-in-use`. On macOS, planning uses a bounded
+native `libproc` PID snapshot of cwd/root vnode paths, file-backed memory
+mappings, and vnode descriptors, then matches every path recursively against
+all generated candidates in memory. Other Unix platforms, or a native
+capability/API failure, use one machine-readable global `lsof` snapshot with
+NUL-delimited byte paths, so non-UTF-8 names are not silently dropped. Native
+time or resource-budget exhaustion instead fails closed without starting that
+second global scan. Every execution pass takes fresh evidence and rechecks each
+candidate before mutation. If neither backend is available or the snapshot is
+indeterminate, an explicitly requested ownership check retains all candidates
+rather than granting mtime-only deletion authority:
 
 ```sh
 cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-use --execute
@@ -168,6 +176,51 @@ Or start from an empty generated-directory policy:
 ```sh
 cargo run -- triage --repo /path/to/repo --no-default-generated --delete-generated coverage
 ```
+
+## Storage inventory
+
+Use `inventory` to find the directories that account for a root's disk usage
+before deciding which domain-specific cleanup policy should own them:
+
+```sh
+worktree-gc inventory ~/Code ~/.codex --depth 2 --top 20
+worktree-gc inventory ~/Library/Application\ Support --depth 1 --json > inventory.json
+worktree-gc inventory ~/Library/Application\ Support/local-sandbox/vfkit/base.img --json
+```
+
+Directory roots are visited once and retain only the requested shallow
+aggregates, so `--depth` controls report detail rather than making totals
+partial. Exact file roots are measured directly without enumerating their
+parent directory, which makes indexed large-file results cheap to verify.
+`--top` keeps the largest children beneath each displayed directory.
+`--max-entries` (default 2,000,000 across all requested roots) is a hard work
+bound; a report says `incomplete` if it reaches that limit. Traversal stays on
+each root's filesystem unless `--cross-filesystems` is explicit, never follows
+symlinks, and deduplicates hard-linked files. Fair resumption keeps wide trees
+from monopolizing the budget, while a fixed live-reader cap prevents resumable
+directory cursors from exhausting process file descriptors.
+
+On macOS, directory enumeration and file accounting use `getattrlistbulk`;
+exact file roots use `getattrlist`.
+Alongside logical and allocated size, APFS reports
+`ATTR_CMNEXT_PRIVATESIZE` as `private_reclaimable_bytes`: a conservative floor
+for space immediately private to the visited files. APFS clones can share
+extents, so deleting an entire clone family can reclaim more than this floor;
+ordinary path allocation can substantially overstate the space freed by
+deleting only one clone or one pnpm-linked dependency tree. Other platforms
+report logical and allocated bytes and mark private-byte accounting incomplete.
+
+Inventory is read-only and deliberately separate from scheduled cleanup in
+this first version. Its structured output is the evidence surface for adding
+domain collectors and, later, cached physical-reclaim estimates to pressure
+ordering without turning scheduled runs into broad recursive scans.
+For multi-root scans, the global entry budget is divided fairly across the
+remaining roots and unused shares flow forward, so one large tree cannot hide
+every later storage domain. Within a root, queued sibling directories share the
+remaining root budget for the same reason: a wide early subtree is reported as
+incomplete instead of hiding every later sibling.
+The durable collector contract and incremental delivery order are documented
+in [`STORAGE.md`](STORAGE.md).
 
 ## Expiring protections
 
