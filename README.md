@@ -53,6 +53,11 @@ Multi-root cleanup writes the ordinary per-repository manifests plus an
 aggregate manifest under `$XDG_STATE_HOME/worktree-gc` or
 `~/.local/state/worktree-gc`.
 
+Manual `triage` and `cleanup` scans default to one worker. Use
+`--max-parallelism N` when an interactive scan may trade more CPU for lower
+elapsed time. The limit covers nested repository, worktree, and generated-root
+planning; root discovery passes the same bound to ripgrep.
+
 `triage` reports prunable metadata, dirty worktrees, stale clean worktree removal candidates, and generated directory cleanup candidates. `audit` is kept as an alias for `triage`.
 
 By default, stale clean worktrees are removal candidates after 30 days, and generated directories are considered stale after 7 days:
