@@ -953,6 +953,31 @@ pub fn triage_roots_with_parallelism(
     })
 }
 
+pub(crate) fn triage_exact_roots_with_parallelism(
+    roots: &[PathBuf],
+    options: TriageOptions,
+    max_parallelism: usize,
+) -> Result<RootTriageReport> {
+    let canonical_roots = canonicalize_roots(roots)?;
+    let mut report = triage_roots_with_parallelism(&canonical_roots, options, max_parallelism)?;
+    for repository in &mut report.repositories {
+        repository.worktrees.retain(|worktree| {
+            canonical_roots
+                .iter()
+                .any(|root| worktree.path == root.as_path())
+        });
+        repository.generated_dirs.retain(|dir| {
+            canonical_roots
+                .iter()
+                .any(|root| dir.path.starts_with(root))
+        });
+    }
+    report.repositories.retain(|repository| {
+        !repository.worktrees.is_empty() || !repository.generated_dirs.is_empty()
+    });
+    Ok(report)
+}
+
 fn triage_repositories(
     roots: &[PathBuf],
     repositories: &[PathBuf],
@@ -4080,6 +4105,41 @@ mod tests {
 
         let linked_only = discover_repositories(&[linked])?;
         assert_eq!(linked_only, vec![fs::canonicalize(repo)?]);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_root_triage_does_not_expand_a_worktree_into_siblings() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let linked = temp.path().join("linked");
+        add_worktree(&repo, &linked, "scoped-root")?;
+        fs::create_dir_all(repo.join("target/debug"))?;
+        fs::create_dir_all(linked.join("target/debug"))?;
+        fs::write(repo.join("target/debug/primary"), "primary")?;
+        fs::write(linked.join("target/debug/linked"), "linked")?;
+
+        let report = triage_exact_roots_with_parallelism(
+            std::slice::from_ref(&linked),
+            TriageOptions {
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+            1,
+        )?;
+
+        assert_eq!(report.repositories.len(), 1);
+        let repository = &report.repositories[0];
+        assert_eq!(repository.worktrees.len(), 1);
+        assert_eq!(repository.worktrees[0].path, fs::canonicalize(&linked)?);
+        assert_eq!(repository.generated_dirs.len(), 1);
+        assert_eq!(
+            repository.generated_dirs[0].path,
+            fs::canonicalize(linked.join("target"))?
+        );
         Ok(())
     }
 
