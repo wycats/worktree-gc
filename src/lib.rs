@@ -44,7 +44,7 @@ pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", "
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
 pub const DEFAULT_CARGO_PROFILE_SWEEP_DAYS: u64 = 7;
-pub const MANIFEST_VERSION: u64 = 4;
+pub const MANIFEST_VERSION: u64 = 5;
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -59,6 +59,13 @@ pub const DEFAULT_BUILD_CACHE_NAMES: &[&str] = &[".next", ".turbo", "target"];
 // no ancestor directory mtime at all. Sampling shallower than the real
 // write depth makes a live cache look idle.
 const GENERATED_MTIME_SAMPLE_DEPTH: usize = 6;
+
+// Cleanup planning may encounter hundreds of generated directories across a
+// discovery root. Measure them in one sequential inventory pass with a single
+// global budget so physical-reclaim ranking cannot turn into an unbounded set
+// of concurrent filesystem walks.
+const GENERATED_MEASUREMENT_MAX_ENTRIES: u64 = 2_000_000;
+const GENERATED_MEASUREMENT_MAX_ENTRIES_PER_CANDIDATE: u64 = 250_000;
 
 #[derive(Debug, Clone)]
 pub struct TriageOptions {
@@ -272,9 +279,25 @@ pub struct GeneratedDirDecision {
     pub in_use: bool,
     pub protection: Option<ProtectionMatch>,
     pub cleanup_class: CleanupClass,
+    pub measurement: Option<GeneratedDirMeasurement>,
     pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedDirMeasurement {
+    pub measured_at_unix: u64,
+    pub filesystem: String,
+    pub complete: bool,
+    pub visited_entries: u64,
+    pub metrics: InventoryMetrics,
+}
+
+#[derive(Debug)]
+struct GeneratedMeasurementTarget {
+    priority: (u8, u8),
+    locations: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -610,7 +633,12 @@ pub fn cleanup(repo: Option<&Path>, options: CleanupOptions) -> Result<CleanupRu
     let execute = options.execute;
     let protections = active_protections(options.now)?;
     let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
-    let run = plan_cleanup_with_protections(repo, options, &protections, open_handles.as_ref())?;
+    let mut run =
+        plan_cleanup_with_protections(repo, options, &protections, open_handles.as_ref())?;
+    measure_cleanup_runs(
+        std::slice::from_mut(&mut run),
+        GENERATED_MEASUREMENT_MAX_ENTRIES,
+    )?;
     if execute {
         execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
         if run
@@ -670,6 +698,7 @@ fn plan_cleanup_with_protections(
             in_use: dir.in_use,
             protection: dir.protection.clone(),
             cleanup_class: dir.cleanup_class,
+            measurement: None,
             sweeps: dir.sweeps.clone(),
             action: dir.action.clone(),
             reason: dir.reason.clone(),
@@ -708,6 +737,152 @@ fn plan_cleanup_with_protections(
         manifest_path,
         manifest,
     })
+}
+
+fn measure_cleanup_runs(runs: &mut [CleanupRun], max_entries: u64) -> Result<()> {
+    measure_cleanup_runs_matching(runs, max_entries, None)
+}
+
+fn measure_cleanup_runs_matching(
+    runs: &mut [CleanupRun],
+    max_entries: u64,
+    only_path: Option<&Path>,
+) -> Result<()> {
+    if let Some(path) = only_path {
+        for run in runs.iter_mut() {
+            for decision in &mut run.manifest.generated_dirs {
+                if decision.path == path {
+                    decision.measurement = None;
+                }
+            }
+        }
+    }
+
+    let mut targets: BTreeMap<PathBuf, GeneratedMeasurementTarget> = BTreeMap::new();
+
+    for (run_index, run) in runs.iter().enumerate() {
+        let routine_worktree_removals = run
+            .manifest
+            .worktrees
+            .iter()
+            .filter(|decision| {
+                decision.action == WorktreeAction::Remove
+                    && decision.cleanup_class == CleanupClass::Routine
+            })
+            .map(|decision| decision.path.as_path())
+            .collect::<Vec<_>>();
+
+        for (decision_index, decision) in run.manifest.generated_dirs.iter().enumerate() {
+            if decision.action != GeneratedDirAction::Delete
+                || only_path.is_some_and(|path| decision.path != path)
+                || routine_worktree_removals
+                    .iter()
+                    .any(|worktree| decision.path.starts_with(worktree))
+            {
+                continue;
+            }
+            // A build may finish and remove its temporary output between
+            // classification and measurement. Execution already treats a
+            // vanished candidate as reclaimed, so it should not abort the
+            // read-only evidence pass either.
+            let metadata = match fs::symlink_metadata(&decision.path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect generated measurement candidate {}",
+                            decision.path.display()
+                        )
+                    });
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+            let canonical = match fs::canonicalize(&decision.path) {
+                Ok(path) => path,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to resolve generated measurement candidate {}",
+                            decision.path.display()
+                        )
+                    });
+                }
+            };
+            let canonical_worktree =
+                fs::canonicalize(&decision.worktree_path).with_context(|| {
+                    format!(
+                        "failed to resolve generated candidate worktree {}",
+                        decision.worktree_path.display()
+                    )
+                })?;
+            anyhow::ensure!(
+                canonical.starts_with(&canonical_worktree),
+                "generated measurement candidate {} escaped worktree {}",
+                canonical.display(),
+                canonical_worktree.display()
+            );
+            let priority = (
+                u8::from(decision.cleanup_class != CleanupClass::Pressure),
+                generated_rebuild_rank(&decision.name),
+            );
+            let target = targets
+                .entry(canonical)
+                .or_insert_with(|| GeneratedMeasurementTarget {
+                    priority,
+                    locations: Vec::new(),
+                });
+            target.priority = target.priority.min(priority);
+            target.locations.push((run_index, decision_index));
+        }
+    }
+
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let mut paths = targets
+        .iter()
+        .map(|(path, target)| (target.priority, path.clone()))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let paths = paths.into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+    let report = inventory::inventory_with_root_limit(
+        &paths,
+        InventoryOptions {
+            display_depth: 0,
+            top: 1,
+            max_entries,
+            one_filesystem: true,
+        },
+        Some(GENERATED_MEASUREMENT_MAX_ENTRIES_PER_CANDIDATE),
+    )?;
+
+    let measured_at_unix = report.generated_at_unix;
+    for root in report.roots {
+        let Some(target) = targets.get(&root.path) else {
+            continue;
+        };
+        let measurement = GeneratedDirMeasurement {
+            measured_at_unix,
+            filesystem: root.filesystem,
+            complete: root.complete,
+            visited_entries: root.visited_entries,
+            metrics: root.metrics,
+        };
+        for (run_index, decision_index) in &target.locations {
+            runs[*run_index].manifest.generated_dirs[*decision_index].measurement =
+                Some(measurement.clone());
+        }
+    }
+
+    for run in runs {
+        run.manifest_path = write_manifest(&run.manifest.git_common_dir, &run.manifest)?;
+    }
+    Ok(())
 }
 
 pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTriageReport> {
@@ -770,7 +945,7 @@ pub fn cleanup_repositories(
     };
     let protections = active_protections(options.now)?;
     let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
-    let repositories = repositories
+    let mut repositories = repositories
         .par_iter()
         .map(|repo| {
             plan_cleanup_with_protections(
@@ -781,6 +956,7 @@ pub fn cleanup_repositories(
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    measure_cleanup_runs(&mut repositories, GENERATED_MEASUREMENT_MAX_ENTRIES)?;
     let mut manifest = RootCleanupManifest {
         manifest_version: MANIFEST_VERSION,
         mode,
@@ -800,12 +976,15 @@ pub fn cleanup_repositories(
             let refreshed_open_handles = refreshed_options
                 .check_in_use
                 .then(capture_open_handle_snapshot);
-            let refreshed = plan_cleanup_with_protections(
+            let mut refreshed = plan_cleanup_with_protections(
                 Some(&repo_root),
                 refreshed_options,
                 &refreshed_protections,
                 refreshed_open_handles.as_ref(),
             )?;
+            carry_generated_measurements(&manifest.repositories[index], &mut refreshed);
+            refreshed.manifest_path =
+                write_manifest(&refreshed.manifest.git_common_dir, &refreshed.manifest)?;
             manifest.repositories[index] = refreshed;
             write_root_manifest(&manifest)?;
             execute_cleanup_manifest(
@@ -819,24 +998,41 @@ pub fn cleanup_repositories(
             .as_ref()
             .is_some_and(|pressure| pressure.active)
         {
+            let mut satisfied_filesystems = HashSet::new();
             for rank in 0..=4 {
-                for index in
-                    pressure_repository_order(&manifest, ExecutionPass::PressureGenerated(rank))
-                {
+                for (index, path) in pressure_generated_candidate_order(&manifest, rank) {
+                    if !path.exists()
+                        || !root_pressure_should_continue(
+                            &manifest,
+                            &path,
+                            &mut satisfied_filesystems,
+                        )?
+                    {
+                        continue;
+                    }
                     refresh_and_execute_repository(
                         &mut manifest,
                         index,
                         &options,
                         ExecutionPass::PressureGenerated(rank),
+                        Some(&path),
                     )?;
                 }
             }
-            for index in pressure_repository_order(&manifest, ExecutionPass::PressureWorktrees) {
+            for index in pressure_worktree_repository_order(&manifest) {
+                if !root_pressure_worktrees_should_continue(
+                    &manifest,
+                    &manifest.repositories[index],
+                    &mut satisfied_filesystems,
+                )? {
+                    continue;
+                }
                 refresh_and_execute_repository(
                     &mut manifest,
                     index,
                     &options,
                     ExecutionPass::PressureWorktrees,
+                    None,
                 )?;
             }
         }
@@ -946,6 +1142,7 @@ fn refresh_and_execute_repository(
     index: usize,
     options: &CleanupOptions,
     pass: ExecutionPass,
+    only_generated_path: Option<&Path>,
 ) -> Result<()> {
     let repo_root = manifest.repositories[index].manifest.repo_root.clone();
     let mut refreshed_options = options.clone();
@@ -954,55 +1151,104 @@ fn refresh_and_execute_repository(
     let refreshed_open_handles = refreshed_options
         .check_in_use
         .then(capture_open_handle_snapshot);
-    let refreshed = plan_cleanup_with_protections(
+    let mut refreshed = plan_cleanup_with_protections(
         Some(&repo_root),
         refreshed_options,
         &refreshed_protections,
         refreshed_open_handles.as_ref(),
     )?;
+    carry_generated_measurements(&manifest.repositories[index], &mut refreshed);
+    if let Some(path) = only_generated_path {
+        measure_cleanup_runs_matching(
+            std::slice::from_mut(&mut refreshed),
+            GENERATED_MEASUREMENT_MAX_ENTRIES_PER_CANDIDATE,
+            Some(path),
+        )?;
+    }
+    refreshed.manifest_path =
+        write_manifest(&refreshed.manifest.git_common_dir, &refreshed.manifest)?;
     manifest.repositories[index] = refreshed;
     write_root_manifest(manifest)?;
-    execute_cleanup_manifest(&manifest.repositories[index].manifest, pass)
+    execute_cleanup_manifest_matching(
+        &manifest.repositories[index].manifest,
+        pass,
+        only_generated_path,
+    )
 }
 
-fn pressure_repository_order(manifest: &RootCleanupManifest, pass: ExecutionPass) -> Vec<usize> {
+fn carry_generated_measurements(previous: &CleanupRun, refreshed: &mut CleanupRun) {
+    let measurements = previous
+        .manifest
+        .generated_dirs
+        .iter()
+        .filter_map(|decision| {
+            decision
+                .measurement
+                .clone()
+                .map(|measurement| (decision.path.clone(), measurement))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for decision in &mut refreshed.manifest.generated_dirs {
+        decision.measurement = measurements.get(&decision.path).cloned();
+    }
+}
+
+fn pressure_generated_candidate_order(
+    manifest: &RootCleanupManifest,
+    rank: u8,
+) -> Vec<(usize, PathBuf)> {
+    let mut candidates = manifest
+        .repositories
+        .iter()
+        .enumerate()
+        .flat_map(|(index, repository)| {
+            repository
+                .manifest
+                .generated_dirs
+                .iter()
+                .filter(move |decision| {
+                    decision.action == GeneratedDirAction::Delete
+                        && decision.cleanup_class == CleanupClass::Pressure
+                        && generated_rebuild_rank(&decision.name) == rank
+                })
+                .map(move |decision| (index, decision))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, decision)| {
+        let measurement = decision.measurement.as_ref();
+        (
+            std::cmp::Reverse(
+                measurement
+                    .map(|measurement| measurement.metrics.private_reclaimable_bytes)
+                    .unwrap_or_default(),
+            ),
+            std::cmp::Reverse(
+                measurement
+                    .map(|measurement| measurement.metrics.allocated_bytes)
+                    .unwrap_or_default(),
+            ),
+            decision.mtime_unix.unwrap_or(i64::MAX),
+            decision.path.clone(),
+        )
+    });
+    candidates
+        .into_iter()
+        .map(|(index, decision)| (index, decision.path.clone()))
+        .collect()
+}
+
+fn pressure_worktree_repository_order(manifest: &RootCleanupManifest) -> Vec<usize> {
     let mut order = (0..manifest.repositories.len())
         .filter(|index| {
             let repository = &manifest.repositories[*index].manifest;
-            match pass {
-                ExecutionPass::PressureGenerated(rank) => {
-                    repository.generated_dirs.iter().any(|decision| {
-                        decision.action == GeneratedDirAction::Delete
-                            && decision.cleanup_class == CleanupClass::Pressure
-                            && generated_rebuild_rank(&decision.name) == rank
-                    })
-                }
-                ExecutionPass::PressureWorktrees => repository.worktrees.iter().any(|decision| {
-                    decision.action == WorktreeAction::Remove
-                        && decision.cleanup_class == CleanupClass::Pressure
-                }),
-                ExecutionPass::Routine => false,
-            }
+            repository.worktrees.iter().any(|decision| {
+                decision.action == WorktreeAction::Remove
+                    && decision.cleanup_class == CleanupClass::Pressure
+            })
         })
         .collect::<Vec<_>>();
     order.sort_by_key(|index| {
         let manifest = &manifest.repositories[*index].manifest;
-        let oldest_generated = manifest
-            .generated_dirs
-            .iter()
-            .filter(|decision| {
-                decision.action == GeneratedDirAction::Delete
-                    && decision.cleanup_class == CleanupClass::Pressure
-                    && match pass {
-                        ExecutionPass::PressureGenerated(rank) => {
-                            generated_rebuild_rank(&decision.name) == rank
-                        }
-                        _ => false,
-                    }
-            })
-            .filter_map(|decision| decision.mtime_unix)
-            .min()
-            .unwrap_or(i64::MAX);
         let oldest_worktree = manifest
             .worktrees
             .iter()
@@ -1011,12 +1257,47 @@ fn pressure_repository_order(manifest: &RootCleanupManifest, pass: ExecutionPass
             .max()
             .unwrap_or_default();
         (
-            oldest_generated,
             std::cmp::Reverse(oldest_worktree),
             manifest.repo_root.clone(),
         )
     });
     order
+}
+
+fn root_pressure_should_continue(
+    manifest: &RootCleanupManifest,
+    path: &Path,
+    satisfied_filesystems: &mut HashSet<String>,
+) -> Result<bool> {
+    let policy = &manifest
+        .pressure
+        .as_ref()
+        .context("pressure candidate has no pressure policy")?
+        .policy;
+    pressure_policy_should_continue(policy, path, satisfied_filesystems)
+}
+
+fn root_pressure_worktrees_should_continue(
+    manifest: &RootCleanupManifest,
+    repository: &CleanupRun,
+    satisfied_filesystems: &mut HashSet<String>,
+) -> Result<bool> {
+    for path in repository
+        .manifest
+        .worktrees
+        .iter()
+        .filter(|decision| {
+            decision.path.exists()
+                && decision.action == WorktreeAction::Remove
+                && decision.cleanup_class == CleanupClass::Pressure
+        })
+        .map(|decision| decision.path.as_path())
+    {
+        if root_pressure_should_continue(manifest, path, satisfied_filesystems)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1027,8 +1308,16 @@ enum ExecutionPass {
 }
 
 fn execute_cleanup_manifest(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()> {
+    execute_cleanup_manifest_matching(manifest, pass, None)
+}
+
+fn execute_cleanup_manifest_matching(
+    manifest: &CleanupManifest,
+    pass: ExecutionPass,
+    only_generated_path: Option<&Path>,
+) -> Result<()> {
     if pass != ExecutionPass::Routine {
-        return execute_cleanup(manifest, pass);
+        return execute_cleanup(manifest, pass, only_generated_path);
     }
     let worktree_paths = prunable_worktree_paths(&manifest.worktrees);
     match with_protection_guard_for_paths(&worktree_paths, SystemTime::now(), || {
@@ -1047,7 +1336,7 @@ fn execute_cleanup_manifest(manifest: &CleanupManifest, pass: ExecutionPass) -> 
             result?;
         }
     }
-    execute_cleanup(manifest, pass)
+    execute_cleanup(manifest, pass, only_generated_path)
 }
 
 fn prunable_worktree_paths(worktrees: &[WorktreeDecision]) -> Vec<PathBuf> {
@@ -1379,12 +1668,63 @@ pub fn print_cleanup(run: &CleanupRun) {
         }
     }
 
+    print_generated_measurements(&run.manifest.generated_dirs);
+
     print_sweep_candidates(
         run.manifest
             .generated_dirs
             .iter()
             .map(|dir| (dir.path.as_path(), dir.sweeps.as_slice())),
     );
+}
+
+fn print_generated_measurements(generated_dirs: &[GeneratedDirDecision]) {
+    let measured = generated_dirs
+        .iter()
+        .filter(|decision| decision.action == GeneratedDirAction::Delete)
+        .filter_map(|decision| {
+            decision
+                .measurement
+                .as_ref()
+                .map(|measurement| (decision, measurement))
+        })
+        .collect::<Vec<_>>();
+    if measured.is_empty() {
+        return;
+    }
+
+    let private = measured
+        .iter()
+        .map(|(_, measurement)| measurement.metrics.private_reclaimable_bytes)
+        .sum::<u64>();
+    let allocated = measured
+        .iter()
+        .map(|(_, measurement)| measurement.metrics.allocated_bytes)
+        .sum::<u64>();
+    println!();
+    println!(
+        "generated delete measurements: {} candidates, {} private, {} allocated observed",
+        measured.len(),
+        format_bytes(private),
+        format_bytes(allocated)
+    );
+    for (decision, measurement) in measured.iter().take(25) {
+        let completeness = if measurement.complete {
+            "complete"
+        } else {
+            "partial"
+        };
+        println!(
+            "- {} ({} private, {} allocated, {completeness}, {} entries)",
+            decision.path.display(),
+            format_bytes(measurement.metrics.private_reclaimable_bytes),
+            format_bytes(measurement.metrics.allocated_bytes),
+            measurement.visited_entries
+        );
+    }
+    if measured.len() > 25 {
+        println!("- ... and {} more (see manifest)", measured.len() - 25);
+    }
 }
 
 pub fn print_root_triage(report: &RootTriageReport) {
@@ -2599,7 +2939,41 @@ fn plan_worktree_cleanup(
         .collect()
 }
 
-fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()> {
+fn sort_generated_deletions(
+    generated_deletions: &mut Vec<&GeneratedDirDecision>,
+    pass: ExecutionPass,
+) {
+    generated_deletions.sort_by_key(|decision| {
+        let measurement = decision.measurement.as_ref();
+        let pressure_private = if pass == ExecutionPass::Routine {
+            0
+        } else {
+            measurement
+                .map(|measurement| measurement.metrics.private_reclaimable_bytes)
+                .unwrap_or_default()
+        };
+        let pressure_allocated = if pass == ExecutionPass::Routine {
+            0
+        } else {
+            measurement
+                .map(|measurement| measurement.metrics.allocated_bytes)
+                .unwrap_or_default()
+        };
+        (
+            generated_rebuild_rank(&decision.name),
+            std::cmp::Reverse(pressure_private),
+            std::cmp::Reverse(pressure_allocated),
+            decision.mtime_unix.unwrap_or(i64::MAX),
+            decision.path.clone(),
+        )
+    });
+}
+
+fn execute_cleanup(
+    manifest: &CleanupManifest,
+    pass: ExecutionPass,
+    only_generated_path: Option<&Path>,
+) -> Result<()> {
     let mut worktree_removals = manifest
         .worktrees
         .iter()
@@ -2624,6 +2998,7 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
         .filter(|decision| {
             decision.action == GeneratedDirAction::Delete
                 && execution_matches(decision.cleanup_class, pass)
+                && only_generated_path.is_none_or(|path| decision.path == path)
                 && match pass {
                     ExecutionPass::Routine => true,
                     ExecutionPass::PressureGenerated(rank) => {
@@ -2633,13 +3008,7 @@ fn execute_cleanup(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()
                 }
         })
         .collect::<Vec<_>>();
-    generated_deletions.sort_by_key(|decision| {
-        (
-            generated_rebuild_rank(&decision.name),
-            decision.mtime_unix.unwrap_or(i64::MAX),
-            decision.path.clone(),
-        )
-    });
+    sort_generated_deletions(&mut generated_deletions, pass);
     let generated_sweeps = if pass == ExecutionPass::Routine {
         manifest
             .generated_dirs
@@ -2851,6 +3220,14 @@ fn pressure_should_continue(
         .pressure
         .as_ref()
         .context("pressure candidate has no pressure policy")?;
+    pressure_policy_should_continue(policy, path, satisfied_filesystems)
+}
+
+fn pressure_policy_should_continue(
+    policy: &PressurePolicy,
+    path: &Path,
+    satisfied_filesystems: &mut HashSet<String>,
+) -> Result<bool> {
     let filesystem = filesystem_key(path)?;
     if !pressure_filesystem_entered(policy, &filesystem) {
         return Ok(false);
@@ -4358,6 +4735,7 @@ mod tests {
             in_use: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
+            measurement: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
             reason: "stale target".to_string(),
@@ -4391,6 +4769,7 @@ mod tests {
             in_use: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
+            measurement: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
             reason: "stale target".to_string(),
@@ -4788,6 +5167,7 @@ mod tests {
             in_use: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
+            measurement: None,
             sweeps: vec![SweepDecision {
                 tool: SweepTool::CargoSweep,
                 limit: SweepLimit::MaxSize { bytes: 1_000_000 },
@@ -4923,20 +5303,35 @@ mod tests {
 
     #[test]
     fn pressure_order_enforces_rebuild_classes_across_repositories() {
-        let generated = |repo: &str, name: &str, mtime_unix: i64| GeneratedDirDecision {
-            path: PathBuf::from(repo).join(name),
-            worktree_path: PathBuf::from(repo),
-            name: name.to_string(),
-            mtime: None,
-            mtime_unix: Some(mtime_unix),
-            effective_days: 1,
-            in_use: false,
-            protection: None,
-            cleanup_class: CleanupClass::Pressure,
-            sweeps: Vec::new(),
-            action: GeneratedDirAction::Delete,
-            reason: "pressure fixture".to_string(),
-        };
+        let generated =
+            |repo: &str, name: &str, mtime_unix: i64, private_reclaimable_bytes: u64| {
+                GeneratedDirDecision {
+                    path: PathBuf::from(repo).join(name),
+                    worktree_path: PathBuf::from(repo),
+                    name: name.to_string(),
+                    mtime: None,
+                    mtime_unix: Some(mtime_unix),
+                    effective_days: 1,
+                    in_use: false,
+                    protection: None,
+                    cleanup_class: CleanupClass::Pressure,
+                    measurement: Some(GeneratedDirMeasurement {
+                        measured_at_unix: 1,
+                        filesystem: "fixture".to_string(),
+                        complete: true,
+                        visited_entries: 1,
+                        metrics: InventoryMetrics {
+                            allocated_bytes: private_reclaimable_bytes,
+                            private_reclaimable_bytes,
+                            private_reclaimable_complete: true,
+                            ..InventoryMetrics::default()
+                        },
+                    }),
+                    sweeps: Vec::new(),
+                    action: GeneratedDirAction::Delete,
+                    reason: "pressure fixture".to_string(),
+                }
+            };
         let repository = |repo: &str, generated_dirs: Vec<GeneratedDirDecision>| CleanupRun {
             manifest_path: PathBuf::from(repo).join("manifest.json"),
             manifest: CleanupManifest {
@@ -4971,32 +5366,118 @@ mod tests {
                 repository(
                     "/code/a",
                     vec![
-                        generated("/code/a", "node_modules", 10),
-                        generated("/code/a", ".turbo", 20),
+                        generated("/code/a", "node_modules", 10, 50),
+                        generated("/code/a", ".turbo", 20, 1_000),
                     ],
                 ),
                 repository(
                     "/code/b",
                     vec![
-                        generated("/code/b", ".next", 5),
-                        generated("/code/b", ".turbo", 10),
+                        generated("/code/b", ".next", 5, 500),
+                        generated("/code/b", ".turbo", 10, 100),
                     ],
                 ),
             ],
         };
 
+        let turbo_candidates = || {
+            manifest
+                .repositories
+                .iter()
+                .flat_map(|repository| &repository.manifest.generated_dirs)
+                .filter(|decision| decision.name == ".turbo")
+                .collect::<Vec<_>>()
+        };
+        let mut pressure_candidates = turbo_candidates();
+        sort_generated_deletions(
+            &mut pressure_candidates,
+            ExecutionPass::PressureGenerated(0),
+        );
+        assert_eq!(pressure_candidates[0].path, PathBuf::from("/code/a/.turbo"));
+        let mut routine_candidates = turbo_candidates();
+        sort_generated_deletions(&mut routine_candidates, ExecutionPass::Routine);
+        assert_eq!(routine_candidates[0].path, PathBuf::from("/code/b/.turbo"));
+
         assert_eq!(
-            pressure_repository_order(&manifest, ExecutionPass::PressureGenerated(0)),
-            vec![1, 0]
+            pressure_generated_candidate_order(&manifest, 0),
+            vec![
+                (0, PathBuf::from("/code/a/.turbo")),
+                (1, PathBuf::from("/code/b/.turbo"))
+            ]
         );
         assert_eq!(
-            pressure_repository_order(&manifest, ExecutionPass::PressureGenerated(1)),
-            vec![1]
+            pressure_generated_candidate_order(&manifest, 1),
+            vec![(1, PathBuf::from("/code/b/.next"))]
         );
         assert_eq!(
-            pressure_repository_order(&manifest, ExecutionPass::PressureGenerated(3)),
-            vec![0]
+            pressure_generated_candidate_order(&manifest, 3),
+            vec![(0, PathBuf::from("/code/a/node_modules"))]
         );
+    }
+
+    #[test]
+    fn pressure_execution_deletes_only_the_selected_generated_candidate() -> Result<()> {
+        let temp = TempDir::new()?;
+        let first = temp.path().join("first/.turbo");
+        let second = temp.path().join("second/.turbo");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        fs::write(first.join("artifact"), "first")?;
+        fs::write(second.join("artifact"), "second")?;
+        let first = fs::canonicalize(first)?;
+        let second = fs::canonicalize(second)?;
+        let decision = |path: PathBuf| GeneratedDirDecision {
+            worktree_path: path.parent().expect("candidate has a parent").to_path_buf(),
+            path,
+            name: ".turbo".to_string(),
+            mtime: None,
+            mtime_unix: Some(1),
+            effective_days: 1,
+            in_use: false,
+            protection: None,
+            cleanup_class: CleanupClass::Pressure,
+            measurement: None,
+            sweeps: Vec::new(),
+            action: GeneratedDirAction::Delete,
+            reason: "pressure fixture".to_string(),
+        };
+        let manifest = CleanupManifest {
+            manifest_version: MANIFEST_VERSION,
+            mode: CleanupMode::Execute,
+            generated_at: "fixture".to_string(),
+            repo_root: temp.path().to_path_buf(),
+            current_worktree: temp.path().to_path_buf(),
+            git_common_dir: temp.path().join(".git"),
+            stale_days: 14,
+            generated_days: 7,
+            generated_activity_only: true,
+            check_in_use: false,
+            cargo_lock_timeout_secs: None,
+            defer_lock_timeouts: false,
+            pressure: Some(PressurePolicy {
+                enter_bytes: u64::MAX - 1,
+                target_bytes: u64::MAX,
+                generated_days: 1,
+                stale_days: 7,
+                active: true,
+                entered_filesystems: vec![filesystem_key(temp.path())?],
+            }),
+            generated_delete_names: Vec::new(),
+            generated_report_only_names: Vec::new(),
+            protections: Vec::new(),
+            prune_output: String::new(),
+            worktrees: Vec::new(),
+            generated_dirs: vec![decision(first.clone()), decision(second.clone())],
+        };
+
+        execute_cleanup_manifest_matching(
+            &manifest,
+            ExecutionPass::PressureGenerated(0),
+            Some(&first),
+        )?;
+        assert!(!first.exists());
+        assert!(second.exists());
+        Ok(())
     }
 
     #[test]
@@ -5060,6 +5541,50 @@ mod tests {
         activate_pressure_policy(&mut policy, &observations)?;
         assert_eq!(policy.entered_filesystems, vec!["pressured"]);
         assert!(policy.active);
+        Ok(())
+    }
+
+    #[test]
+    fn root_pressure_scheduler_shares_satisfied_filesystems_across_candidates() -> Result<()> {
+        let temp = TempDir::new()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        let filesystem = filesystem_key(&first)?;
+        let manifest = RootCleanupManifest {
+            manifest_version: MANIFEST_VERSION,
+            mode: CleanupMode::Execute,
+            generated_at: "fixture".to_string(),
+            roots: vec![temp.path().to_path_buf()],
+            pressure: Some(PressureRunDecision {
+                policy: PressurePolicy {
+                    enter_bytes: u64::MAX,
+                    target_bytes: 0,
+                    generated_days: 1,
+                    stale_days: 7,
+                    active: true,
+                    entered_filesystems: vec![filesystem.clone()],
+                },
+                observations: Vec::new(),
+                final_observations: None,
+            }),
+            repositories: Vec::new(),
+        };
+        let mut satisfied_filesystems = HashSet::new();
+
+        assert!(!root_pressure_should_continue(
+            &manifest,
+            &first,
+            &mut satisfied_filesystems,
+        )?);
+        assert!(satisfied_filesystems.contains(&filesystem));
+        assert!(!root_pressure_should_continue(
+            &manifest,
+            &second,
+            &mut satisfied_filesystems,
+        )?);
+
         Ok(())
     }
 
@@ -5286,6 +5811,224 @@ mod tests {
         assert!(!worktree.join("node_modules").exists());
         assert!(!worktree.join("target").exists());
         assert!(worktree.join("tracked-target/file.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_manifest_measures_generated_delete_candidates() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let package = repo.join("node_modules/pkg");
+        fs::create_dir_all(&package)?;
+        fs::write(package.join("index.js"), vec![b'x'; 16 * 1024])?;
+        let old = unix_days_before_now(10);
+        set_mtime(&package.join("index.js"), old)?;
+        set_mtime(&package, old)?;
+        set_mtime(&repo.join("node_modules"), old)?;
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        let measurement = decision
+            .measurement
+            .as_ref()
+            .context("missing generated directory measurement")?;
+        assert!(measurement.complete);
+        assert!(measurement.visited_entries >= 2);
+        assert!(measurement.metrics.logical_bytes >= 16 * 1024);
+        assert!(measurement.metrics.allocated_bytes > 0);
+
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&run.manifest_path)?)?;
+        let serialized = json["generated_dirs"]
+            .as_array()
+            .context("generated_dirs is not an array")?
+            .iter()
+            .find(|entry| entry["name"] == "node_modules")
+            .context("serialized node_modules decision is missing")?;
+        assert!(serialized["measurement"]["metrics"]["allocated_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_measurements_share_one_global_entry_budget() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let roots = [repo.join(".next/cache"), repo.join("node_modules/pkg")];
+        let old = unix_days_before_now(10);
+        for root in &roots {
+            fs::create_dir_all(root)?;
+            fs::write(root.join("artifact"), "fixture")?;
+            set_mtime(&root.join("artifact"), old)?;
+            set_mtime(root, old)?;
+            set_mtime(root.parent().context("generated root has no parent")?, old)?;
+        }
+
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+            &[],
+            None,
+        )?;
+        assert!(run
+            .manifest
+            .generated_dirs
+            .iter()
+            .filter(|decision| decision.action == GeneratedDirAction::Delete)
+            .all(|decision| decision.measurement.is_none()));
+
+        measure_cleanup_runs(std::slice::from_mut(&mut run), 1)?;
+        let measurements = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .filter(|decision| decision.action == GeneratedDirAction::Delete)
+            .map(|decision| decision.measurement.as_ref())
+            .collect::<Option<Vec<_>>>()
+            .context("delete candidate was not measured")?;
+        assert_eq!(
+            measurements
+                .iter()
+                .map(|measurement| measurement.visited_entries)
+                .sum::<u64>(),
+            1
+        );
+        assert!(measurements.iter().any(|measurement| !measurement.complete));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_measurement_does_not_follow_a_replaced_candidate_symlink() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules");
+        fs::create_dir_all(&candidate)?;
+        fs::write(candidate.join("artifact"), "fixture")?;
+        let old = unix_days_before_now(10);
+        set_mtime(&candidate.join("artifact"), old)?;
+        set_mtime(&candidate, old)?;
+
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+            &[],
+            None,
+        )?;
+        let external = repo
+            .parent()
+            .context("repository has no parent")?
+            .join("external");
+        fs::create_dir_all(&external)?;
+        fs::write(external.join("durable"), "keep")?;
+        fs::remove_dir_all(&candidate)?;
+        std::os::unix::fs::symlink(&external, &candidate)?;
+
+        measure_cleanup_runs(std::slice::from_mut(&mut run), 100)?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert!(decision.measurement.is_none());
+        assert!(external.join("durable").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_measurement_refresh_clears_vanished_candidate_evidence() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules");
+        fs::create_dir_all(&candidate)?;
+        fs::write(candidate.join("artifact"), "fixture")?;
+        let old = unix_days_before_now(10);
+        set_mtime(&candidate.join("artifact"), old)?;
+        set_mtime(&candidate, old)?;
+
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+            &[],
+            None,
+        )?;
+        let candidate = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?
+            .path
+            .clone();
+
+        measure_cleanup_runs(std::slice::from_mut(&mut run), 100)?;
+        assert!(run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == candidate)
+            .and_then(|decision| decision.measurement.as_ref())
+            .is_some());
+        fs::remove_dir_all(&candidate)?;
+
+        measure_cleanup_runs_matching(std::slice::from_mut(&mut run), 100, Some(&candidate))?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == candidate)
+            .context("missing node_modules decision after refresh")?;
+        assert!(decision.measurement.is_none());
         Ok(())
     }
 
