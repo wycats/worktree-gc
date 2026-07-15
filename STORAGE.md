@@ -78,6 +78,43 @@ Every candidate therefore needs more than a path:
 Collectors do not infer safety from size. Inventory results can prioritize a
 collector's already-safe candidates, but cannot turn user data into a cache.
 
+### Gateway storage inventory adapter
+
+Vercel AI Gateway owns the liveness, pin/export, and eligibility model for its
+workspace PGlite databases and investigation logs. `worktree-gc` consumes the
+owner's `GatewayStorageInventoryV1` reports without reinterpreting those
+claims. The adapter retains the complete owner report alongside separately
+labelled filesystem evidence; logical, allocated, and APFS-private currencies
+and their completeness remain distinct.
+
+The adapter accepts explicit report files and bounded, non-recursive manifest
+directories. Owner-issued `localRootUri` and `localUnitUri` values must be
+canonical local `file:///` URIs. Existing paths are canonicalized, and each
+unit must remain under its declared canonical root before any APFS correlation
+occurs. Missing paths are reported as unavailable. Symlink escapes and a
+shared `rootId` that resolves to different roots fail closed for measurement.
+
+A shallow machine inventory may have visited a Gateway unit without retaining
+its exact path. Ancestor totals are not unit evidence. When exact complete
+evidence is absent, the adapter performs one bounded exact-path inventory
+subpass across all validated unique units, sharing both global and per-unit
+entry budgets and staying on one filesystem. This subpass is operationally
+useful without teaching a later broad survey about VS Code workspace hashes.
+
+Reports from Stable and Insiders are preserved independently and are never
+summed. Same-root observations receive an advisory duplicate grouping;
+conflicting owner URIs for one root identity suppress filesystem correlation.
+Different root IDs resolving to the same physical root receive a distinct
+non-additive overlap grouping. Neither grouping changes extension-issued
+activity, protection, export, or eligibility state. Each unit explicitly
+records whether its selected evidence came from an exact retained inventory
+node, the exact-unit subpass, or is unavailable; incomplete broad evidence is
+preserved alongside that selection.
+The adapter exposes no generic execution command and is not a collector
+execution surface. Its versioned JSON report is independently readable so a
+later machine-wide survey can compose the completed correlation without
+copying Gateway schema knowledge or repeating the exact-path subpass.
+
 ## Pressure policy
 
 Routine policy can remove uncontroversially stale, recoverable content even
