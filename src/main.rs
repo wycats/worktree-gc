@@ -416,6 +416,10 @@ fn scheduled_pressure_policy(
         "pressure.generated_days must be at least 1"
     );
     anyhow::ensure!(
+        !pressure.owner_free_generated || cleanup.check_in_use,
+        "pressure.owner_free_generated requires cleanup.check_in_use = true"
+    );
+    anyhow::ensure!(
         pressure.stale_days <= cleanup.stale_days,
         "pressure.stale_days must not exceed cleanup.stale_days"
     );
@@ -428,6 +432,7 @@ fn scheduled_pressure_policy(
         target_bytes,
         generated_days: pressure.generated_days,
         stale_days: pressure.stale_days,
+        owner_free_generated: pressure.owner_free_generated,
         active: false,
         entered_filesystems: Vec::new(),
     }))
@@ -1061,6 +1066,7 @@ enter_free_space = "100GiB"
 target_free_space = "150GiB"
 generated_days = 1
 stale_days = 7
+owner_free_generated = true
 "#,
         )?;
         let cleanup = config::CleanupConfig::default();
@@ -1069,6 +1075,7 @@ stale_days = 7
         assert_eq!(policy.target_bytes, 150 * 1024 * 1024 * 1024);
         assert_eq!(policy.generated_days, 1);
         assert_eq!(policy.stale_days, 7);
+        assert!(policy.owner_free_generated);
         assert!(!policy.active);
         Ok(())
     }
@@ -1089,6 +1096,14 @@ stale_days = 7
         )
         .unwrap();
         assert!(scheduled_pressure_policy(&zero_days, &cleanup).is_err());
+
+        let owner_free: config::PressureConfig = toml::from_str(
+            "enter_free_space = '100GiB'\ntarget_free_space = '150GiB'\nowner_free_generated = true",
+        )
+        .unwrap();
+        let mut unsafe_cleanup = cleanup;
+        unsafe_cleanup.check_in_use = false;
+        assert!(scheduled_pressure_policy(&owner_free, &unsafe_cleanup).is_err());
     }
 
     #[test]
