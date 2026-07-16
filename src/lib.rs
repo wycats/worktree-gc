@@ -2097,12 +2097,7 @@ fn scan_generated_dirs_for_worktree(
             policy.open_handle_snapshot,
             Some(OpenHandleSnapshot::Available(_))
         );
-    let worktree_in_use = policy.check_in_use
-        && dirs_with_open_handles(
-            std::iter::once(worktree.path.as_path()),
-            policy.open_handle_snapshot,
-        )
-        .contains(&worktree.path);
+    let mut worktree_in_use = None;
     let open_generated_dirs = if policy.check_in_use {
         dirs_with_open_handles(
             candidates.iter().map(|candidate| candidate.path.as_path()),
@@ -2120,6 +2115,18 @@ fn scan_generated_dirs_for_worktree(
             && policy
                 .pressure
                 .is_some_and(|pressure| pressure.owner_free_generated);
+        let worktree_in_use = if owner_free_pressure_mode {
+            *worktree_in_use.get_or_insert_with(|| {
+                policy.check_in_use
+                    && dirs_with_open_handles(
+                        std::iter::once(worktree.path.as_path()),
+                        policy.open_handle_snapshot,
+                    )
+                    .contains(&worktree.path)
+            })
+        } else {
+            false
+        };
         let effective_days = if pressure_applies {
             routine_days.min(
                 policy
@@ -6356,6 +6363,52 @@ mod tests {
         assert!(!decision.worktree_in_use);
         assert!(decision.owner_free_pressure);
         assert!(decision.reason.contains("bypasses artifact age"));
+        Ok(())
+    }
+
+    #[test]
+    fn routine_pressure_does_not_evaluate_owner_free_worktree_ownership() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("node_modules/pkg"))?;
+        fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+        let repo = fs::canonicalize(repo)?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: false,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::from([
+                repo.join("src/held.rs")
+            ]))),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert!(!decision.worktree_in_use);
+        assert!(!decision.owner_free_pressure);
         Ok(())
     }
 
