@@ -239,7 +239,7 @@ pub struct GatewayBroadInventoryRoot {
     pub traversal_complete: bool,
     pub private_measurement_complete: bool,
     pub visited_entries: u64,
-    pub scan_error_count: usize,
+    pub scan_error_count: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -307,7 +307,7 @@ pub struct GatewayFilesystemMeasurement {
     pub traversal_complete: bool,
     pub private_measurement_complete: bool,
     pub visited_entries: Option<u64>,
-    pub scan_error_count: usize,
+    pub scan_error_count: u64,
     pub metrics: InventoryMetrics,
 }
 
@@ -612,7 +612,7 @@ pub fn gateway_storage_report(options: GatewayStorageOptions) -> Result<GatewayS
                     traversal_complete: root.complete && root.errors.is_empty(),
                     private_measurement_complete: root.metrics.private_reclaimable_complete,
                     visited_entries: root.visited_entries,
-                    scan_error_count: root.errors.len(),
+                    scan_error_count: root.metrics.errors,
                 })
                 .collect(),
         },
@@ -1182,7 +1182,7 @@ fn index_inventory_measurements(
                 traversal_complete: root.complete && root.errors.is_empty(),
                 private_measurement_complete: root.metrics.private_reclaimable_complete,
                 visited_entries: Some(root.visited_entries),
-                scan_error_count: root.errors.len(),
+                scan_error_count: root.metrics.errors,
                 metrics: root.metrics.clone(),
             },
         );
@@ -1196,7 +1196,7 @@ fn index_inventory_measurements(
                     traversal_complete: root.complete && root.errors.is_empty(),
                     private_measurement_complete: entry.metrics.private_reclaimable_complete,
                     visited_entries: None,
-                    scan_error_count: root.errors.len(),
+                    scan_error_count: root.metrics.errors,
                     metrics: entry.metrics.clone(),
                 },
             );
@@ -1213,17 +1213,21 @@ fn inventory_units_tolerating_disappearance(
     let mut roots = Vec::with_capacity(paths.len());
     let mut remaining_entries = options.max_entries;
     let mut generated_at_unix = now_unix_millis() / 1_000;
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
         if remaining_entries == 0 {
             break;
         }
+        let remaining_roots = u64::try_from(paths.len() - index).unwrap_or(u64::MAX);
+        let fair_share =
+            remaining_entries.saturating_add(remaining_roots.saturating_sub(1)) / remaining_roots;
+        let root_budget = max_entries_per_unit.min(fair_share);
         let report = inventory_with_root_limit(
             std::slice::from_ref(path),
             InventoryOptions {
-                max_entries: remaining_entries,
+                max_entries: root_budget,
                 ..options.clone()
             },
-            Some(max_entries_per_unit),
+            Some(root_budget),
         );
         match report {
             Ok(report) => {
@@ -2017,6 +2021,66 @@ mod tests {
         assert_eq!(result.roots.len(), 1);
         assert_eq!(result.roots[0].path, fs::canonicalize(existing).unwrap());
         assert!(result.options.one_filesystem);
+    }
+
+    #[test]
+    fn exact_subpass_preserves_a_fair_budget_for_later_units() {
+        let temp = TempDir::new().unwrap();
+        let paths = (0..3)
+            .map(|unit_index| {
+                let path = temp.path().join(format!("unit-{unit_index}"));
+                fs::create_dir_all(&path).unwrap();
+                for file_index in 0..8 {
+                    fs::write(path.join(format!("file-{file_index}")), b"data").unwrap();
+                }
+                path
+            })
+            .collect::<Vec<_>>();
+
+        let result = inventory_units_tolerating_disappearance(
+            &paths,
+            InventoryOptions {
+                display_depth: 0,
+                top: 1,
+                max_entries: 6,
+                one_filesystem: true,
+            },
+            6,
+        )
+        .unwrap();
+
+        assert_eq!(result.roots.len(), 3);
+        assert!(result.roots.iter().all(|root| root.visited_entries <= 2));
+    }
+
+    #[test]
+    fn retained_inventory_uses_the_full_scanner_error_count() {
+        let root_path = PathBuf::from("/gateway/root");
+        let report = InventoryReport {
+            inventory_version: INVENTORY_VERSION,
+            generated_at_unix: 123,
+            options: InventoryReportOptions {
+                display_depth: 0,
+                top: 1,
+                max_entries: 100,
+                one_filesystem: true,
+            },
+            roots: vec![InventoryRoot {
+                path: root_path.clone(),
+                filesystem: "testfs".to_string(),
+                complete: false,
+                visited_entries: 100,
+                metrics: InventoryMetrics {
+                    errors: 143,
+                    ..InventoryMetrics::default()
+                },
+                entries: Vec::new(),
+                errors: Vec::new(),
+            }],
+        };
+
+        let measurements = index_inventory_measurements(&report);
+        assert_eq!(measurements[&root_path].scan_error_count, 143);
     }
 
     #[test]
