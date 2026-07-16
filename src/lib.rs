@@ -2115,18 +2115,6 @@ fn scan_generated_dirs_for_worktree(
             && policy
                 .pressure
                 .is_some_and(|pressure| pressure.owner_free_generated);
-        let worktree_in_use = if owner_free_pressure_mode {
-            *worktree_in_use.get_or_insert_with(|| {
-                policy.check_in_use
-                    && dirs_with_open_handles(
-                        std::iter::once(worktree.path.as_path()),
-                        policy.open_handle_snapshot,
-                    )
-                    .contains(&worktree.path)
-            })
-        } else {
-            false
-        };
         let effective_days = if pressure_applies {
             routine_days.min(
                 policy
@@ -2161,6 +2149,20 @@ fn scan_generated_dirs_for_worktree(
             .is_some_and(|days| days < routine_days);
         let routine_active = routine_worktree_recent || routine_dir_recent;
         let candidate_in_use = open_generated_dirs.contains(&candidate.path);
+        let active = worktree_recent || dir_recent;
+        let owner_free_age_bypass = owner_free_pressure_mode && active;
+        let worktree_in_use = if owner_free_age_bypass {
+            *worktree_in_use.get_or_insert_with(|| {
+                policy.check_in_use
+                    && dirs_with_open_handles(
+                        std::iter::once(worktree.path.as_path()),
+                        policy.open_handle_snapshot,
+                    )
+                    .contains(&worktree.path)
+            })
+        } else {
+            false
+        };
 
         // Only pay for the open-handle probe when the directory would
         // otherwise be deleted, except in owner-free pressure mode where
@@ -2170,7 +2172,7 @@ fn scan_generated_dirs_for_worktree(
             && !dir_recent
             && !has_tracked_files;
         let in_use = candidate_in_use && (deletable_so_far || owner_free_pressure_mode);
-        let owner_free_pressure = owner_free_pressure_mode
+        let owner_free_pressure = owner_free_age_bypass
             && ownership_evidence_complete
             && !worktree_in_use
             && !candidate_in_use
@@ -2178,13 +2180,9 @@ fn scan_generated_dirs_for_worktree(
             && candidate.action == GeneratedCandidateAction::Delete
             && !has_tracked_files;
         let sweep_strategies = config.sweep_strategies(&candidate.name);
-        let active = worktree_recent || dir_recent;
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
             && protection.is_none()
-            && !owner_free_pressure
-            && (routine_active
-                || (owner_free_pressure_mode && ownership_evidence_complete && worktree_in_use)
-                || candidate.action == GeneratedCandidateAction::SweepOnly)
+            && (routine_active || candidate.action == GeneratedCandidateAction::SweepOnly)
             && !has_tracked_files
             && !sweep_strategies.is_empty()
         {
@@ -2214,12 +2212,17 @@ fn scan_generated_dirs_for_worktree(
                     lease.reason
                 ),
             )
-        } else if owner_free_pressure_mode && !ownership_evidence_complete {
+        } else if owner_free_age_bypass && !ownership_evidence_complete {
             (
                 GeneratedDirAction::Skip,
                 "owner-free pressure cleanup requires complete ownership evidence".to_string(),
             )
-        } else if owner_free_pressure_mode && worktree_in_use {
+        } else if in_use {
+            (
+                GeneratedDirAction::Skip,
+                "a running process has open files in this directory".to_string(),
+            )
+        } else if owner_free_age_bypass && worktree_in_use {
             if has_sweep_work {
                 let descriptions = sweeps
                     .iter()
@@ -2237,11 +2240,6 @@ fn scan_generated_dirs_for_worktree(
                     "worktree has current process ownership evidence".to_string(),
                 )
             }
-        } else if in_use {
-            (
-                GeneratedDirAction::Skip,
-                "a running process has open files in this directory".to_string(),
-            )
         } else if candidate.action == GeneratedCandidateAction::SweepOnly {
             if has_tracked_files {
                 (
@@ -4140,6 +4138,37 @@ mod tests {
 
     fn unix_days_before_now(days: u64) -> i64 {
         system_time_to_unix(now()).expect("test now fits in unix time") - (days * 86_400) as i64
+    }
+
+    fn create_stale_incremental_target(repo: &Path) -> Result<(PathBuf, PathBuf)> {
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"pressure-sweep-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let target = repo.join("target");
+        let profile = target.join("debug");
+        let root = profile.join("incremental/fixture-old");
+        let session = root.join("s-session-hash");
+        fs::create_dir_all(&session)?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        let dep_graph = session.join("dep-graph.bin");
+        fs::write(&dep_graph, "old")?;
+        let stale = unix_days_before_now(20);
+        for path in [&dep_graph, &session, &root] {
+            set_mtime(path, stale)?;
+        }
+        let pressure_only = unix_days_before_now(0);
+        for path in [
+            profile.join("incremental"),
+            profile.join(".cargo-lock"),
+            profile,
+            target.clone(),
+        ] {
+            set_mtime(&path, pressure_only)?;
+        }
+        Ok((target, dep_graph))
     }
 
     #[test]
@@ -6371,6 +6400,14 @@ mod tests {
         let (_temp, repo) = init_repo()?;
         fs::create_dir_all(repo.join("node_modules/pkg"))?;
         fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+        let recent = unix_days_before_now(0);
+        for path in [
+            repo.join("node_modules/pkg/index.js"),
+            repo.join("node_modules/pkg"),
+            repo.join("node_modules"),
+        ] {
+            set_mtime(&path, recent)?;
+        }
         let repo = fs::canonicalize(repo)?;
 
         let run = plan_cleanup_with_protections(
@@ -6413,10 +6450,217 @@ mod tests {
     }
 
     #[test]
+    fn owner_free_pressure_keeps_expired_generated_dirs_routine() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let package = repo.join("node_modules/pkg");
+        fs::create_dir_all(&package)?;
+        let module = package.join("index.js");
+        fs::write(&module, "old\n")?;
+        let stale = unix_days_before_now(20);
+        for path in [&module, &package, &repo.join("node_modules")] {
+            set_mtime(path, stale)?;
+        }
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert_eq!(decision.cleanup_class, CleanupClass::Routine);
+        assert!(!decision.owner_free_pressure);
+        Ok(())
+    }
+
+    #[test]
+    fn source_ownership_does_not_block_expired_generated_dirs() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let package = repo.join("node_modules/pkg");
+        fs::create_dir_all(&package)?;
+        let module = package.join("index.js");
+        fs::write(&module, "old\n")?;
+        let stale = unix_days_before_now(20);
+        for path in [&module, &package, &repo.join("node_modules")] {
+            set_mtime(path, stale)?;
+        }
+        let repo = fs::canonicalize(repo)?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::from([
+                repo.join("src/held.rs")
+            ]))),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert_eq!(decision.cleanup_class, CleanupClass::Routine);
+        assert!(!decision.owner_free_pressure);
+        Ok(())
+    }
+
+    #[test]
+    fn owner_free_pressure_does_not_sweep_an_owned_generated_dir() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let (target, dep_graph) = create_stale_incremental_target(&repo)?;
+        let repo = fs::canonicalize(repo)?;
+        let target = fs::canonicalize(target)?;
+        let dep_graph = fs::canonicalize(dep_graph)?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::from([dep_graph]))),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == target)
+            .context("missing target decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Skip);
+        assert!(decision.in_use);
+        assert!(
+            decision.sweeps.iter().any(SweepDecision::has_work),
+            "expected stale sweep work: {decision:#?}"
+        );
+        assert!(decision.reason.contains("open files in this directory"));
+        Ok(())
+    }
+
+    #[test]
+    fn owner_free_pressure_preserves_routine_sweeps() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let (target, _dep_graph) = create_stale_incremental_target(&repo)?;
+        let repo = fs::canonicalize(repo)?;
+        let target = fs::canonicalize(target)?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == target)
+            .context("missing target decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert_eq!(decision.cleanup_class, CleanupClass::Pressure);
+        assert!(decision.owner_free_pressure);
+        assert!(decision.sweeps.iter().any(SweepDecision::has_work));
+        Ok(())
+    }
+
+    #[test]
     fn owner_free_pressure_keeps_worktrees_with_current_ownership() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         fs::create_dir_all(repo.join("node_modules/pkg"))?;
         fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+        let recent = unix_days_before_now(0);
+        for path in [
+            repo.join("node_modules/pkg/index.js"),
+            repo.join("node_modules/pkg"),
+            repo.join("node_modules"),
+        ] {
+            set_mtime(&path, recent)?;
+        }
         let repo = fs::canonicalize(repo)?;
 
         let run = plan_cleanup_with_protections(
@@ -6468,6 +6712,14 @@ mod tests {
         let (_temp, repo) = init_repo()?;
         fs::create_dir_all(repo.join("node_modules/pkg"))?;
         fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+        let recent = unix_days_before_now(0);
+        for path in [
+            repo.join("node_modules/pkg/index.js"),
+            repo.join("node_modules/pkg"),
+            repo.join("node_modules"),
+        ] {
+            set_mtime(&path, recent)?;
+        }
 
         let run = plan_cleanup_with_protections(
             Some(&repo),
@@ -6529,6 +6781,14 @@ mod tests {
         fs::write(repo.join("held-source.txt"), "held\n")?;
         fs::create_dir_all(repo.join("node_modules/pkg"))?;
         fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+        let recent = unix_days_before_now(0);
+        for path in [
+            repo.join("node_modules/pkg/index.js"),
+            repo.join("node_modules/pkg"),
+            repo.join("node_modules"),
+        ] {
+            set_mtime(&path, recent)?;
+        }
 
         let run = plan_cleanup_with_protections(
             Some(&repo),
