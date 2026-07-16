@@ -1,4 +1,6 @@
 use crate::inventory::inventory_with_root_limit;
+#[cfg(test)]
+use crate::InventoryEntry;
 use crate::{
     InventoryMetrics, InventoryOptions, InventoryReport, InventoryReportOptions, INVENTORY_VERSION,
 };
@@ -501,7 +503,7 @@ pub fn gateway_storage_report(options: GatewayStorageOptions) -> Result<GatewayS
                 .and_then(|measurements| measurements.get(path))
             {
                 unit.broad_measurement = Some(measurement.clone());
-                if measurement.traversal_complete && measurement.private_measurement_complete {
+                if measurement.traversal_complete {
                     unit.selected_measurement_source =
                         GatewayMeasurementSource::InventoryManifestExact;
                     continue;
@@ -530,9 +532,11 @@ pub fn gateway_storage_report(options: GatewayStorageOptions) -> Result<GatewayS
         let exact_measurements = index_inventory_measurements(exact);
         for manifest in &mut manifests {
             for unit in &mut manifest.units {
-                if unit.broad_measurement.as_ref().is_some_and(|measurement| {
-                    measurement.traversal_complete && measurement.private_measurement_complete
-                }) {
+                if unit
+                    .broad_measurement
+                    .as_ref()
+                    .is_some_and(|measurement| measurement.traversal_complete)
+                {
                     continue;
                 }
                 if let Some(path) = unit.canonical_path.as_ref() {
@@ -1173,7 +1177,8 @@ fn index_inventory_measurements(
 ) -> HashMap<PathBuf, GatewayFilesystemMeasurement> {
     let mut measurements = HashMap::new();
     for root in &inventory.roots {
-        measurements.insert(
+        insert_preferred_inventory_measurement(
+            &mut measurements,
             root.path.clone(),
             GatewayFilesystemMeasurement {
                 source: GatewayMeasurementSource::InventoryManifestExact,
@@ -1187,7 +1192,8 @@ fn index_inventory_measurements(
             },
         );
         for entry in &root.entries {
-            measurements.insert(
+            insert_preferred_inventory_measurement(
+                &mut measurements,
                 entry.path.clone(),
                 GatewayFilesystemMeasurement {
                     source: GatewayMeasurementSource::InventoryManifestExact,
@@ -1203,6 +1209,41 @@ fn index_inventory_measurements(
         }
     }
     measurements
+}
+
+fn insert_preferred_inventory_measurement(
+    measurements: &mut HashMap<PathBuf, GatewayFilesystemMeasurement>,
+    path: PathBuf,
+    candidate: GatewayFilesystemMeasurement,
+) {
+    match measurements.entry(path) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if inventory_measurement_is_preferred(entry.get(), &candidate) {
+                entry.insert(candidate);
+            }
+        }
+    }
+}
+
+fn inventory_measurement_is_preferred(
+    existing: &GatewayFilesystemMeasurement,
+    candidate: &GatewayFilesystemMeasurement,
+) -> bool {
+    let existing_is_exact_root = existing.visited_entries.is_some();
+    let candidate_is_exact_root = candidate.visited_entries.is_some();
+    if existing_is_exact_root != candidate_is_exact_root {
+        return candidate_is_exact_root;
+    }
+    if existing.traversal_complete != candidate.traversal_complete {
+        return candidate.traversal_complete;
+    }
+    if existing.private_measurement_complete != candidate.private_measurement_complete {
+        return candidate.private_measurement_complete;
+    }
+    candidate.scan_error_count < existing.scan_error_count
 }
 
 fn inventory_units_tolerating_disappearance(
@@ -1862,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_retained_inventory_entry_is_used_without_a_subpass() {
+    fn complete_retained_inventory_entry_is_used_without_a_private_bytes_subpass() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("gateway");
         let workspace = root.join("workspace");
@@ -1871,8 +1912,8 @@ mod tests {
         let metrics = InventoryMetrics {
             logical_bytes: 99,
             allocated_bytes: 4096,
-            private_reclaimable_bytes: 4096,
-            private_reclaimable_complete: true,
+            private_reclaimable_bytes: 0,
+            private_reclaimable_complete: false,
             files: 1,
             directories: 1,
             hardlink_duplicates: 0,
@@ -1919,6 +1960,7 @@ mod tests {
             GatewayMeasurementSource::InventoryManifestExact
         );
         assert_eq!(measurement.metrics.logical_bytes, 99);
+        assert!(!measurement.private_measurement_complete);
         assert_eq!(
             result.manifests[0].units[0].selected_measurement_source,
             GatewayMeasurementSource::InventoryManifestExact
@@ -2081,6 +2123,72 @@ mod tests {
 
         let measurements = index_inventory_measurements(&report);
         assert_eq!(measurements[&root_path].scan_error_count, 143);
+    }
+
+    #[test]
+    fn exact_inventory_root_wins_over_a_later_retained_child_entry() {
+        let unit_path = PathBuf::from("/gateway/unit");
+        let parent_path = PathBuf::from("/gateway");
+        let report = InventoryReport {
+            inventory_version: INVENTORY_VERSION,
+            generated_at_unix: 123,
+            options: InventoryReportOptions {
+                display_depth: 1,
+                top: 1,
+                max_entries: 100,
+                one_filesystem: true,
+            },
+            roots: vec![
+                InventoryRoot {
+                    path: unit_path.clone(),
+                    filesystem: "testfs".to_string(),
+                    complete: true,
+                    visited_entries: 4,
+                    metrics: InventoryMetrics {
+                        logical_bytes: 10,
+                        allocated_bytes: 20,
+                        private_reclaimable_bytes: 0,
+                        private_reclaimable_complete: false,
+                        files: 1,
+                        directories: 1,
+                        hardlink_duplicates: 0,
+                        errors: 0,
+                    },
+                    entries: Vec::new(),
+                    errors: Vec::new(),
+                },
+                InventoryRoot {
+                    path: parent_path.clone(),
+                    filesystem: "testfs".to_string(),
+                    complete: true,
+                    visited_entries: 5,
+                    metrics: InventoryMetrics::default(),
+                    entries: vec![InventoryEntry {
+                        path: unit_path.clone(),
+                        relative_path: PathBuf::from("unit"),
+                        parent: parent_path,
+                        depth: 1,
+                        metrics: InventoryMetrics {
+                            logical_bytes: 99,
+                            allocated_bytes: 100,
+                            private_reclaimable_bytes: 100,
+                            private_reclaimable_complete: true,
+                            files: 1,
+                            directories: 1,
+                            hardlink_duplicates: 0,
+                            errors: 0,
+                        },
+                    }],
+                    errors: Vec::new(),
+                },
+            ],
+        };
+
+        let measurements = index_inventory_measurements(&report);
+        let selected = &measurements[&unit_path];
+        assert_eq!(selected.visited_entries, Some(4));
+        assert_eq!(selected.metrics.logical_bytes, 10);
+        assert!(!selected.private_measurement_complete);
     }
 
     #[test]
