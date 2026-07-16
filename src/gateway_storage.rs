@@ -8,7 +8,7 @@ use percent_encoding::percent_decode_str;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -412,6 +412,10 @@ pub fn gateway_storage_report(options: GatewayStorageOptions) -> Result<GatewayS
         "unsupported inventory version {} (expected {INVENTORY_VERSION})",
         inventory.inventory_version
     );
+    let inventory_measurements = inventory
+        .options
+        .one_filesystem
+        .then(|| index_inventory_measurements(&inventory));
 
     let (manifest_paths, snapshots) = discover_manifest_paths(
         &options.gateway_manifests,
@@ -492,7 +496,10 @@ pub fn gateway_storage_report(options: GatewayStorageOptions) -> Result<GatewayS
             let Some(path) = unit.canonical_path.as_ref() else {
                 continue;
             };
-            if let Some(measurement) = exact_inventory_measurement(&inventory, path) {
+            if let Some(measurement) = inventory_measurements
+                .as_ref()
+                .and_then(|measurements| measurements.get(path))
+            {
                 unit.broad_measurement = Some(measurement.clone());
                 if measurement.traversal_complete && measurement.private_measurement_complete {
                     unit.selected_measurement_source =
@@ -507,7 +514,7 @@ pub fn gateway_storage_report(options: GatewayStorageOptions) -> Result<GatewayS
     let exact_report = if subpass_paths.is_empty() {
         None
     } else {
-        Some(inventory_with_root_limit(
+        Some(inventory_units_tolerating_disappearance(
             &subpass_paths.iter().cloned().collect::<Vec<_>>(),
             InventoryOptions {
                 display_depth: 0,
@@ -515,11 +522,12 @@ pub fn gateway_storage_report(options: GatewayStorageOptions) -> Result<GatewayS
                 max_entries: options.exact_max_entries,
                 one_filesystem: true,
             },
-            Some(options.exact_max_entries_per_unit),
+            options.exact_max_entries_per_unit,
         )?)
     };
 
     if let Some(exact) = exact_report.as_ref() {
+        let exact_measurements = index_inventory_measurements(exact);
         for manifest in &mut manifests {
             for unit in &mut manifest.units {
                 if unit.broad_measurement.as_ref().is_some_and(|measurement| {
@@ -529,7 +537,7 @@ pub fn gateway_storage_report(options: GatewayStorageOptions) -> Result<GatewayS
                 }
                 if let Some(path) = unit.canonical_path.as_ref() {
                     unit.exact_measurement =
-                        exact_inventory_measurement(exact, path).map(|mut value| {
+                        exact_measurements.get(path).cloned().map(|mut value| {
                             value.source = GatewayMeasurementSource::ExactUnitSubpass;
                             value
                         });
@@ -1160,13 +1168,14 @@ fn root_observation(
     }
 }
 
-fn exact_inventory_measurement(
+fn index_inventory_measurements(
     inventory: &InventoryReport,
-    path: &Path,
-) -> Option<GatewayFilesystemMeasurement> {
+) -> HashMap<PathBuf, GatewayFilesystemMeasurement> {
+    let mut measurements = HashMap::new();
     for root in &inventory.roots {
-        if root.path == path {
-            return Some(GatewayFilesystemMeasurement {
+        measurements.insert(
+            root.path.clone(),
+            GatewayFilesystemMeasurement {
                 source: GatewayMeasurementSource::InventoryManifestExact,
                 inventory_generated_at_unix: inventory.generated_at_unix,
                 filesystem: root.filesystem.clone(),
@@ -1175,22 +1184,78 @@ fn exact_inventory_measurement(
                 visited_entries: Some(root.visited_entries),
                 scan_error_count: root.errors.len(),
                 metrics: root.metrics.clone(),
-            });
-        }
-        if let Some(entry) = root.entries.iter().find(|entry| entry.path == path) {
-            return Some(GatewayFilesystemMeasurement {
-                source: GatewayMeasurementSource::InventoryManifestExact,
-                inventory_generated_at_unix: inventory.generated_at_unix,
-                filesystem: root.filesystem.clone(),
-                traversal_complete: root.complete && root.errors.is_empty(),
-                private_measurement_complete: entry.metrics.private_reclaimable_complete,
-                visited_entries: None,
-                scan_error_count: root.errors.len(),
-                metrics: entry.metrics.clone(),
-            });
+            },
+        );
+        for entry in &root.entries {
+            measurements.insert(
+                entry.path.clone(),
+                GatewayFilesystemMeasurement {
+                    source: GatewayMeasurementSource::InventoryManifestExact,
+                    inventory_generated_at_unix: inventory.generated_at_unix,
+                    filesystem: root.filesystem.clone(),
+                    traversal_complete: root.complete && root.errors.is_empty(),
+                    private_measurement_complete: entry.metrics.private_reclaimable_complete,
+                    visited_entries: None,
+                    scan_error_count: root.errors.len(),
+                    metrics: entry.metrics.clone(),
+                },
+            );
         }
     }
-    None
+    measurements
+}
+
+fn inventory_units_tolerating_disappearance(
+    paths: &[PathBuf],
+    options: InventoryOptions,
+    max_entries_per_unit: u64,
+) -> Result<InventoryReport> {
+    let mut roots = Vec::with_capacity(paths.len());
+    let mut remaining_entries = options.max_entries;
+    let mut generated_at_unix = now_unix_millis() / 1_000;
+    for path in paths {
+        if remaining_entries == 0 {
+            break;
+        }
+        let report = inventory_with_root_limit(
+            std::slice::from_ref(path),
+            InventoryOptions {
+                max_entries: remaining_entries,
+                ..options.clone()
+            },
+            Some(max_entries_per_unit),
+        );
+        match report {
+            Ok(report) => {
+                generated_at_unix = generated_at_unix.max(report.generated_at_unix);
+                if let Some(root) = report.roots.into_iter().next() {
+                    remaining_entries = remaining_entries.saturating_sub(root.visited_entries);
+                    roots.push(root);
+                }
+            }
+            Err(error) if error_chain_contains_not_found(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(InventoryReport {
+        inventory_version: INVENTORY_VERSION,
+        generated_at_unix,
+        options: InventoryReportOptions {
+            display_depth: options.display_depth,
+            top: options.top,
+            max_entries: options.max_entries,
+            one_filesystem: options.one_filesystem,
+        },
+        roots,
+    })
+}
+
+fn error_chain_contains_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 fn discover_manifest_paths(
@@ -1485,14 +1550,13 @@ fn validate_percent_escapes(value: &str, label: &str) -> Result<()> {
             index + 2 < bytes.len(),
             "{label} has an incomplete percent escape"
         );
-        let digits = &value[index + 1..index + 3];
+        let high = bytes[index + 1];
+        let low = bytes[index + 2];
         ensure!(
-            digits
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte)),
+            is_uppercase_hex(high) && is_uppercase_hex(low),
             "{label} percent escapes must use uppercase hexadecimal"
         );
-        let decoded = u8::from_str_radix(digits, 16).expect("validated hexadecimal escape");
+        let decoded = (hex_value(high) << 4) | hex_value(low);
         ensure!(
             decoded != b'/' && decoded != b'\\',
             "{label} must not percent-encode a path separator"
@@ -1500,6 +1564,18 @@ fn validate_percent_escapes(value: &str, label: &str) -> Result<()> {
         index += 3;
     }
     Ok(())
+}
+
+fn is_uppercase_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte)
+}
+
+fn hex_value(byte: u8) -> u8 {
+    if byte.is_ascii_digit() {
+        byte - b'0'
+    } else {
+        byte - b'A' + 10
+    }
 }
 
 fn validate_nonempty(label: &str, value: &str) -> Result<()> {
@@ -1845,6 +1921,102 @@ mod tests {
         );
         assert!(result.manifests[0].units[0].exact_measurement.is_none());
         assert!(result.exact_measurement.is_none());
+    }
+
+    #[test]
+    fn cross_filesystem_retained_inventory_is_remeasured_with_one_filesystem() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("gateway");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("db"), b"workspace").unwrap();
+        let inventory = temp.path().join("inventory.json");
+        write_json(
+            &inventory,
+            &InventoryReport {
+                inventory_version: INVENTORY_VERSION,
+                generated_at_unix: 123,
+                options: InventoryReportOptions {
+                    display_depth: 0,
+                    top: 1,
+                    max_entries: 1000,
+                    one_filesystem: false,
+                },
+                roots: vec![InventoryRoot {
+                    path: fs::canonicalize(&workspace).unwrap(),
+                    filesystem: "cross-filesystem".to_string(),
+                    complete: true,
+                    visited_entries: 1,
+                    metrics: InventoryMetrics {
+                        logical_bytes: 99_999,
+                        allocated_bytes: 99_999,
+                        private_reclaimable_bytes: 99_999,
+                        private_reclaimable_complete: true,
+                        files: 1,
+                        directories: 1,
+                        hardlink_duplicates: 0,
+                        errors: 0,
+                    },
+                    entries: Vec::new(),
+                    errors: Vec::new(),
+                }],
+            },
+        );
+        let manifest = temp.path().join("gateway.json");
+        write_json(
+            &manifest,
+            &report(
+                "report-code",
+                "code-root",
+                &root,
+                vec![unit(
+                    "code-root",
+                    "workspace-a",
+                    &workspace,
+                    "workspace-pglite",
+                    "canonical-durable",
+                    "workspace-id",
+                )],
+            ),
+        );
+
+        let result = gateway_storage_report(options(&inventory, vec![manifest])).unwrap();
+        let evidence = &result.manifests[0].units[0];
+        assert!(evidence.broad_measurement.is_none());
+        assert_eq!(
+            evidence.selected_measurement_source,
+            GatewayMeasurementSource::ExactUnitSubpass
+        );
+        assert_eq!(
+            evidence.exact_measurement.as_ref().unwrap().source,
+            GatewayMeasurementSource::ExactUnitSubpass
+        );
+        assert!(result.exact_measurement.as_ref().unwrap().one_filesystem);
+    }
+
+    #[test]
+    fn exact_subpass_keeps_existing_units_when_another_unit_disappears() {
+        let temp = TempDir::new().unwrap();
+        let existing = temp.path().join("existing");
+        let missing = temp.path().join("missing");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("data"), b"data").unwrap();
+
+        let result = inventory_units_tolerating_disappearance(
+            &[existing.clone(), missing],
+            InventoryOptions {
+                display_depth: 0,
+                top: 1,
+                max_entries: 100,
+                one_filesystem: true,
+            },
+            50,
+        )
+        .unwrap();
+
+        assert_eq!(result.roots.len(), 1);
+        assert_eq!(result.roots[0].path, fs::canonicalize(existing).unwrap());
+        assert!(result.options.one_filesystem);
     }
 
     #[test]
@@ -2457,6 +2629,7 @@ mod tests {
                 "{uri} should be rejected"
             );
         }
+        assert!(local_file_uri_path("file:///tmp/%😀", "localUnitUri").is_err());
         #[cfg(not(windows))]
         assert_eq!(
             local_file_uri_path("file:///tmp/space%20name", "localUnitUri").unwrap(),

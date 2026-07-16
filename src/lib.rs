@@ -1,6 +1,6 @@
 mod cargo_incremental;
 mod cargo_profiles;
-pub mod gateway_storage;
+mod gateway_storage;
 mod inventory;
 #[cfg(target_os = "macos")]
 mod macos_open_handles;
