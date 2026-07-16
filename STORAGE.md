@@ -12,6 +12,11 @@ This separation lets inventory inspect broad roots while cleanup remains
 manifest-driven, approval-friendly, and specific to content whose meaning the
 tool understands.
 
+The accepted [source-safe rebuildable-state controller RFC](docs/rfcs/0001-rebuildable-state-controller.md)
+separates conservative worktree retention from aggressive generated-artifact
+recovery. Current releases still contain TTL-first behavior in places; the
+implementation plan below identifies the migration to ownership-first policy.
+
 ## Inventory contract
 
 An inventory scan visits each requested directory root once and aggregates
@@ -115,70 +120,103 @@ execution surface. Its versioned JSON report is independently readable so a
 later machine-wide survey can compose the completed correlation without
 copying Gateway schema knowledge or repeating the exact-path subpass.
 
+## Source and rebuildable-state policy
+
+Worktree source and generated artifacts have different durability. Source can
+contain unique human work and context; generated state spends only a known
+recovery operation. The controller therefore has three ordered cleanup tiers:
+
+1. **Granular active cleanup.** Prune superseded generations inside actively
+   owned build trees while preserving the locked current working set.
+2. **Coarse owner-free cleanup.** Remove complete `target`, `.next`, `.turbo`,
+   project-local `node_modules`, and equivalent trees when complete ownership
+   evidence finds no current owner. The source worktree may be recent or dirty.
+3. **Conservative worktree cleanup.** Remove the worktree only after separate
+   source-safety, reachability, inactivity, and protection checks.
+
+Current ownership is positive evidence such as open handles, process cwd or
+mapped files, owner locks, a live runtime, or an explicit artifact lease. A
+recent commit or worktree mtime is not ownership. Age remains useful as an
+anti-thrash cooldown and ranking tie-breaker, but it is not the primary
+authority for retaining rebuildable state.
+
+This separation also applies to protections. A source lease should prevent
+whole-worktree removal without implicitly pinning every generated descendant.
+Artifact and runtime leases protect exact warm or live outputs. Existing
+recursive leases remain broad until explicitly migrated; the controller never
+silently weakens them.
+
 ## Pressure policy
 
-Routine policy can remove uncontroversially stale, recoverable content even
-when free space is healthy. Pressure policy answers a different question: how
-much additional rebuild cost should the machine spend to reach a free-space
-target such as 100 or 150 GiB?
+Routine policy prevents generated state from accreting until the machine is
+already full. Pressure policy decides how much additional rebuild cost to
+spend to restore a free-space target, initially entering below 100 GiB and
+recovering toward 150 GiB.
 
-Once candidate measurements are cached, pressure order should prefer:
+Safety gates determine eligibility. Within a filesystem, pressure order is:
 
-1. candidates already eligible under routine TTL policy;
-2. lower recovery cost;
-3. lower probability of near-term reuse;
-4. larger private reclaim;
-5. older evidence/activity as a stable tie-breaker.
+1. granular superseded-state cleanup in actively owned artifacts;
+2. owner-free coarse cleanup from low through higher rebuild-cost classes;
+3. conservative source-safe worktree cleanup;
+4. owner-mediated or durable domains only through their own contracts.
 
-The controller continues to check live free space after each operation. APFS
-private bytes improve ordering and planning; realized filesystem availability
-remains the stop condition.
+Within a tier and rebuild-cost class, prefer larger complete APFS-private
+reclaim, then lower near-term reuse evidence, then older artifact activity as
+a stable tie-breaker. Source-worktree age is not a primary generated-artifact
+ranking key.
 
-Generated-directory cleanup applies the inventory primitive only after safety
-classification. Delete candidates share one sequential global entry budget
-and a smaller per-candidate slice; their complete or partial measurements are
-persisted in manifest version 5. When the evidence budget cannot cover every
-candidate, pressure candidates and lower rebuild-cost classes are measured
-first.
-Pressure execution preserves rebuild-cost classes, orders exact candidates
-machine-wide by private reclaim and observed allocation, refreshes safety, and
-executes one candidate before checking free space again. Routine TTL order
-remains age-based.
+Pressure may admit young owner-free artifacts, including output created the
+previous day. It never bypasses canonical containment, tracked-file checks,
+complete ownership evidence, locks, protection scope, exact identity, or
+execution-time revalidation.
+
+The controller checks live free space after every exact operation and stops at
+the configured target. APFS-private bytes improve ordering; realized
+filesystem availability remains authoritative. If safe rebuildable candidates
+cannot reach the target, the controller reports the remaining durable or
+owner-mediated domains rather than widening deletion authority automatically.
 
 ## Incremental delivery
 
-The implementation order is intentionally useful after every merge:
+The implementation order is intentionally useful after every merge. Landed
+foundations remain valuable even where their original TTL-first policy needs
+revision.
 
-1. **APFS-aware inventory CLI.** Safely map large roots and export structured
-   evidence without changing scheduled cleanup.
-2. **Measured generated candidates.** Reuse inventory measurements for the
-   existing `target`, `.next`, `.turbo`, and `node_modules` collectors. Store
-   measurements in manifests and rank safe pressure candidates by physical
-   benefit inside their rebuild-cost class.
-3. **Bounded scheduling and first activation.** Make repository concurrency an
-   explicit scheduled-mode setting, retain hard inventory/measurement budgets,
-   and validate a complete dry-run manifest before enabling execution. Roots
-   such as Codex-managed Git worktrees can then reuse the existing generated
-   collectors; task metadata is advisory, while protections, Git state, open
-   handles, Cargo locks, and execution-time revalidation remain authoritative.
-4. **Shared package-store collectors.** Discover pnpm's canonical content store
+1. **Landed: APFS-aware inventory and exact candidate evidence.** Broad scans,
+   hard-link and clone-aware measurements, manifest identities, and live `df`
+   verification establish physical evidence without granting deletion
+   authority.
+2. **Landed: measured generated candidates and owner adapters.** Generated
+   roots can be ranked by private reclaim, while Gateway and other durable
+   domains preserve owner-issued liveness and remain report-only.
+3. **Next: split source, artifact, runtime, and legacy protection scopes.** A
+   source lease must be able to protect worktree context without indefinitely
+   retaining rebuildable descendants. Existing recursive leases stay broad
+   until explicitly migrated.
+4. **Next: owner-free coarse generated cleanup.** Make current ownership and
+   recoverability the eligibility boundary for complete generated-tree
+   deletion. Treat elapsed/workday age as cooldown and ranking evidence. Admit
+   project-local `node_modules` after lower rebuild-cost classes.
+5. **Next: active-target granular budgets.** Extend incremental pruning and
+   coherent Cargo profile reset with a reviewed active-target size policy so
+   current worktrees do not accrete indefinitely.
+6. **Controller activation.** Retain bounded repository concurrency, global
+   measurement budgets, bounded pressure waves, per-path safety guards, and
+   live free-space stop checks. Compare supervised plans with manual disk-map
+   judgments before enabling unattended execution.
+7. **Shared package-store collectors.** Discover pnpm's canonical content store
    through pnpm and wrap official prune semantics with preflight, protections,
-   measurement, and verification. Treat pnpm's metadata and `dlx` caches as a
-   separate candidate domain: their path allocation can be mostly shared on
-   APFS, and their retention contract is not the content store's prune contract.
-5. **Container/VM collectors.** Treat Docker/OrbStack, Lima, and Parallels as
-   separate domains. Use their public inventory/prune/compact interfaces and
-   surface running or suspended state. VM deletion or archival remains an
-   explicit user decision.
-6. **Owner-mediated advisors and collectors.** Large IDE, browser, session-log,
-   and application stores begin report-only. Activity must come from the
-   owning application's task/database model rather than generic file mtimes
-   when the owner rewrites or reindexes old content. A domain graduates to
-   cleanup only after it has a stable liveness model, a recoverable-content or
-   durable-export boundary, and an owner-approved execution operation.
+   measurement, and verification. Keep store, metadata, and `dlx` contracts
+   separate from project-local `node_modules` cleanup.
+8. **Other owner-mediated domains.** Docker/OrbStack, IDE diagnostics, browser
+   state, and similar domains use owner operations. Application databases,
+   evidence, and VM storage remain report-only until explicit retention or
+   export contracts exist. Parallels deletion is outside generic cleanup.
 
-This sequence starts reclaiming better-ranked repository artifacts in step 2,
-makes unattended activation bounded in step 3, and then adds machine-wide
-domains one at a time. Inventory caches can later make scheduled discovery
-incremental, but cached measurements must always include their observation
-time and be revalidated before mutation.
+The immediate center of gravity is step 4: deleting whole rebuildable trees
+from owner-free worktrees without spending source-state risk. Step 5 prevents
+the same long tail from regrowing inside active worktrees. Whole-worktree
+removal remains conservative and is not the primary disk-recovery mechanism.
+
+Inventory caches can later make discovery incremental, but cached evidence
+must retain its observation time and be revalidated before mutation.
