@@ -1,5 +1,6 @@
 mod cargo_incremental;
 mod cargo_profiles;
+mod gateway_storage;
 mod inventory;
 #[cfg(target_os = "macos")]
 mod macos_open_handles;
@@ -27,6 +28,11 @@ use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
+pub use gateway_storage::{
+    gateway_storage_report, print_gateway_storage_report, GatewayStorageOptions,
+    GatewayStorageReport, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES,
+    DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT,
+};
 pub use inventory::{
     inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
     InventoryReport, InventoryReportOptions, InventoryRoot, InventoryScanError, INVENTORY_VERSION,

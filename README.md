@@ -222,6 +222,45 @@ incomplete instead of hiding every later sibling.
 The durable collector contract and incremental delivery order are documented
 in [`STORAGE.md`](STORAGE.md).
 
+### Gateway owner reports
+
+`gateway-storage-report` correlates a saved inventory with one or more
+extension-issued `GatewayStorageInventoryV1` reports. It is a standalone,
+report-only adapter: it cannot clean storage, emit an execution command, or
+turn filesystem observations into owner activity, protection, export, or
+eligibility claims.
+
+```sh
+worktree-gc gateway-storage-report \
+  --inventory-manifest inventory.json \
+  --gateway-manifest gateway-code.json \
+  --gateway-manifest-dir "$CODE_GLOBAL_STORAGE/storage-inventory-v1" \
+  --json > gateway-storage-report.json
+```
+
+Explicit manifests and repeatable manifest directories may be combined.
+Directory discovery is non-recursive, accepts only regular `.json` files,
+sorts and deduplicates canonical paths, and has fixed file-count and byte
+budgets. Owner `file:///` URIs are validated and canonically contained before
+correlation. If the saved inventory did not retain an exact unit path, the
+adapter runs one exact-path, one-filesystem inventory subpass under a shared
+global and per-unit entry budget; it never substitutes an ancestor's total.
+
+Stable and Insiders observations remain independent and non-additive. A shared
+`rootId` at the same canonical root is reported as such. If the same `rootId`
+names different owner root URIs, filesystem correlation is suppressed instead
+of guessing which owner identity is authoritative. Different root IDs that
+resolve to the same physical root receive a separate non-additive overlap
+group. Each unit explicitly selects `inventory-manifest-exact`,
+`exact-unit-subpass`, or `unavailable` as its filesystem evidence source.
+For closed owner snapshots, the correlated unit also exposes
+`derived_closed_age_ms` with basis `owner-snapshot-plus-manifest-elapsed`. This
+adds elapsed time since the immutable owner report to its original
+`closedAgeMs`; the source value remains unchanged under `owner_report`, and the
+derived value does not upgrade liveness or cleanup eligibility.
+JSON output intentionally retains the owner-issued local URIs for local
+reconciliation and is not a support-safe export artifact.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but

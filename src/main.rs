@@ -5,12 +5,15 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories, inventory,
-    list_protections, print_cleanup, print_inventory, print_root_cleanup, print_root_triage,
+    add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories,
+    gateway_storage_report, inventory, list_protections, print_cleanup,
+    print_gateway_storage_report, print_inventory, print_root_cleanup, print_root_triage,
     print_triage, remove_protection, renew_protection, triage, triage_roots, CleanupOptions,
-    GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit, SweepStrategy, SweepTool,
-    TriageOptions, DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
-    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    GatewayStorageOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit,
+    SweepStrategy, SweepTool, TriageOptions, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES,
+    DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT, DEFAULT_GENERATED_DAYS,
+    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -63,6 +66,26 @@ enum Command {
         cross_filesystems: bool,
 
         #[arg(long, help = "Write the complete structured report as JSON")]
+        json: bool,
+    },
+    /// Correlate extension-owned Gateway storage reports with bounded filesystem evidence
+    GatewayStorageReport {
+        #[arg(long, value_name = "PATH")]
+        inventory_manifest: PathBuf,
+
+        #[arg(long = "gateway-manifest", value_name = "PATH")]
+        gateway_manifests: Vec<PathBuf>,
+
+        #[arg(long = "gateway-manifest-dir", value_name = "PATH")]
+        gateway_manifest_dirs: Vec<PathBuf>,
+
+        #[arg(long, default_value_t = DEFAULT_GATEWAY_EXACT_MAX_ENTRIES)]
+        exact_max_entries: u64,
+
+        #[arg(long, default_value_t = DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT)]
+        exact_max_entries_per_unit: u64,
+
+        #[arg(long, help = "Write the complete report-only correlation as JSON")]
         json: bool,
     },
     #[command(visible_alias = "audit")]
@@ -443,6 +466,32 @@ fn main() -> Result<()> {
                 println!();
             } else {
                 print_inventory(&report);
+            }
+        }
+        Command::GatewayStorageReport {
+            inventory_manifest,
+            gateway_manifests,
+            gateway_manifest_dirs,
+            exact_max_entries,
+            exact_max_entries_per_unit,
+            json,
+        } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "gateway-storage-report consumes manifests directly; do not pass --repo or --root"
+            );
+            let report = gateway_storage_report(GatewayStorageOptions {
+                inventory_manifest,
+                gateway_manifests,
+                gateway_manifest_dirs,
+                exact_max_entries,
+                exact_max_entries_per_unit,
+            })?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+                println!();
+            } else {
+                print_gateway_storage_report(&report);
             }
         }
         Command::Triage {
@@ -873,6 +922,44 @@ mod tests {
                 assert_eq!(top, 7);
                 assert_eq!(max_entries, 99);
                 assert!(!cross_filesystems);
+                assert!(json);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn gateway_storage_cli_accepts_explicit_and_directory_manifests() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "gateway-storage-report",
+            "--inventory-manifest",
+            "/tmp/inventory.json",
+            "--gateway-manifest",
+            "/tmp/code.json",
+            "--gateway-manifest-dir",
+            "/tmp/insiders",
+            "--exact-max-entries",
+            "1000",
+            "--exact-max-entries-per-unit",
+            "100",
+            "--json",
+        ])
+        .expect("Gateway storage CLI should parse");
+        match cli.command {
+            Command::GatewayStorageReport {
+                inventory_manifest,
+                gateway_manifests,
+                gateway_manifest_dirs,
+                exact_max_entries,
+                exact_max_entries_per_unit,
+                json,
+            } => {
+                assert_eq!(inventory_manifest, PathBuf::from("/tmp/inventory.json"));
+                assert_eq!(gateway_manifests, [PathBuf::from("/tmp/code.json")]);
+                assert_eq!(gateway_manifest_dirs, [PathBuf::from("/tmp/insiders")]);
+                assert_eq!(exact_max_entries, 1000);
+                assert_eq!(exact_max_entries_per_unit, 100);
                 assert!(json);
             }
             _ => unreachable!(),
