@@ -319,6 +319,9 @@ enter_free_space = "100GiB"
 target_free_space = "150GiB"
 generated_days = 1
 stale_days = 7
+# Opt in to age-independent coarse cleanup only when ownership evidence is
+# complete and the whole source worktree is owner-free.
+owner_free_generated = true
 
 [history]
 retention_days = 90
@@ -343,13 +346,22 @@ reclaiming pressure-only candidates until their filesystem reaches
 single threshold. Routine TTL candidates still run regardless of free space.
 
 Pressure mode lowers generated-directory and clean-worktree windows to the
-configured values. Dirty, detached, current, tracked, open, and explicitly
-protected content keeps the same safety rules. Rebuildable directories are
-ordered by expected rebuild cost (`.turbo`, `.next`, `target`, then
-`node_modules`) across all repositories. Inside each rebuild-cost class, the
-controller prefers the largest conservative APFS-private reclaim, then the
-largest observed allocation, then the oldest activity. It refreshes and
-executes one exact candidate at a time; clean worktrees come last.
+configured values. With `owner_free_generated = true`, pressure cleanup may
+also remove a complete generated tree without waiting for its age window when
+the ownership snapshot is complete and finds no open file, mapped file,
+process cwd/root, or other vnode anywhere in the owning worktree. Incomplete
+ownership evidence fails closed. This option requires
+`cleanup.check_in_use = true`.
+
+Dirty source does not by itself retain an ignored or untracked generated tree,
+but tracked content and every existing recursive protection still do. Current
+broad protections therefore remain broad until they are explicitly migrated
+to the scoped model described in the RFC. Rebuildable directories are ordered
+by expected rebuild cost (`.turbo`, `.next`, `target`, then `node_modules`)
+across all repositories. Inside each rebuild-cost class, the controller prefers
+the largest conservative APFS-private reclaim, then the largest observed
+allocation, then the oldest activity. It refreshes and executes one exact
+candidate at a time; clean worktrees come last.
 The aggregate manifest records the policy, initial free-space observations,
 which decisions exist only because of pressure, and final free space after an
 executing run. Generated delete decisions also record logical, allocated, and

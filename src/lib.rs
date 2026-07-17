@@ -50,7 +50,7 @@ pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", "
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
 pub const DEFAULT_CARGO_PROFILE_SWEEP_DAYS: u64 = 7;
-pub const MANIFEST_VERSION: u64 = 5;
+pub const MANIFEST_VERSION: u64 = 6;
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -103,6 +103,7 @@ pub struct PressurePolicy {
     pub target_bytes: u64,
     pub generated_days: u64,
     pub stale_days: u64,
+    pub owner_free_generated: bool,
     pub active: bool,
     pub entered_filesystems: Vec<String>,
 }
@@ -229,6 +230,9 @@ pub struct GeneratedDirInfo {
     pub mtime: Option<String>,
     pub effective_days: u64,
     pub in_use: bool,
+    pub ownership_evidence_complete: bool,
+    pub worktree_in_use: bool,
+    pub owner_free_pressure: bool,
     pub protection: Option<ProtectionMatch>,
     pub cleanup_class: CleanupClass,
     pub sweeps: Vec<SweepDecision>,
@@ -283,6 +287,9 @@ pub struct GeneratedDirDecision {
     pub mtime_unix: Option<i64>,
     pub effective_days: u64,
     pub in_use: bool,
+    pub ownership_evidence_complete: bool,
+    pub worktree_in_use: bool,
+    pub owner_free_pressure: bool,
     pub protection: Option<ProtectionMatch>,
     pub cleanup_class: CleanupClass,
     pub measurement: Option<GeneratedDirMeasurement>,
@@ -702,6 +709,9 @@ fn plan_cleanup_with_protections(
             mtime_unix: dir.mtime_unix,
             effective_days: dir.effective_days,
             in_use: dir.in_use,
+            ownership_evidence_complete: dir.ownership_evidence_complete,
+            worktree_in_use: dir.worktree_in_use,
+            owner_free_pressure: dir.owner_free_pressure,
             protection: dir.protection.clone(),
             cleanup_class: dir.cleanup_class,
             measurement: None,
@@ -2082,6 +2092,12 @@ fn scan_generated_dirs_for_worktree(
     let candidates = generated_candidates(worktree, config)?;
     let ignored_paths = git_ignored_paths(&worktree.path, &candidates)?;
     let tracked_paths = git_tracked_paths(&worktree.path, &candidates)?;
+    let ownership_evidence_complete = policy.check_in_use
+        && matches!(
+            policy.open_handle_snapshot,
+            Some(OpenHandleSnapshot::Available(_))
+        );
+    let mut worktree_in_use = None;
     let open_generated_dirs = if policy.check_in_use {
         dirs_with_open_handles(
             candidates.iter().map(|candidate| candidate.path.as_path()),
@@ -2095,6 +2111,10 @@ fn scan_generated_dirs_for_worktree(
         let protection = protection_for_path(&candidate.path, protections);
         let routine_days = config.effective_days(&candidate.name, policy.generated_days);
         let pressure_applies = pressure_applies(&candidate.path, policy.pressure)?;
+        let owner_free_pressure_mode = pressure_applies
+            && policy
+                .pressure
+                .is_some_and(|pressure| pressure.owner_free_generated);
         let effective_days = if pressure_applies {
             routine_days.min(
                 policy
@@ -2128,16 +2148,38 @@ fn scan_generated_dirs_for_worktree(
             .and_then(|unix| age_days(policy.now, unix))
             .is_some_and(|days| days < routine_days);
         let routine_active = routine_worktree_recent || routine_dir_recent;
+        let candidate_in_use = open_generated_dirs.contains(&candidate.path);
+        let active = worktree_recent || dir_recent;
+        let owner_free_age_bypass = owner_free_pressure_mode && active;
+        let worktree_in_use = if owner_free_age_bypass {
+            *worktree_in_use.get_or_insert_with(|| {
+                policy.check_in_use
+                    && dirs_with_open_handles(
+                        std::iter::once(worktree.path.as_path()),
+                        policy.open_handle_snapshot,
+                    )
+                    .contains(&worktree.path)
+            })
+        } else {
+            false
+        };
 
         // Only pay for the open-handle probe when the directory would
-        // otherwise be deleted.
+        // otherwise be deleted, except in owner-free pressure mode where
+        // complete ownership evidence is the eligibility boundary.
         let deletable_so_far = candidate.action == GeneratedCandidateAction::Delete
             && !worktree_recent
             && !dir_recent
             && !has_tracked_files;
-        let in_use = deletable_so_far && open_generated_dirs.contains(&candidate.path);
+        let in_use = candidate_in_use && (deletable_so_far || owner_free_pressure_mode);
+        let owner_free_pressure = owner_free_age_bypass
+            && ownership_evidence_complete
+            && !worktree_in_use
+            && !candidate_in_use
+            && protection.is_none()
+            && candidate.action == GeneratedCandidateAction::Delete
+            && !has_tracked_files;
         let sweep_strategies = config.sweep_strategies(&candidate.name);
-        let active = worktree_recent || dir_recent;
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
             && protection.is_none()
             && (routine_active || candidate.action == GeneratedCandidateAction::SweepOnly)
@@ -2170,11 +2212,34 @@ fn scan_generated_dirs_for_worktree(
                     lease.reason
                 ),
             )
+        } else if owner_free_age_bypass && !ownership_evidence_complete {
+            (
+                GeneratedDirAction::Skip,
+                "owner-free pressure cleanup requires complete ownership evidence".to_string(),
+            )
         } else if in_use {
             (
                 GeneratedDirAction::Skip,
                 "a running process has open files in this directory".to_string(),
             )
+        } else if owner_free_age_bypass && worktree_in_use {
+            if has_sweep_work {
+                let descriptions = sweeps
+                    .iter()
+                    .filter(|sweep| sweep.has_work())
+                    .map(|sweep| format!("{}: {}", sweep_tool_name(&sweep.tool), sweep.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                (
+                    GeneratedDirAction::Sweep,
+                    format!("owned worktree with sweep work: {descriptions}"),
+                )
+            } else {
+                (
+                    GeneratedDirAction::Skip,
+                    "worktree has current process ownership evidence".to_string(),
+                )
+            }
         } else if candidate.action == GeneratedCandidateAction::SweepOnly {
             if has_tracked_files {
                 (
@@ -2207,7 +2272,7 @@ fn scan_generated_dirs_for_worktree(
                     },
                 )
             }
-        } else if active {
+        } else if active && !owner_free_pressure {
             if has_sweep_work {
                 let descriptions = sweeps
                     .iter()
@@ -2246,24 +2311,33 @@ fn scan_generated_dirs_for_worktree(
         } else if ignored {
             (
                 GeneratedDirAction::Delete,
-                "ignored generated directory".to_string(),
+                if owner_free_pressure {
+                    "owner-free ignored generated directory".to_string()
+                } else {
+                    "ignored generated directory".to_string()
+                },
             )
         } else {
             (
                 GeneratedDirAction::Delete,
-                "untracked generated directory".to_string(),
+                if owner_free_pressure {
+                    "owner-free untracked generated directory".to_string()
+                } else {
+                    "untracked generated directory".to_string()
+                },
             )
         };
         let cleanup_class = if action == GeneratedDirAction::Delete
             && pressure_applies
-            && effective_days < routine_days
-            && routine_active
+            && (owner_free_pressure || (effective_days < routine_days && routine_active))
         {
             CleanupClass::Pressure
         } else {
             CleanupClass::Routine
         };
-        let reason = if cleanup_class == CleanupClass::Pressure {
+        let reason = if owner_free_pressure {
+            format!("pressure cleanup bypasses artifact age: {reason}")
+        } else if cleanup_class == CleanupClass::Pressure {
             format!("pressure cleanup below the {routine_days}-day routine window: {reason}")
         } else {
             reason
@@ -2279,6 +2353,9 @@ fn scan_generated_dirs_for_worktree(
             mtime: mtime_unix.map(format_unix_time),
             effective_days,
             in_use,
+            ownership_evidence_complete,
+            worktree_in_use,
+            owner_free_pressure,
             protection,
             cleanup_class,
             sweeps,
@@ -3045,6 +3122,21 @@ fn execute_cleanup(
     } else {
         HashSet::new()
     };
+    let owner_free_worktrees = generated_deletions
+        .iter()
+        .filter(|decision| decision.owner_free_pressure)
+        .map(|decision| decision.worktree_path.clone())
+        .collect::<HashSet<_>>();
+    let execution_owned_worktrees = if manifest.check_in_use {
+        dirs_with_open_handles(
+            owner_free_worktrees.iter().map(PathBuf::as_path),
+            execution_open_handles.as_ref(),
+        )
+    } else {
+        // An owner-free decision must never survive a malformed or stale
+        // manifest that omitted the ownership recheck.
+        owner_free_worktrees
+    };
 
     eprintln!(
         "executing {pass:?} cleanup: {} worktrees, {} generated dirs, {} sweeps",
@@ -3084,6 +3176,15 @@ fn execute_cleanup(
         }
 
         if decision.action != GeneratedDirAction::Delete {
+            continue;
+        }
+        if decision.owner_free_pressure
+            && execution_owned_worktrees.contains(&decision.worktree_path)
+        {
+            eprintln!(
+                "  keeping {} because its worktree has current or incomplete ownership evidence",
+                decision.path.display()
+            );
             continue;
         }
         if execution_open_generated_dirs.contains(&decision.path) {
@@ -4039,6 +4140,37 @@ mod tests {
         system_time_to_unix(now()).expect("test now fits in unix time") - (days * 86_400) as i64
     }
 
+    fn create_stale_incremental_target(repo: &Path) -> Result<(PathBuf, PathBuf)> {
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"pressure-sweep-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let target = repo.join("target");
+        let profile = target.join("debug");
+        let root = profile.join("incremental/fixture-old");
+        let session = root.join("s-session-hash");
+        fs::create_dir_all(&session)?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        let dep_graph = session.join("dep-graph.bin");
+        fs::write(&dep_graph, "old")?;
+        let stale = unix_days_before_now(20);
+        for path in [&dep_graph, &session, &root] {
+            set_mtime(path, stale)?;
+        }
+        let pressure_only = unix_days_before_now(0);
+        for path in [
+            profile.join("incremental"),
+            profile.join(".cargo-lock"),
+            profile,
+            target.clone(),
+        ] {
+            set_mtime(&path, pressure_only)?;
+        }
+        Ok((target, dep_graph))
+    }
+
     #[test]
     fn effective_days_prefers_later_overrides() {
         let config = GeneratedDirConfig::from_names(
@@ -4739,6 +4871,9 @@ mod tests {
             mtime_unix: None,
             effective_days: 3,
             in_use: false,
+            ownership_evidence_complete: false,
+            worktree_in_use: false,
+            owner_free_pressure: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
             measurement: None,
@@ -4773,6 +4908,9 @@ mod tests {
             mtime_unix: None,
             effective_days: 3,
             in_use: false,
+            ownership_evidence_complete: false,
+            worktree_in_use: false,
+            owner_free_pressure: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
             measurement: None,
@@ -5171,6 +5309,9 @@ mod tests {
             mtime_unix: None,
             effective_days: 3,
             in_use: false,
+            ownership_evidence_complete: false,
+            worktree_in_use: false,
+            owner_free_pressure: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
             measurement: None,
@@ -5319,6 +5460,9 @@ mod tests {
                     mtime_unix: Some(mtime_unix),
                     effective_days: 1,
                     in_use: false,
+                    ownership_evidence_complete: false,
+                    worktree_in_use: false,
+                    owner_free_pressure: false,
                     protection: None,
                     cleanup_class: CleanupClass::Pressure,
                     measurement: Some(GeneratedDirMeasurement {
@@ -5440,6 +5584,9 @@ mod tests {
             mtime_unix: Some(1),
             effective_days: 1,
             in_use: false,
+            ownership_evidence_complete: false,
+            worktree_in_use: false,
+            owner_free_pressure: false,
             protection: None,
             cleanup_class: CleanupClass::Pressure,
             measurement: None,
@@ -5465,6 +5612,7 @@ mod tests {
                 target_bytes: u64::MAX,
                 generated_days: 1,
                 stale_days: 7,
+                owner_free_generated: false,
                 active: true,
                 entered_filesystems: vec![filesystem_key(temp.path())?],
             }),
@@ -5506,6 +5654,7 @@ mod tests {
                     target_bytes: u64::MAX,
                     generated_days: 1,
                     stale_days: 7,
+                    owner_free_generated: false,
                     active: false,
                     entered_filesystems: Vec::new(),
                 }),
@@ -5526,6 +5675,7 @@ mod tests {
             target_bytes: 150,
             generated_days: 1,
             stale_days: 7,
+            owner_free_generated: false,
             active: false,
             entered_filesystems: Vec::new(),
         };
@@ -5569,6 +5719,7 @@ mod tests {
                     target_bytes: 0,
                     generated_days: 1,
                     stale_days: 7,
+                    owner_free_generated: false,
                     active: true,
                     entered_filesystems: vec![filesystem.clone()],
                 },
@@ -5631,6 +5782,7 @@ mod tests {
             target_bytes: u64::MAX,
             generated_days: 1,
             stale_days: 7,
+            owner_free_generated: false,
             active: true,
             entered_filesystems: vec!["different-filesystem".to_string()],
         };
@@ -5666,6 +5818,7 @@ mod tests {
                     target_bytes: u64::MAX,
                     generated_days: 1,
                     stale_days: 7,
+                    owner_free_generated: false,
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
@@ -6126,6 +6279,7 @@ mod tests {
                     target_bytes: 1,
                     generated_days: 1,
                     stale_days: 7,
+                    owner_free_generated: false,
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
@@ -6145,6 +6299,7 @@ mod tests {
             target_bytes: u64::MAX,
             generated_days: 1,
             stale_days: 7,
+            owner_free_generated: false,
             active: true,
             entered_filesystems: Vec::new(),
         };
@@ -6190,6 +6345,488 @@ mod tests {
             },
         )?;
         assert!(!repo.join("node_modules").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn owner_free_pressure_bypasses_generated_age_with_complete_evidence() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("node_modules/pkg"))?;
+        fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert_eq!(decision.cleanup_class, CleanupClass::Pressure);
+        assert!(decision.ownership_evidence_complete);
+        assert!(!decision.worktree_in_use);
+        assert!(decision.owner_free_pressure);
+        assert!(decision.reason.contains("bypasses artifact age"));
+        Ok(())
+    }
+
+    #[test]
+    fn routine_pressure_does_not_evaluate_owner_free_worktree_ownership() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("node_modules/pkg"))?;
+        fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+        let recent = unix_days_before_now(0);
+        for path in [
+            repo.join("node_modules/pkg/index.js"),
+            repo.join("node_modules/pkg"),
+            repo.join("node_modules"),
+        ] {
+            set_mtime(&path, recent)?;
+        }
+        let repo = fs::canonicalize(repo)?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: false,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::from([
+                repo.join("src/held.rs")
+            ]))),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert!(!decision.worktree_in_use);
+        assert!(!decision.owner_free_pressure);
+        Ok(())
+    }
+
+    #[test]
+    fn owner_free_pressure_keeps_expired_generated_dirs_routine() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let package = repo.join("node_modules/pkg");
+        fs::create_dir_all(&package)?;
+        let module = package.join("index.js");
+        fs::write(&module, "old\n")?;
+        let stale = unix_days_before_now(20);
+        for path in [&module, &package, &repo.join("node_modules")] {
+            set_mtime(path, stale)?;
+        }
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert_eq!(decision.cleanup_class, CleanupClass::Routine);
+        assert!(!decision.owner_free_pressure);
+        Ok(())
+    }
+
+    #[test]
+    fn source_ownership_does_not_block_expired_generated_dirs() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let package = repo.join("node_modules/pkg");
+        fs::create_dir_all(&package)?;
+        let module = package.join("index.js");
+        fs::write(&module, "old\n")?;
+        let stale = unix_days_before_now(20);
+        for path in [&module, &package, &repo.join("node_modules")] {
+            set_mtime(path, stale)?;
+        }
+        let repo = fs::canonicalize(repo)?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::from([
+                repo.join("src/held.rs")
+            ]))),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert_eq!(decision.cleanup_class, CleanupClass::Routine);
+        assert!(!decision.owner_free_pressure);
+        Ok(())
+    }
+
+    #[test]
+    fn owner_free_pressure_does_not_sweep_an_owned_generated_dir() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let (target, dep_graph) = create_stale_incremental_target(&repo)?;
+        let repo = fs::canonicalize(repo)?;
+        let target = fs::canonicalize(target)?;
+        let dep_graph = fs::canonicalize(dep_graph)?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::from([dep_graph]))),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == target)
+            .context("missing target decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Skip);
+        assert!(decision.in_use);
+        assert!(
+            decision.sweeps.iter().any(SweepDecision::has_work),
+            "expected stale sweep work: {decision:#?}"
+        );
+        assert!(decision.reason.contains("open files in this directory"));
+        Ok(())
+    }
+
+    #[test]
+    fn owner_free_pressure_preserves_routine_sweeps() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let (target, _dep_graph) = create_stale_incremental_target(&repo)?;
+        let repo = fs::canonicalize(repo)?;
+        let target = fs::canonicalize(target)?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == target)
+            .context("missing target decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert_eq!(decision.cleanup_class, CleanupClass::Pressure);
+        assert!(decision.owner_free_pressure);
+        assert!(decision.sweeps.iter().any(SweepDecision::has_work));
+        Ok(())
+    }
+
+    #[test]
+    fn owner_free_pressure_keeps_worktrees_with_current_ownership() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("node_modules/pkg"))?;
+        fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+        let recent = unix_days_before_now(0);
+        for path in [
+            repo.join("node_modules/pkg/index.js"),
+            repo.join("node_modules/pkg"),
+            repo.join("node_modules"),
+        ] {
+            set_mtime(&path, recent)?;
+        }
+        let repo = fs::canonicalize(repo)?;
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::from([
+                repo.join("src/held.rs")
+            ]))),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Skip);
+        assert!(decision.ownership_evidence_complete);
+        assert!(decision.worktree_in_use);
+        assert!(!decision.owner_free_pressure);
+        assert!(decision
+            .reason
+            .contains("worktree has current process ownership"));
+        Ok(())
+    }
+
+    #[test]
+    fn owner_free_pressure_fails_closed_on_incomplete_ownership_evidence() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("node_modules/pkg"))?;
+        fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+        let recent = unix_days_before_now(0);
+        for path in [
+            repo.join("node_modules/pkg/index.js"),
+            repo.join("node_modules/pkg"),
+            repo.join("node_modules"),
+        ] {
+            set_mtime(&path, recent)?;
+        }
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Indeterminate),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Skip);
+        assert!(!decision.ownership_evidence_complete);
+        assert!(!decision.owner_free_pressure);
+        assert!(decision
+            .reason
+            .contains("requires complete ownership evidence"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_free_pressure_rechecks_worktree_ownership_before_deletion() -> Result<()> {
+        if !cfg!(target_os = "macos")
+            && Command::new("lsof")
+                .arg("-v")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_err()
+        {
+            eprintln!("skipping: lsof unavailable");
+            return Ok(());
+        }
+
+        let (_temp, repo) = init_repo()?;
+        fs::write(repo.join("held-source.txt"), "held\n")?;
+        fs::create_dir_all(repo.join("node_modules/pkg"))?;
+        fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
+        let recent = unix_days_before_now(0);
+        for path in [
+            repo.join("node_modules/pkg/index.js"),
+            repo.join("node_modules/pkg"),
+            repo.join("node_modules"),
+        ] {
+            set_mtime(&path, recent)?;
+        }
+
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 7,
+                    owner_free_generated: true,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+        )?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert!(decision.owner_free_pressure);
+
+        let _held = fs::File::open(repo.join("held-source.txt"))?;
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::PressureGenerated(3))?;
+
+        assert!(repo.join("node_modules").exists());
         Ok(())
     }
 
@@ -6240,6 +6877,7 @@ mod tests {
                     target_bytes: u64::MAX,
                     generated_days: 1,
                     stale_days: 7,
+                    owner_free_generated: false,
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
