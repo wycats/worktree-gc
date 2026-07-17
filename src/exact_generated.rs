@@ -750,7 +750,13 @@ fn ensure_no_nested_mount_points_with(path: &Path, mount_points: &[PathBuf]) -> 
     let path = fs::canonicalize(path)
         .with_context(|| format!("failed to canonicalize candidate {}", path.display()))?;
     for mount_point in mount_points {
-        if mount_point != &path && mount_point.starts_with(&path) {
+        if mount_point == &path {
+            bail!(
+                "candidate root is a mount point at {}",
+                mount_point.display()
+            );
+        }
+        if mount_point.starts_with(&path) {
             bail!(
                 "candidate contains a nested mount point at {}",
                 mount_point.display()
@@ -1628,11 +1634,26 @@ mod tests {
         let nested = root.join("mounted");
         fs::create_dir(&nested)?;
 
-        let error = ensure_no_nested_mount_points_with(&root, &[root.clone(), nested.clone()])
+        let error = ensure_no_nested_mount_points_with(&root, std::slice::from_ref(&nested))
             .expect_err("same-device nested mount points must fail closed");
 
         assert!(error.to_string().contains("contains a nested mount point"));
         assert!(nested.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_deletion_rejects_a_same_device_candidate_root_mount_point() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = fs::canonicalize(temp.path())?;
+
+        let error = ensure_no_nested_mount_points_with(&root, std::slice::from_ref(&root))
+            .expect_err("a candidate-root mount point must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("candidate root is a mount point"));
+        assert!(root.is_dir());
         Ok(())
     }
 
