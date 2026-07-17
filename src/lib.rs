@@ -4119,11 +4119,11 @@ fn git_ignored_paths(
             }
             Ok(())
         });
-        let output = child.wait_with_output()?;
+        let output = child.wait_with_output();
         let writer_result = writer
             .join()
             .map_err(|_| anyhow::anyhow!("git check-ignore input writer panicked"))?;
-        Ok((output, writer_result))
+        Ok((output?, writer_result))
     })?;
     if !output.status.success() && output.status.code() != Some(1) {
         bail!(
