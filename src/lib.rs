@@ -4107,18 +4107,24 @@ fn git_ignored_paths(
         .spawn()
         .with_context(|| format!("failed to run git check-ignore in {}", worktree.display()))?;
 
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("failed to open git check-ignore stdin")?;
-        for candidate in candidates {
-            stdin.write_all(path_key(&candidate.relative).as_bytes())?;
-            stdin.write_all(&[0])?;
-        }
-    }
-
-    let output = child.wait_with_output()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to open git check-ignore stdin")?;
+    let (output, writer_result) = std::thread::scope(|scope| -> Result<_> {
+        let writer = scope.spawn(move || -> Result<()> {
+            for candidate in candidates {
+                stdin.write_all(path_key(&candidate.relative).as_bytes())?;
+                stdin.write_all(&[0])?;
+            }
+            Ok(())
+        });
+        let output = child.wait_with_output()?;
+        let writer_result = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("git check-ignore input writer panicked"))?;
+        Ok((output, writer_result))
+    })?;
     if !output.status.success() && output.status.code() != Some(1) {
         bail!(
             "git check-ignore failed in {}: {}",
@@ -4126,6 +4132,7 @@ fn git_ignored_paths(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    writer_result?;
 
     Ok(split_nul_strings(&output.stdout).into_iter().collect())
 }
@@ -4307,6 +4314,30 @@ mod tests {
         let context = repo_context(Some(&repo))?;
 
         assert_eq!(context.git_common_dir, fs::canonicalize(common)?);
+        Ok(())
+    }
+
+    #[test]
+    fn ignored_path_probe_streams_output_larger_than_a_pipe() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::write(repo.join(".gitignore"), "ignored-*\n")?;
+        let candidates = (0..20_000)
+            .map(|index| {
+                let relative = PathBuf::from(format!("ignored-{index:05}"));
+                GeneratedCandidate {
+                    path: repo.join(&relative),
+                    relative,
+                    name: "node_modules".to_string(),
+                    action: GeneratedCandidateAction::Delete,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let ignored = git_ignored_paths(&repo, &candidates)?;
+
+        assert_eq!(ignored.len(), candidates.len());
+        assert!(ignored.contains("ignored-00000"));
+        assert!(ignored.contains("ignored-19999"));
         Ok(())
     }
 
