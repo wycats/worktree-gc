@@ -587,9 +587,15 @@ fn validate_candidate_lexical_boundary(
 
 fn validate_git_generated_boundary(worktree: &Path, candidate: &Path) -> Result<()> {
     let relative = candidate.strip_prefix(worktree)?;
+    let relative = relative
+        .to_str()
+        .context("candidate relative path is not valid UTF-8")?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let mut literal_pathspec = std::ffi::OsString::from(":(top,literal)");
+    literal_pathspec.push(relative);
     let tracked = Command::new("git")
         .args(["ls-files", "-z", "--"])
-        .arg(relative)
+        .arg(literal_pathspec)
         .current_dir(worktree)
         .stdin(Stdio::null())
         .output()
@@ -732,7 +738,113 @@ fn measure_exact_candidate(path: &Path) -> Result<GeneratedDirMeasurement> {
 }
 
 fn ensure_single_filesystem_tree(path: &Path, expected_filesystem: &str) -> Result<()> {
+    ensure_no_nested_mount_points(path)?;
     ensure_single_filesystem_tree_with(path, expected_filesystem, crate::filesystem_key)
+}
+
+fn ensure_no_nested_mount_points(path: &Path) -> Result<()> {
+    ensure_no_nested_mount_points_with(path, &system_mount_points()?)
+}
+
+fn ensure_no_nested_mount_points_with(path: &Path, mount_points: &[PathBuf]) -> Result<()> {
+    let path = fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize candidate {}", path.display()))?;
+    for mount_point in mount_points {
+        if mount_point != &path && mount_point.starts_with(&path) {
+            bail!(
+                "candidate contains a nested mount point at {}",
+                mount_point.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn system_mount_points() -> Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    anyhow::ensure!(count >= 0, "failed to enumerate mounted filesystems");
+    let capacity = usize::try_from(count)?.saturating_add(16);
+    let mut mounts = (0..capacity)
+        .map(|_| unsafe { std::mem::zeroed::<libc::statfs>() })
+        .collect::<Vec<_>>();
+    let buffer_size = i32::try_from(
+        mounts
+            .len()
+            .saturating_mul(std::mem::size_of::<libc::statfs>()),
+    )?;
+    let written = unsafe { libc::getfsstat(mounts.as_mut_ptr(), buffer_size, libc::MNT_NOWAIT) };
+    anyhow::ensure!(written >= 0, "failed to read mounted filesystems");
+    let written = usize::try_from(written)?;
+    anyhow::ensure!(
+        written < mounts.len(),
+        "mounted filesystem table changed during enumeration"
+    );
+    mounts.truncate(written);
+
+    mounts
+        .into_iter()
+        .map(|mount| {
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    mount.f_mntonname.as_ptr().cast::<u8>(),
+                    mount.f_mntonname.len(),
+                )
+            };
+            let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(&raw[..end]));
+            fs::canonicalize(&path)
+                .with_context(|| format!("failed to canonicalize mount point {}", path.display()))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn system_mount_points() -> Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mountinfo = fs::read("/proc/self/mountinfo").context("failed to read Linux mount table")?;
+    mountinfo
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let field = line
+                .split(|byte| *byte == b' ')
+                .nth(4)
+                .context("invalid Linux mount table entry")?;
+            let mut decoded = Vec::with_capacity(field.len());
+            let mut index = 0;
+            while index < field.len() {
+                if field[index] == b'\\' && index + 3 < field.len() {
+                    let octal = &field[index + 1..index + 4];
+                    if octal.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+                        decoded.push(
+                            (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'),
+                        );
+                        index += 4;
+                        continue;
+                    }
+                }
+                decoded.push(field[index]);
+                index += 1;
+            }
+            let path = PathBuf::from(std::ffi::OsString::from_vec(decoded));
+            fs::canonicalize(&path)
+                .with_context(|| format!("failed to canonicalize mount point {}", path.display()))
+        })
+        .collect()
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn system_mount_points() -> Result<Vec<PathBuf>> {
+    bail!("exact generated execution cannot verify mount boundaries on this Unix platform")
+}
+
+#[cfg(not(unix))]
+fn system_mount_points() -> Result<Vec<PathBuf>> {
+    Ok(Vec::new())
 }
 
 fn ensure_single_filesystem_tree_with(
@@ -1363,6 +1475,36 @@ mod tests {
     }
 
     #[test]
+    fn exact_execution_treats_pathspec_magic_names_as_literal() -> Result<()> {
+        let mut fixture = fixture_for_name(false, ":(top)tracked")?;
+        git(
+            &fixture.repo,
+            [
+                "--literal-pathspecs",
+                "add",
+                "-f",
+                "--",
+                ":(top)tracked/cache/artifact",
+            ],
+        )?;
+        git(&fixture.repo, ["commit", "-m", "track magic fixture"])?;
+        let source = source_identity(&fixture.repo)?;
+        rewrite_repository_manifest(&mut fixture, |manifest| {
+            manifest["worktrees"][0]["head"] = json!(source.head);
+            manifest["worktrees"][0]["dirty_count"] = json!(source.dirty_count);
+            manifest["worktrees"][0]["status_sha256"] = json!(source.status_sha256);
+        })?;
+
+        let error = fixture
+            .execute()
+            .expect_err("tracked content in a pathspec-magic name must fail closed");
+
+        assert!(error.to_string().contains("tracked content"));
+        assert!(fixture.candidate.is_dir());
+        Ok(())
+    }
+
+    #[test]
     fn exact_execution_recovers_only_its_digest_bound_quarantine() -> Result<()> {
         let fixture = fixture(false)?;
         let digest = fixture.digest.strip_prefix("sha256:").unwrap();
@@ -1476,6 +1618,21 @@ mod tests {
 
         assert!(error.to_string().contains("contains a nested filesystem"));
         assert!(nested.join("artifact").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_deletion_rejects_a_same_device_nested_mount_point() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = fs::canonicalize(temp.path())?;
+        let nested = root.join("mounted");
+        fs::create_dir(&nested)?;
+
+        let error = ensure_no_nested_mount_points_with(&root, &[root.clone(), nested.clone()])
+            .expect_err("same-device nested mount points must fail closed");
+
+        assert!(error.to_string().contains("contains a nested mount point"));
+        assert!(nested.is_dir());
         Ok(())
     }
 

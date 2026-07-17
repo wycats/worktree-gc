@@ -1932,7 +1932,11 @@ fn repo_context(repo: Option<&Path>) -> Result<RepoContext> {
     let git_common_dir = git_output(&current_worktree, ["rev-parse", "--git-common-dir"])?
         .trim()
         .to_string();
-    let git_common_dir = resolve_relative(&current_worktree, Path::new(&git_common_dir));
+    let git_common_dir = fs::canonicalize(resolve_relative(
+        &current_worktree,
+        Path::new(&git_common_dir),
+    ))
+    .context("failed to canonicalize Git common directory")?;
 
     Ok(RepoContext {
         current_worktree,
@@ -4288,6 +4292,22 @@ mod tests {
         git_output(&repo, ["add", "."])?;
         commit_with_date(&repo, "initial", "2025-01-01T00:00:00Z")?;
         Ok((temp, repo))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_context_canonicalizes_a_symlinked_git_common_dir() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = init_repo()?;
+        let common = temp.path().join("git-common");
+        fs::rename(repo.join(".git"), &common)?;
+        symlink(&common, repo.join(".git"))?;
+
+        let context = repo_context(Some(&repo))?;
+
+        assert_eq!(context.git_common_dir, fs::canonicalize(common)?);
+        Ok(())
     }
 
     fn commit_with_date(repo: &Path, message: &str, date: &str) -> Result<()> {
