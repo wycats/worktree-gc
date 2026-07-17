@@ -801,6 +801,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "fs4",
+ "libc",
  "parse-size",
  "percent-encoding",
  "rayon",

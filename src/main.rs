@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories,
-    gateway_storage_report, inventory, list_protections, print_cleanup,
+    execute_approved_generated, gateway_storage_report, inventory, list_protections, print_cleanup,
     print_gateway_storage_report, print_inventory, print_root_cleanup, print_root_triage,
     print_triage, remove_protection, renew_protection, triage, triage_roots, CleanupOptions,
     GatewayStorageOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit,
@@ -135,6 +135,20 @@ enum Command {
 
         #[command(flatten)]
         generated: GeneratedArgs,
+    },
+    /// Execute exactly one approved owner-free generated candidate
+    ExecuteGenerated {
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+
+        #[arg(long, value_name = "SHA256")]
+        approval_digest: String,
+
+        #[arg(long, value_name = "PATH")]
+        candidate: PathBuf,
+
+        #[arg(long, value_name = "PATH")]
+        result: Option<PathBuf>,
     },
     /// Run configured multi-root cleanup for a scheduler such as launchd or cron
     Scheduled {
@@ -549,6 +563,25 @@ fn main() -> Result<()> {
                 let run = cleanup_roots(&roots, options)?;
                 print_root_cleanup(&run);
             }
+        }
+        Command::ExecuteGenerated {
+            manifest,
+            approval_digest,
+            candidate,
+            result,
+        } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "execute-generated consumes an approved manifest directly; do not pass --repo or --root"
+            );
+            let run = execute_approved_generated(
+                &manifest,
+                &approval_digest,
+                &candidate,
+                result.as_deref(),
+            )?;
+            serde_json::to_writer_pretty(std::io::stdout().lock(), &run)?;
+            println!();
         }
         Command::Scheduled {
             config,
