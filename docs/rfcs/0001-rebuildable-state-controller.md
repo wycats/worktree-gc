@@ -363,6 +363,10 @@ already conservative and is not the first place to spend implementation risk.
   classes.
 - Preserve per-path execution guards while sharing expensive revalidation in
   bounded waves.
+- Route supervised deletion through the manifest/digest-bound single-candidate
+  executor, including exact source and inode identity, a fresh ownership and
+  protection check, atomic quarantine, Cargo profile locks for `target/`, and
+  a durable realized-reclaim result.
 
 ### Phase 3: strengthen active-target pruning
 

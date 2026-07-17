@@ -1,5 +1,6 @@
 mod cargo_incremental;
 mod cargo_profiles;
+mod exact_generated;
 mod gateway_storage;
 mod inventory;
 #[cfg(target_os = "macos")]
@@ -13,7 +14,8 @@ use cargo_incremental::{
 };
 use cargo_profiles::{execute_cargo_profile_reset, plan_cargo_profile_sweep};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -28,6 +30,9 @@ use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
+pub use exact_generated::{
+    execute_approved_generated, ApprovedGeneratedExecutionResult, ApprovedGeneratedExecutionRun,
+};
 pub use gateway_storage::{
     gateway_storage_report, print_gateway_storage_report, GatewayStorageOptions,
     GatewayStorageReport, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES,
@@ -50,7 +55,7 @@ pub const DEFAULT_GENERATED_DELETE_NAMES: &[&str] = &["node_modules", ".next", "
 pub const DEFAULT_GENERATED_REPORT_NAMES: &[&str] = &["dist"];
 pub const DEFAULT_INCREMENTAL_SWEEP_DAYS: u64 = 14;
 pub const DEFAULT_CARGO_PROFILE_SWEEP_DAYS: u64 = 7;
-pub const MANIFEST_VERSION: u64 = 6;
+pub const MANIFEST_VERSION: u64 = 7;
 
 // Build caches are cheap to regenerate compared to dependency installs, so
 // they default to a tighter window than --generated-days.
@@ -193,7 +198,7 @@ pub struct CleanupManifest {
     pub generated_dirs: Vec<GeneratedDirDecision>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupMode {
     DryRun,
@@ -210,6 +215,7 @@ pub struct WorktreeInfo {
     pub exists: bool,
     pub is_current: bool,
     pub dirty_count: Option<usize>,
+    pub status_sha256: Option<String>,
     pub upstream: Option<String>,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
@@ -240,7 +246,7 @@ pub struct GeneratedDirInfo {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GeneratedDirAction {
     Delete,
@@ -252,6 +258,7 @@ pub enum GeneratedDirAction {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorktreeDecision {
     pub path: PathBuf,
+    pub head: Option<String>,
     pub branch: Option<String>,
     pub metadata_prunable: bool,
     pub action: WorktreeAction,
@@ -259,6 +266,7 @@ pub struct WorktreeDecision {
     pub reason: String,
     pub protection: Option<ProtectionMatch>,
     pub dirty_count: Option<usize>,
+    pub status_sha256: Option<String>,
     pub last_commit: Option<String>,
     pub activity_age_days: Option<u64>,
 }
@@ -271,7 +279,7 @@ pub enum WorktreeAction {
     PruneMetadata,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupClass {
     Routine,
@@ -292,13 +300,24 @@ pub struct GeneratedDirDecision {
     pub owner_free_pressure: bool,
     pub protection: Option<ProtectionMatch>,
     pub cleanup_class: CleanupClass,
+    pub identity: Option<GeneratedDirIdentity>,
     pub measurement: Option<GeneratedDirMeasurement>,
     pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GeneratedDirIdentity {
+    pub canonical_path: PathBuf,
+    pub filesystem: String,
+    pub device: Option<u64>,
+    pub inode: Option<u64>,
+    pub modified_unix: Option<i64>,
+    pub modified_nanos: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GeneratedDirMeasurement {
     pub measured_at_unix: u64,
     pub filesystem: String,
@@ -310,6 +329,7 @@ pub struct GeneratedDirMeasurement {
 #[derive(Debug)]
 struct GeneratedMeasurementTarget {
     priority: (u8, u8),
+    identity: GeneratedDirIdentity,
     locations: Vec<(usize, usize)>,
 }
 
@@ -714,6 +734,7 @@ fn plan_cleanup_with_protections(
             owner_free_pressure: dir.owner_free_pressure,
             protection: dir.protection.clone(),
             cleanup_class: dir.cleanup_class,
+            identity: None,
             measurement: None,
             sweeps: dir.sweeps.clone(),
             action: dir.action.clone(),
@@ -768,6 +789,7 @@ fn measure_cleanup_runs_matching(
         for run in runs.iter_mut() {
             for decision in &mut run.manifest.generated_dirs {
                 if decision.path == path {
+                    decision.identity = None;
                     decision.measurement = None;
                 }
             }
@@ -841,6 +863,7 @@ fn measure_cleanup_runs_matching(
                 canonical.display(),
                 canonical_worktree.display()
             );
+            let identity = generated_dir_identity(&decision.path)?;
             let priority = (
                 u8::from(decision.cleanup_class != CleanupClass::Pressure),
                 generated_rebuild_rank(&decision.name),
@@ -849,8 +872,14 @@ fn measure_cleanup_runs_matching(
                 .entry(canonical)
                 .or_insert_with(|| GeneratedMeasurementTarget {
                     priority,
+                    identity: identity.clone(),
                     locations: Vec::new(),
                 });
+            anyhow::ensure!(
+                target.identity == identity,
+                "generated candidate identity changed during measurement planning: {}",
+                decision.path.display()
+            );
             target.priority = target.priority.min(priority);
             target.locations.push((run_index, decision_index));
         }
@@ -890,6 +919,8 @@ fn measure_cleanup_runs_matching(
             metrics: root.metrics,
         };
         for (run_index, decision_index) in &target.locations {
+            runs[*run_index].manifest.generated_dirs[*decision_index].identity =
+                Some(target.identity.clone());
             runs[*run_index].manifest.generated_dirs[*decision_index].measurement =
                 Some(measurement.clone());
         }
@@ -998,7 +1029,7 @@ pub fn cleanup_repositories(
                 &refreshed_protections,
                 refreshed_open_handles.as_ref(),
             )?;
-            carry_generated_measurements(&manifest.repositories[index], &mut refreshed);
+            carry_generated_measurements(&manifest.repositories[index], &mut refreshed)?;
             refreshed.manifest_path =
                 write_manifest(&refreshed.manifest.git_common_dir, &refreshed.manifest)?;
             manifest.repositories[index] = refreshed;
@@ -1173,7 +1204,7 @@ fn refresh_and_execute_repository(
         &refreshed_protections,
         refreshed_open_handles.as_ref(),
     )?;
-    carry_generated_measurements(&manifest.repositories[index], &mut refreshed);
+    carry_generated_measurements(&manifest.repositories[index], &mut refreshed)?;
     if let Some(path) = only_generated_path {
         measure_cleanup_runs_matching(
             std::slice::from_mut(&mut refreshed),
@@ -1192,21 +1223,30 @@ fn refresh_and_execute_repository(
     )
 }
 
-fn carry_generated_measurements(previous: &CleanupRun, refreshed: &mut CleanupRun) {
+fn carry_generated_measurements(previous: &CleanupRun, refreshed: &mut CleanupRun) -> Result<()> {
     let measurements = previous
         .manifest
         .generated_dirs
         .iter()
         .filter_map(|decision| {
-            decision
-                .measurement
-                .clone()
-                .map(|measurement| (decision.path.clone(), measurement))
+            decision.measurement.clone().map(|measurement| {
+                (
+                    decision.path.clone(),
+                    (decision.identity.clone(), measurement),
+                )
+            })
         })
         .collect::<BTreeMap<_, _>>();
     for decision in &mut refreshed.manifest.generated_dirs {
-        decision.measurement = measurements.get(&decision.path).cloned();
+        if let Some((identity, measurement)) = measurements.get(&decision.path) {
+            let live_identity = generated_dir_identity(&decision.path)?;
+            if identity.as_ref() == Some(&live_identity) {
+                decision.identity = Some(live_identity);
+                decision.measurement = Some(measurement.clone());
+            }
+        }
     }
+    Ok(())
 }
 
 fn pressure_generated_candidate_order(
@@ -1879,6 +1919,7 @@ fn inspect_worktree(
             exists,
             is_current,
             dirty_count: None,
+            status_sha256: None,
             upstream: None,
             ahead: None,
             behind: None,
@@ -1911,6 +1952,7 @@ fn inspect_worktree(
         exists,
         is_current,
         dirty_count: Some(status.dirty_count),
+        status_sha256: Some(status.status_sha256),
         upstream,
         ahead,
         behind,
@@ -1975,6 +2017,7 @@ fn parse_worktree_list(output: &str) -> Vec<RawWorktree> {
 
 fn dirty_status(path: &Path) -> Result<DirtyStatus> {
     let output = git_bytes(path, ["status", "--porcelain=v1", "-z"])?;
+    let status_sha256 = format!("{:x}", Sha256::digest(&output));
     let mut dirty_count = 0;
     let mut newest_dirty_mtime_unix = None;
     let mut parts = output.split(|byte| *byte == 0);
@@ -1995,13 +2038,14 @@ fn dirty_status(path: &Path) -> Result<DirtyStatus> {
             }
         }
 
-        if status[0] == b'R' || status[0] == b'C' {
+        if status[0] == b'R' || status[0] == b'C' || status[1] == b'R' || status[1] == b'C' {
             let _ = parts.next();
         }
     }
 
     Ok(DirtyStatus {
         dirty_count,
+        status_sha256,
         newest_dirty_mtime_unix,
     })
 }
@@ -2009,6 +2053,7 @@ fn dirty_status(path: &Path) -> Result<DirtyStatus> {
 #[derive(Debug)]
 struct DirtyStatus {
     dirty_count: usize,
+    status_sha256: String,
     newest_dirty_mtime_unix: Option<i64>,
 }
 
@@ -3008,6 +3053,7 @@ fn plan_worktree_cleanup(
 
             Ok(WorktreeDecision {
                 path: worktree.path.clone(),
+                head: worktree.head.clone(),
                 branch: worktree.branch.clone(),
                 metadata_prunable: worktree.prunable.is_some() || !worktree.exists,
                 action,
@@ -3015,6 +3061,7 @@ fn plan_worktree_cleanup(
                 reason,
                 protection,
                 dirty_count: worktree.dirty_count,
+                status_sha256: worktree.status_sha256.clone(),
                 last_commit: worktree.last_commit.clone(),
                 activity_age_days: worktree.activity_age_days,
             })
@@ -3384,6 +3431,46 @@ fn filesystem_key(path: &Path) -> Result<String> {
             .context("path has no filesystem component")?;
         Ok(format!("root:{root:?}"))
     }
+}
+
+pub(crate) fn generated_dir_identity(path: &Path) -> Result<GeneratedDirIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect generated directory {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "generated path is not a real directory: {}",
+        path.display()
+    );
+    let canonical_path = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve generated directory {}", path.display()))?;
+    let filesystem = filesystem_key(&canonical_path)?;
+    let (modified_unix, modified_nanos) = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| {
+            (
+                i64::try_from(duration.as_secs()).ok(),
+                Some(duration.subsec_nanos()),
+            )
+        })
+        .unwrap_or((None, None));
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        (Some(metadata.dev()), Some(metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let (device, inode) = (None, None);
+
+    Ok(GeneratedDirIdentity {
+        canonical_path,
+        filesystem,
+        device,
+        inode,
+        modified_unix,
+        modified_nanos,
+    })
 }
 
 fn generated_rebuild_rank(name: &str) -> u8 {
@@ -4741,6 +4828,7 @@ mod tests {
             exists: false,
             is_current: false,
             dirty_count: None,
+            status_sha256: None,
             upstream: None,
             ahead: None,
             behind: None,
@@ -4876,6 +4964,7 @@ mod tests {
             owner_free_pressure: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
+            identity: None,
             measurement: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
@@ -4913,6 +5002,7 @@ mod tests {
             owner_free_pressure: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
+            identity: None,
             measurement: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
@@ -5314,6 +5404,7 @@ mod tests {
             owner_free_pressure: false,
             protection: None,
             cleanup_class: CleanupClass::Routine,
+            identity: None,
             measurement: None,
             sweeps: vec![SweepDecision {
                 tool: SweepTool::CargoSweep,
@@ -5422,6 +5513,7 @@ mod tests {
     fn metadata_prune_guard_only_covers_prunable_worktrees() {
         let decision = |path: &str, action, metadata_prunable| WorktreeDecision {
             path: PathBuf::from(path),
+            head: None,
             branch: None,
             metadata_prunable,
             action,
@@ -5429,6 +5521,7 @@ mod tests {
             reason: "fixture".to_string(),
             protection: None,
             dirty_count: None,
+            status_sha256: None,
             last_commit: None,
             activity_age_days: None,
         };
@@ -5465,6 +5558,7 @@ mod tests {
                     owner_free_pressure: false,
                     protection: None,
                     cleanup_class: CleanupClass::Pressure,
+                    identity: None,
                     measurement: Some(GeneratedDirMeasurement {
                         measured_at_unix: 1,
                         filesystem: "fixture".to_string(),
@@ -5589,6 +5683,7 @@ mod tests {
             owner_free_pressure: false,
             protection: None,
             cleanup_class: CleanupClass::Pressure,
+            identity: None,
             measurement: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
@@ -5976,6 +6071,7 @@ mod tests {
     #[test]
     fn cleanup_manifest_measures_generated_delete_candidates() -> Result<()> {
         let (_temp, repo) = init_repo()?;
+        let canonical_repo = fs::canonicalize(&repo)?;
         let package = repo.join("node_modules/pkg");
         fs::create_dir_all(&package)?;
         fs::write(package.join("index.js"), vec![b'x'; 16 * 1024])?;
@@ -6014,6 +6110,21 @@ mod tests {
         assert!(measurement.visited_entries >= 2);
         assert!(measurement.metrics.logical_bytes >= 16 * 1024);
         assert!(measurement.metrics.allocated_bytes > 0);
+        let identity = decision
+            .identity
+            .as_ref()
+            .context("missing generated directory identity")?;
+        assert_eq!(identity.canonical_path, canonical_repo.join("node_modules"));
+        #[cfg(unix)]
+        assert!(identity.device.is_some() && identity.inode.is_some());
+        let worktree = run
+            .manifest
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == canonical_repo)
+            .context("missing current worktree decision")?;
+        assert!(worktree.head.is_some());
+        assert!(worktree.status_sha256.is_some());
 
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&run.manifest_path)?)?;
         let serialized = json["generated_dirs"]
@@ -6025,6 +6136,10 @@ mod tests {
         assert!(serialized["measurement"]["metrics"]["allocated_bytes"]
             .as_u64()
             .is_some_and(|bytes| bytes > 0));
+        assert_eq!(
+            serialized["identity"]["canonical_path"],
+            canonical_repo.join("node_modules").display().to_string()
+        );
         Ok(())
     }
 

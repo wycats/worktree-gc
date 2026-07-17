@@ -372,6 +372,37 @@ one candidate, so very large candidate sets remain bounded, fair, and visibly
 partial. The controller checks live filesystem
 availability after each deletion and stops once the target is reached.
 
+For a supervised recovery, `execute-generated` consumes one dry-run manifest
+and one exact candidate instead of translating approval into an ad hoc removal
+command. The approval digest is the SHA-256 of the manifest bytes:
+
+```sh
+worktree-gc execute-generated \
+  --manifest /absolute/path/to/dry-run.json \
+  --approval-digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --candidate /absolute/path/to/worktree/chat/.next
+```
+
+The command accepts only a measured owner-free pressure deletion. It requires
+complete ownership and APFS-private evidence, revalidates the candidate's
+canonical path and filesystem identity, verifies the exact Git HEAD and
+porcelain status digest, rejects tracked content and current protections, and
+takes a fresh ownership snapshot inside the protection guard immediately
+before mutation. It atomically
+renames the candidate into a digest-bound quarantine below the repository Git
+common directory, verifies the renamed inode, removes only that quarantine,
+and writes a structured execution result next to the approved manifest.
+It also rechecks live free space immediately before quarantine and retains the
+candidate when the approved pressure target is already satisfied.
+An intact digest-bound quarantine interrupted after rename and before removal
+can be resumed with the same command and approval. Identity or measurement
+drift, including partial removal, fails closed and requires a new recovery
+boundary. A `target/` candidate additionally requires the dry-run manifest's
+Cargo lock timeout and existing Cargo profile locks. Its guarded ownership
+snapshot is taken immediately before waiting for those locks, which are then
+held across the final identity, measurement, source, and pressure
+revalidation, quarantine, and deletion.
+
 Each scheduled run writes the normal per-repository manifests and a structured
 aggregate manifest. Aggregate manifests are retained for the configured
 history window. Query them with:
