@@ -16,6 +16,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
 
 const APPROVAL_DIGEST_PREFIX: &str = "sha256:";
 
@@ -119,7 +120,7 @@ struct ApprovedGeneratedDecision {
     ownership_evidence_complete: bool,
     worktree_in_use: bool,
     owner_free_pressure: bool,
-    protection: Option<serde_json::Value>,
+    protection: serde_json::Value,
     cleanup_class: CleanupClass,
     identity: Option<GeneratedDirIdentity>,
     measurement: Option<GeneratedDirMeasurement>,
@@ -341,7 +342,7 @@ fn execute_approved_generated_with_ownership(
         Some(path) => path.to_path_buf(),
         None => default_result_path(manifest_path, &actual_digest, candidate)?,
     };
-    validate_result_path(&result_path, &worktree, &git_common_dir)?;
+    validate_result_path(&result_path, &worktree, &git_common_dir, &quarantine)?;
 
     let target_lock_timeout = if decision.name == "target" && !recovered_quarantine {
         let lock_timeout = manifest
@@ -496,7 +497,7 @@ fn validate_approved_decision(decision: &ApprovedGeneratedDecision) -> Result<()
         "approved candidate lacks complete owner-free evidence"
     );
     anyhow::ensure!(
-        decision.protection.is_none(),
+        decision.protection.is_null(),
         "approved candidate had an applicable protection"
     );
     anyhow::ensure!(
@@ -730,6 +731,45 @@ fn measure_exact_candidate(path: &Path) -> Result<GeneratedDirMeasurement> {
     Ok(measurement)
 }
 
+fn ensure_single_filesystem_tree(path: &Path, expected_filesystem: &str) -> Result<()> {
+    ensure_single_filesystem_tree_with(path, expected_filesystem, crate::filesystem_key)
+}
+
+fn ensure_single_filesystem_tree_with(
+    path: &Path,
+    expected_filesystem: &str,
+    filesystem_for: impl Fn(&Path) -> Result<String>,
+) -> Result<()> {
+    for (index, entry) in WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        anyhow::ensure!(
+            index < super::GENERATED_MEASUREMENT_MAX_ENTRIES_PER_CANDIDATE as usize,
+            "candidate filesystem-boundary scan exceeds the per-candidate traversal bound"
+        );
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to inspect candidate filesystem boundary beneath {}",
+                path.display()
+            )
+        })?;
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+        let actual_filesystem = filesystem_for(entry.path())?;
+        anyhow::ensure!(
+            actual_filesystem == expected_filesystem,
+            "candidate contains a nested filesystem at {}: expected {}, found {}",
+            entry.path().display(),
+            expected_filesystem,
+            actual_filesystem
+        );
+    }
+    Ok(())
+}
+
 fn measurements_match(approved: &GeneratedDirMeasurement, live: &GeneratedDirMeasurement) -> bool {
     approved.filesystem == live.filesystem
         && approved.complete == live.complete
@@ -809,6 +849,7 @@ impl CandidateExecution<'_> {
             &live_identity,
             self.recovered_quarantine,
         )?;
+        ensure_single_filesystem_tree(active_path, &self.approved_identity.filesystem)?;
         let live_measurement = match self.measurement_override {
             Some(measurement) => measurement.clone(),
             None => measure_exact_candidate(active_path)?,
@@ -934,7 +975,12 @@ fn default_result_path(manifest_path: &Path, digest: &str, candidate: &Path) -> 
     )))
 }
 
-fn validate_result_path(path: &Path, worktree: &Path, git_common_dir: &Path) -> Result<()> {
+fn validate_result_path(
+    path: &Path,
+    worktree: &Path,
+    git_common_dir: &Path,
+    quarantine: &Path,
+) -> Result<()> {
     anyhow::ensure!(path.is_absolute(), "execution result path is not absolute");
     anyhow::ensure!(
         !path.try_exists()?,
@@ -949,6 +995,13 @@ fn validate_result_path(path: &Path, worktree: &Path, git_common_dir: &Path) -> 
         !canonical_parent.starts_with(worktree) || canonical_parent.starts_with(git_common_dir),
         "execution result must be outside the owner worktree or inside its Git common directory"
     );
+    if quarantine.try_exists()? {
+        let canonical_quarantine = canonical_existing_directory(quarantine, "exact quarantine")?;
+        anyhow::ensure!(
+            !canonical_parent.starts_with(&canonical_quarantine),
+            "execution result must be outside the exact quarantine being removed"
+        );
+    }
     Ok(())
 }
 
@@ -1271,6 +1324,25 @@ mod tests {
     }
 
     #[test]
+    fn exact_execution_requires_explicit_protection_evidence() -> Result<()> {
+        let mut fixture = fixture(false)?;
+        rewrite_repository_manifest(&mut fixture, |manifest| {
+            manifest["generated_dirs"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("protection");
+        })?;
+
+        let error = fixture
+            .execute()
+            .expect_err("omitted protection evidence must fail closed");
+
+        assert!(error.to_string().contains("invalid cleanup manifest"));
+        assert!(fixture.candidate.is_dir());
+        Ok(())
+    }
+
+    #[test]
     fn exact_execution_rejects_generated_trees_with_tracked_content() -> Result<()> {
         let mut fixture = fixture(false)?;
         git(&fixture.repo, ["add", "-f", "chat/.next/cache/artifact"])?;
@@ -1306,6 +1378,37 @@ mod tests {
 
         assert!(run.result.recovered_quarantine);
         assert!(!quarantine.exists());
+        assert!(!fixture.candidate.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_execution_rejects_a_result_inside_the_recovered_quarantine() -> Result<()> {
+        let fixture = fixture(false)?;
+        let digest = fixture.digest.strip_prefix("sha256:").unwrap();
+        let quarantine = quarantine_path(
+            &fs::canonicalize(fixture.repo.join(".git"))?,
+            &fixture.candidate,
+            digest,
+        )?;
+        fs::create_dir_all(quarantine.parent().unwrap())?;
+        fs::rename(&fixture.candidate, &quarantine)?;
+        let result_dir = quarantine.join("cache");
+
+        let error = execute_approved_generated_with_ownership(
+            &fixture.manifest,
+            &fixture.digest,
+            &fixture.candidate,
+            Some(&result_dir.join("execution.json")),
+            Some(&unowned_ownership),
+            Some(&fixture.measurement),
+        )
+        .expect_err("result evidence inside recovered quarantine must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("outside the exact quarantine being removed"));
+        assert!(quarantine.is_dir());
         assert!(!fixture.candidate.exists());
         Ok(())
     }
@@ -1351,6 +1454,28 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .ends_with(".execution.json"));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_deletion_rejects_a_nested_filesystem() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("candidate");
+        let nested = root.join("mounted");
+        fs::create_dir_all(&nested)?;
+        fs::write(nested.join("artifact"), "generated\n")?;
+
+        let error = ensure_single_filesystem_tree_with(&root, "device:1", |path| {
+            if path == nested {
+                Ok("device:2".to_string())
+            } else {
+                Ok("device:1".to_string())
+            }
+        })
+        .expect_err("nested filesystems must fail closed before deletion");
+
+        assert!(error.to_string().contains("contains a nested filesystem"));
+        assert!(nested.join("artifact").is_file());
         Ok(())
     }
 
