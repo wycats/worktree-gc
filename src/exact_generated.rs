@@ -624,13 +624,14 @@ fn count_status_entries(status: &[u8]) -> usize {
 }
 
 fn quarantine_path(git_common_dir: &Path, candidate: &Path, digest: &str) -> Result<PathBuf> {
-    let name = candidate
-        .file_name()
-        .context("candidate has no final path component")?;
+    let candidate = candidate
+        .to_str()
+        .context("candidate path is not valid UTF-8")?;
+    let candidate_digest = format!("{:x}", Sha256::digest(candidate.as_bytes()));
     Ok(git_common_dir
         .join("worktree-gc/exact-quarantine")
         .join(digest)
-        .join(name))
+        .join(candidate_digest))
 }
 
 fn validate_live_identity(
@@ -1219,6 +1220,24 @@ mod tests {
         assert!(run.result.recovered_quarantine);
         assert!(!quarantine.exists());
         assert!(!fixture.candidate.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_paths_distinguish_candidates_with_the_same_basename() -> Result<()> {
+        let temp = TempDir::new()?;
+        let git_common = temp.path().join("git-common");
+        let first = temp.path().join("first/node_modules");
+        let second = temp.path().join("second/node_modules");
+        let digest = "a".repeat(64);
+
+        let first_quarantine = quarantine_path(&git_common, &first, &digest)?;
+        let second_quarantine = quarantine_path(&git_common, &second, &digest)?;
+
+        assert_ne!(first_quarantine, second_quarantine);
+        assert_eq!(first_quarantine.parent(), second_quarantine.parent());
+        assert_eq!(first_quarantine.file_name().unwrap().len(), 64);
+        assert_eq!(second_quarantine.file_name().unwrap().len(), 64);
         Ok(())
     }
 

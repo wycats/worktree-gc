@@ -330,7 +330,7 @@ pub struct GeneratedDirMeasurement {
 struct GeneratedMeasurementTarget {
     priority: (u8, u8),
     identity: GeneratedDirIdentity,
-    locations: Vec<(usize, usize)>,
+    locations: Vec<(usize, usize, PathBuf)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -788,7 +788,9 @@ fn measure_cleanup_runs_matching(
     if let Some(path) = only_path {
         for run in runs.iter_mut() {
             for decision in &mut run.manifest.generated_dirs {
-                if decision.path == path {
+                if decision.path == path
+                    || fs::canonicalize(&decision.path).is_ok_and(|candidate| candidate == path)
+                {
                     decision.identity = None;
                     decision.measurement = None;
                 }
@@ -812,7 +814,6 @@ fn measure_cleanup_runs_matching(
 
         for (decision_index, decision) in run.manifest.generated_dirs.iter().enumerate() {
             if decision.action != GeneratedDirAction::Delete
-                || only_path.is_some_and(|path| decision.path != path)
                 || routine_worktree_removals
                     .iter()
                     .any(|worktree| decision.path.starts_with(worktree))
@@ -850,6 +851,9 @@ fn measure_cleanup_runs_matching(
                     });
                 }
             };
+            if only_path.is_some_and(|path| canonical != path) {
+                continue;
+            }
             let canonical_worktree =
                 fs::canonicalize(&decision.worktree_path).with_context(|| {
                     format!(
@@ -881,7 +885,9 @@ fn measure_cleanup_runs_matching(
                 decision.path.display()
             );
             target.priority = target.priority.min(priority);
-            target.locations.push((run_index, decision_index));
+            target
+                .locations
+                .push((run_index, decision_index, canonical_worktree));
         }
     }
 
@@ -918,11 +924,28 @@ fn measure_cleanup_runs_matching(
             visited_entries: root.visited_entries,
             metrics: root.metrics,
         };
-        for (run_index, decision_index) in &target.locations {
-            runs[*run_index].manifest.generated_dirs[*decision_index].identity =
-                Some(target.identity.clone());
-            runs[*run_index].manifest.generated_dirs[*decision_index].measurement =
-                Some(measurement.clone());
+        for (run_index, decision_index, canonical_worktree) in &target.locations {
+            let manifest = &mut runs[*run_index].manifest;
+            let previous_worktree = {
+                let decision = &mut manifest.generated_dirs[*decision_index];
+                let previous_worktree = decision.worktree_path.clone();
+                decision.path = target.identity.canonical_path.clone();
+                decision.worktree_path = canonical_worktree.clone();
+                decision.identity = Some(target.identity.clone());
+                decision.measurement = Some(measurement.clone());
+                previous_worktree
+            };
+            for worktree in &mut manifest.worktrees {
+                if worktree.path == previous_worktree {
+                    worktree.path = canonical_worktree.clone();
+                }
+            }
+            if manifest.current_worktree == previous_worktree {
+                manifest.current_worktree = canonical_worktree.clone();
+            }
+            if manifest.repo_root == previous_worktree {
+                manifest.repo_root = canonical_worktree.clone();
+            }
         }
     }
 
@@ -1239,7 +1262,19 @@ fn carry_generated_measurements(previous: &CleanupRun, refreshed: &mut CleanupRu
         .collect::<BTreeMap<_, _>>();
     for decision in &mut refreshed.manifest.generated_dirs {
         if let Some((identity, measurement)) = measurements.get(&decision.path) {
-            let live_identity = generated_dir_identity(&decision.path)?;
+            let live_identity = match generated_dir_identity(&decision.path) {
+                Ok(identity) => identity,
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<io::Error>()
+                            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+                    }) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if identity.as_ref() == Some(&live_identity) {
                 decision.identity = Some(live_identity);
                 decision.measurement = Some(measurement.clone());
@@ -6140,6 +6175,133 @@ mod tests {
             serialized["identity"]["canonical_path"],
             canonical_repo.join("node_modules").display().to_string()
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_measurement_canonicalizes_manifest_paths() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules");
+        fs::create_dir_all(candidate.join("pkg"))?;
+        fs::write(candidate.join("pkg/index.js"), "fixture\n")?;
+        let old = unix_days_before_now(10);
+        set_mtime(&candidate.join("pkg/index.js"), old)?;
+        set_mtime(&candidate.join("pkg"), old)?;
+        set_mtime(&candidate, old)?;
+
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+            &[],
+            None,
+        )?;
+        let alias = repo
+            .parent()
+            .context("repository has no parent")?
+            .join("repo-alias");
+        std::os::unix::fs::symlink(&repo, &alias)?;
+        let previous_worktree = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?
+            .worktree_path
+            .clone();
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter_mut()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing mutable node_modules decision")?;
+        decision.path = alias.join("node_modules");
+        decision.worktree_path = alias.clone();
+        for worktree in &mut run.manifest.worktrees {
+            if worktree.path == previous_worktree {
+                worktree.path = alias.clone();
+            }
+        }
+        if run.manifest.current_worktree == previous_worktree {
+            run.manifest.current_worktree = alias.clone();
+        }
+        if run.manifest.repo_root == previous_worktree {
+            run.manifest.repo_root = alias;
+        }
+
+        let canonical_repo = fs::canonicalize(&repo)?;
+        measure_cleanup_runs_matching(
+            std::slice::from_mut(&mut run),
+            100,
+            Some(&canonical_repo.join("node_modules")),
+        )?;
+
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing measured node_modules decision")?;
+        assert_eq!(decision.path, canonical_repo.join("node_modules"));
+        assert_eq!(decision.worktree_path, canonical_repo);
+        assert!(run
+            .manifest
+            .worktrees
+            .iter()
+            .any(|worktree| worktree.path == canonical_repo));
+        assert_eq!(run.manifest.current_worktree, canonical_repo);
+        assert_eq!(run.manifest.repo_root, canonical_repo);
+        Ok(())
+    }
+
+    #[test]
+    fn carrying_generated_measurements_skips_a_vanished_candidate() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules");
+        fs::create_dir_all(candidate.join("pkg"))?;
+        fs::write(candidate.join("pkg/index.js"), "fixture\n")?;
+        let old = unix_days_before_now(10);
+        set_mtime(&candidate.join("pkg/index.js"), old)?;
+        set_mtime(&candidate.join("pkg"), old)?;
+        set_mtime(&candidate, old)?;
+        let options = CleanupOptions {
+            execute: false,
+            stale_days: 30,
+            generated_days: 7,
+            generated_activity_only: true,
+            check_in_use: false,
+            generated_config: GeneratedDirConfig::default(),
+            cargo_lock_timeout: None,
+            defer_lock_timeouts: false,
+            pressure: None,
+            now: now(),
+        };
+        let mut previous = plan_cleanup_with_protections(Some(&repo), options.clone(), &[], None)?;
+        measure_cleanup_runs(std::slice::from_mut(&mut previous), 100)?;
+        let mut refreshed = plan_cleanup_with_protections(Some(&repo), options, &[], None)?;
+        fs::remove_dir_all(&candidate)?;
+
+        carry_generated_measurements(&previous, &mut refreshed)?;
+
+        let decision = refreshed
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing refreshed node_modules decision")?;
+        assert!(decision.identity.is_none());
+        assert!(decision.measurement.is_none());
         Ok(())
     }
 
