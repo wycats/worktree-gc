@@ -17,7 +17,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
@@ -302,6 +302,8 @@ pub struct GeneratedDirDecision {
     pub cleanup_class: CleanupClass,
     pub identity: Option<GeneratedDirIdentity>,
     pub measurement: Option<GeneratedDirMeasurement>,
+    pub source_dirty_count_without_candidate: Option<usize>,
+    pub source_status_sha256_without_candidate: Option<String>,
     pub sweeps: Vec<SweepDecision>,
     pub action: GeneratedDirAction,
     pub reason: String,
@@ -736,6 +738,8 @@ fn plan_cleanup_with_protections(
             cleanup_class: dir.cleanup_class,
             identity: None,
             measurement: None,
+            source_dirty_count_without_candidate: None,
+            source_status_sha256_without_candidate: None,
             sweeps: dir.sweeps.clone(),
             action: dir.action.clone(),
             reason: dir.reason.clone(),
@@ -793,6 +797,8 @@ fn measure_cleanup_runs_matching(
                 {
                     decision.identity = None;
                     decision.measurement = None;
+                    decision.source_dirty_count_without_candidate = None;
+                    decision.source_status_sha256_without_candidate = None;
                 }
             }
         }
@@ -925,6 +931,10 @@ fn measure_cleanup_runs_matching(
             metrics: root.metrics,
         };
         for (run_index, decision_index, canonical_worktree) in &target.locations {
+            let (source_dirty_count, source_status_sha256) = source_status_excluding_candidate(
+                canonical_worktree,
+                &target.identity.canonical_path,
+            )?;
             let manifest = &mut runs[*run_index].manifest;
             let previous_worktree = {
                 let decision = &mut manifest.generated_dirs[*decision_index];
@@ -933,6 +943,9 @@ fn measure_cleanup_runs_matching(
                 decision.worktree_path = canonical_worktree.clone();
                 decision.identity = Some(target.identity.clone());
                 decision.measurement = Some(measurement.clone());
+                decision.source_dirty_count_without_candidate = Some(source_dirty_count);
+                decision.source_status_sha256_without_candidate =
+                    Some(source_status_sha256.clone());
                 previous_worktree
             };
             for worktree in &mut manifest.worktrees {
@@ -1255,13 +1268,20 @@ fn carry_generated_measurements(previous: &CleanupRun, refreshed: &mut CleanupRu
             decision.measurement.clone().map(|measurement| {
                 (
                     decision.path.clone(),
-                    (decision.identity.clone(), measurement),
+                    (
+                        decision.identity.clone(),
+                        measurement,
+                        decision.source_dirty_count_without_candidate,
+                        decision.source_status_sha256_without_candidate.clone(),
+                    ),
                 )
             })
         })
         .collect::<BTreeMap<_, _>>();
     for decision in &mut refreshed.manifest.generated_dirs {
-        if let Some((identity, measurement)) = measurements.get(&decision.path) {
+        if let Some((identity, measurement, source_dirty_count, source_status_sha256)) =
+            measurements.get(&decision.path)
+        {
             let live_identity = match generated_dir_identity(&decision.path) {
                 Ok(identity) => identity,
                 Err(error)
@@ -1278,6 +1298,8 @@ fn carry_generated_measurements(previous: &CleanupRun, refreshed: &mut CleanupRu
             if identity.as_ref() == Some(&live_identity) {
                 decision.identity = Some(live_identity);
                 decision.measurement = Some(measurement.clone());
+                decision.source_dirty_count_without_candidate = *source_dirty_count;
+                decision.source_status_sha256_without_candidate = source_status_sha256.clone();
             }
         }
     }
@@ -2083,6 +2105,54 @@ fn dirty_status(path: &Path) -> Result<DirtyStatus> {
         status_sha256,
         newest_dirty_mtime_unix,
     })
+}
+
+fn source_status_excluding_candidate(worktree: &Path, candidate: &Path) -> Result<(usize, String)> {
+    let relative = candidate.strip_prefix(worktree).with_context(|| {
+        format!(
+            "generated candidate {} is outside worktree {}",
+            candidate.display(),
+            worktree.display()
+        )
+    })?;
+    let relative = relative
+        .to_str()
+        .context("generated candidate relative path is not valid UTF-8")?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let mut exclude = OsString::from(":(top,exclude,literal)");
+    exclude.push(relative);
+    let output = Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ])
+        .arg(exclude)
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run git status in {}", worktree.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git status failed in {}: {}",
+        worktree.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut dirty_count = 0;
+    let mut parts = output.stdout.split(|byte| *byte == 0);
+    while let Some(entry) = parts.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        dirty_count += 1;
+        if matches!(entry.first(), Some(b'R' | b'C')) || matches!(entry.get(1), Some(b'R' | b'C')) {
+            let _ = parts.next();
+        }
+    }
+    Ok((dirty_count, format!("{:x}", Sha256::digest(&output.stdout))))
 }
 
 #[derive(Debug)]
@@ -5001,6 +5071,8 @@ mod tests {
             cleanup_class: CleanupClass::Routine,
             identity: None,
             measurement: None,
+            source_dirty_count_without_candidate: None,
+            source_status_sha256_without_candidate: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
             reason: "stale target".to_string(),
@@ -5039,6 +5111,8 @@ mod tests {
             cleanup_class: CleanupClass::Routine,
             identity: None,
             measurement: None,
+            source_dirty_count_without_candidate: None,
+            source_status_sha256_without_candidate: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
             reason: "stale target".to_string(),
@@ -5441,6 +5515,8 @@ mod tests {
             cleanup_class: CleanupClass::Routine,
             identity: None,
             measurement: None,
+            source_dirty_count_without_candidate: None,
+            source_status_sha256_without_candidate: None,
             sweeps: vec![SweepDecision {
                 tool: SweepTool::CargoSweep,
                 limit: SweepLimit::MaxSize { bytes: 1_000_000 },
@@ -5606,6 +5682,8 @@ mod tests {
                             ..InventoryMetrics::default()
                         },
                     }),
+                    source_dirty_count_without_candidate: None,
+                    source_status_sha256_without_candidate: None,
                     sweeps: Vec::new(),
                     action: GeneratedDirAction::Delete,
                     reason: "pressure fixture".to_string(),
@@ -5720,6 +5798,8 @@ mod tests {
             cleanup_class: CleanupClass::Pressure,
             identity: None,
             measurement: None,
+            source_dirty_count_without_candidate: None,
+            source_status_sha256_without_candidate: None,
             sweeps: Vec::new(),
             action: GeneratedDirAction::Delete,
             reason: "pressure fixture".to_string(),
@@ -6160,6 +6240,11 @@ mod tests {
             .context("missing current worktree decision")?;
         assert!(worktree.head.is_some());
         assert!(worktree.status_sha256.is_some());
+        assert!(decision.source_dirty_count_without_candidate.is_some());
+        assert!(decision
+            .source_status_sha256_without_candidate
+            .as_ref()
+            .is_some_and(|digest| digest.len() == 64));
 
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&run.manifest_path)?)?;
         let serialized = json["generated_dirs"]
@@ -6175,6 +6260,12 @@ mod tests {
             serialized["identity"]["canonical_path"],
             canonical_repo.join("node_modules").display().to_string()
         );
+        assert!(serialized["source_dirty_count_without_candidate"]
+            .as_u64()
+            .is_some());
+        assert!(serialized["source_status_sha256_without_candidate"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64));
         Ok(())
     }
 
@@ -6302,6 +6393,8 @@ mod tests {
             .context("missing refreshed node_modules decision")?;
         assert!(decision.identity.is_none());
         assert!(decision.measurement.is_none());
+        assert!(decision.source_dirty_count_without_candidate.is_none());
+        assert!(decision.source_status_sha256_without_candidate.is_none());
         Ok(())
     }
 

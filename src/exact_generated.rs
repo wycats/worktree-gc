@@ -123,6 +123,8 @@ struct ApprovedGeneratedDecision {
     cleanup_class: CleanupClass,
     identity: Option<GeneratedDirIdentity>,
     measurement: Option<GeneratedDirMeasurement>,
+    source_dirty_count_without_candidate: Option<usize>,
+    source_status_sha256_without_candidate: Option<String>,
     action: GeneratedDirAction,
 }
 
@@ -162,7 +164,7 @@ fn execute_approved_generated_with_ownership(
     approval_digest: &str,
     candidate: &Path,
     result_path: Option<&Path>,
-    ownership_override: Option<(HashSet<PathBuf>, bool)>,
+    ownership_override: Option<&dyn Fn() -> (HashSet<PathBuf>, bool)>,
     measurement_override: Option<&GeneratedDirMeasurement>,
 ) -> Result<ApprovedGeneratedExecutionRun> {
     anyhow::ensure!(
@@ -217,6 +219,8 @@ fn execute_approved_generated_with_ownership(
             )
         })?;
     let approved_source = approved_source_identity(approved_worktree)?;
+    let approved_source_without_candidate =
+        approved_source_identity_without_candidate(approved_worktree, decision)?;
     let identity = decision
         .identity
         .as_ref()
@@ -286,12 +290,6 @@ fn execute_approved_generated_with_ownership(
     );
     validate_candidate_lexical_boundary(candidate, decision, &worktree)?;
     validate_git_generated_boundary(&worktree, candidate)?;
-    let source_before = source_identity(&worktree)?;
-    anyhow::ensure!(
-        source_before == approved_source,
-        "worktree source identity changed since approval"
-    );
-
     let quarantine = quarantine_path(&git_common_dir, candidate, &actual_digest)?;
     let candidate_exists = candidate.try_exists()?;
     let quarantine_exists = quarantine.try_exists()?;
@@ -307,6 +305,20 @@ fn execute_approved_generated_with_ownership(
     } else {
         candidate
     };
+    let source_before = source_identity(&worktree)?;
+    let source_without_candidate_before = source_identity_excluding(&worktree, candidate)?;
+    anyhow::ensure!(
+        source_without_candidate_before == approved_source_without_candidate,
+        "worktree filtered source identity changed since approval"
+    );
+    anyhow::ensure!(
+        if recovered_quarantine {
+            source_before.head == approved_source.head
+        } else {
+            source_before == approved_source
+        },
+        "worktree source identity changed since approval"
+    );
     if !recovered_quarantine {
         ensure_pressure_still_needed(active_path, pressure.target_bytes)?;
     }
@@ -323,11 +335,12 @@ fn execute_approved_generated_with_ownership(
     );
 
     let ownership_paths = vec![worktree.clone(), active_path.to_path_buf()];
-    validate_current_ownership(&ownership_paths, ownership_override.as_ref())?;
+    validate_current_ownership(&ownership_paths, ownership_override)?;
 
-    let result_path = result_path
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_result_path(manifest_path, &actual_digest));
+    let result_path = match result_path {
+        Some(path) => path.to_path_buf(),
+        None => default_result_path(manifest_path, &actual_digest, candidate)?,
+    };
     validate_result_path(&result_path, &worktree, &git_common_dir)?;
 
     let target_lock_timeout = if decision.name == "target" && !recovered_quarantine {
@@ -352,7 +365,7 @@ fn execute_approved_generated_with_ownership(
     ];
     let execution = with_protection_guard_for_paths(&guard_paths, SystemTime::now(), || {
         if let Some(lock_timeout) = target_lock_timeout {
-            validate_current_ownership(&ownership_paths, ownership_override.as_ref())?;
+            validate_current_ownership(&ownership_paths, ownership_override)?;
             with_cargo_profile_locks_timeout(candidate, &worktree, Some(lock_timeout), || {
                 CandidateExecution {
                     candidate,
@@ -361,10 +374,11 @@ fn execute_approved_generated_with_ownership(
                     approved_measurement,
                     worktree: &worktree,
                     approved_source: &approved_source,
+                    approved_source_without_candidate: &approved_source_without_candidate,
                     recovered_quarantine,
                     pressure_target_bytes: pressure.target_bytes,
-                    recheck_ownership: false,
-                    ownership_override: ownership_override.as_ref(),
+                    recheck_ownership: true,
+                    ownership_override,
                     measurement_override,
                     result_path: &result_path,
                 }
@@ -378,10 +392,11 @@ fn execute_approved_generated_with_ownership(
                 approved_measurement,
                 worktree: &worktree,
                 approved_source: &approved_source,
+                approved_source_without_candidate: &approved_source_without_candidate,
                 recovered_quarantine,
                 pressure_target_bytes: pressure.target_bytes,
                 recheck_ownership: true,
-                ownership_override: ownership_override.as_ref(),
+                ownership_override,
                 measurement_override,
                 result_path: &result_path,
             }
@@ -409,7 +424,9 @@ fn execute_approved_generated_with_ownership(
     );
     let source_after = source_identity(&worktree)?;
     anyhow::ensure!(
-        source_after == approved_source,
+        source_after.head == approved_source.head
+            && source_identity_excluding(&worktree, candidate)?
+                == approved_source_without_candidate,
         "worktree source identity changed during exact generated execution"
     );
     let available_after = fs4::available_space(&worktree)?;
@@ -505,6 +522,25 @@ fn approved_source_identity(worktree: &ApprovedWorktreeDecision) -> Result<Sourc
     })
 }
 
+fn approved_source_identity_without_candidate(
+    worktree: &ApprovedWorktreeDecision,
+    decision: &ApprovedGeneratedDecision,
+) -> Result<SourceIdentity> {
+    Ok(SourceIdentity {
+        head: worktree
+            .head
+            .clone()
+            .context("approved worktree has no HEAD identity")?,
+        dirty_count: decision
+            .source_dirty_count_without_candidate
+            .context("approved candidate has no filtered source status")?,
+        status_sha256: decision
+            .source_status_sha256_without_candidate
+            .clone()
+            .context("approved candidate has no filtered source status digest")?,
+    })
+}
+
 fn validate_approved_measurement(measurement: &GeneratedDirMeasurement) -> Result<()> {
     anyhow::ensure!(measurement.complete, "approved measurement is incomplete");
     anyhow::ensure!(
@@ -562,16 +598,6 @@ fn validate_git_generated_boundary(worktree: &Path, candidate: &Path) -> Result<
         tracked.stdout.is_empty(),
         "candidate now contains tracked content"
     );
-    if candidate.try_exists()? {
-        let ignored = Command::new("git")
-            .args(["check-ignore", "--quiet", "--"])
-            .arg(relative)
-            .current_dir(worktree)
-            .stdin(Stdio::null())
-            .status()
-            .with_context(|| format!("failed to run git check-ignore in {}", worktree.display()))?;
-        anyhow::ensure!(ignored.success(), "candidate is no longer ignored by Git");
-    }
     Ok(())
 }
 
@@ -608,6 +634,18 @@ fn source_identity(worktree: &Path) -> Result<SourceIdentity> {
     })
 }
 
+fn source_identity_excluding(worktree: &Path, candidate: &Path) -> Result<SourceIdentity> {
+    let (dirty_count, status_sha256) =
+        crate::source_status_excluding_candidate(worktree, candidate)?;
+    Ok(SourceIdentity {
+        head: git_output(worktree, ["rev-parse", "HEAD"])?
+            .trim()
+            .to_string(),
+        dirty_count,
+        status_sha256,
+    })
+}
+
 fn count_status_entries(status: &[u8]) -> usize {
     let mut count = 0;
     let mut parts = status.split(|byte| *byte == 0);
@@ -624,14 +662,18 @@ fn count_status_entries(status: &[u8]) -> usize {
 }
 
 fn quarantine_path(git_common_dir: &Path, candidate: &Path, digest: &str) -> Result<PathBuf> {
-    let candidate = candidate
-        .to_str()
-        .context("candidate path is not valid UTF-8")?;
-    let candidate_digest = format!("{:x}", Sha256::digest(candidate.as_bytes()));
+    let candidate_digest = candidate_path_digest(candidate)?;
     Ok(git_common_dir
         .join("worktree-gc/exact-quarantine")
         .join(digest)
         .join(candidate_digest))
+}
+
+fn candidate_path_digest(candidate: &Path) -> Result<String> {
+    let candidate = candidate
+        .to_str()
+        .context("candidate path is not valid UTF-8")?;
+    Ok(format!("{:x}", Sha256::digest(candidate.as_bytes())))
 }
 
 fn validate_live_identity(
@@ -697,10 +739,10 @@ fn measurements_match(approved: &GeneratedDirMeasurement, live: &GeneratedDirMea
 
 fn validate_current_ownership(
     paths: &[PathBuf],
-    ownership_override: Option<&(HashSet<PathBuf>, bool)>,
+    ownership_override: Option<&dyn Fn() -> (HashSet<PathBuf>, bool)>,
 ) -> Result<()> {
     let (owned_paths, ownership_complete) = ownership_override
-        .cloned()
+        .map(|capture| capture())
         .unwrap_or_else(|| open_handle_evidence_for_paths(paths));
     anyhow::ensure!(
         ownership_complete,
@@ -734,18 +776,26 @@ struct CandidateExecution<'a> {
     approved_measurement: &'a GeneratedDirMeasurement,
     worktree: &'a Path,
     approved_source: &'a SourceIdentity,
+    approved_source_without_candidate: &'a SourceIdentity,
     recovered_quarantine: bool,
     pressure_target_bytes: u64,
     recheck_ownership: bool,
-    ownership_override: Option<&'a (HashSet<PathBuf>, bool)>,
+    ownership_override: Option<&'a dyn Fn() -> (HashSet<PathBuf>, bool)>,
     measurement_override: Option<&'a GeneratedDirMeasurement>,
     result_path: &'a Path,
 }
 
 impl CandidateExecution<'_> {
     fn execute(&self) -> Result<(GeneratedDirMeasurement, AtomicWriteFile)> {
+        let source = source_identity(self.worktree)?;
+        let source_without_candidate = source_identity_excluding(self.worktree, self.candidate)?;
         anyhow::ensure!(
-            source_identity(self.worktree)? == *self.approved_source,
+            source_without_candidate == *self.approved_source_without_candidate
+                && if self.recovered_quarantine {
+                    source.head == self.approved_source.head
+                } else {
+                    source == *self.approved_source
+                },
             "worktree source identity changed immediately before quarantine"
         );
         let active_path = if self.recovered_quarantine {
@@ -871,12 +921,17 @@ fn parse_approval_digest(raw: &str) -> Result<String> {
     Ok(digest.to_string())
 }
 
-fn default_result_path(manifest_path: &Path, digest: &str) -> PathBuf {
+fn default_result_path(manifest_path: &Path, digest: &str, candidate: &Path) -> Result<PathBuf> {
     let filename = manifest_path
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("cleanup-manifest.json");
-    manifest_path.with_file_name(format!("{filename}.{}.execution.json", &digest[..16]))
+    let candidate_digest = candidate_path_digest(candidate)?;
+    Ok(manifest_path.with_file_name(format!(
+        "{filename}.{}.{}.execution.json",
+        &digest[..16],
+        &candidate_digest[..32]
+    )))
 }
 
 fn validate_result_path(path: &Path, worktree: &Path, git_common_dir: &Path) -> Result<()> {
@@ -957,6 +1012,14 @@ mod tests {
         measurement: GeneratedDirMeasurement,
     }
 
+    fn unowned_ownership() -> (HashSet<PathBuf>, bool) {
+        (HashSet::new(), true)
+    }
+
+    fn incomplete_ownership() -> (HashSet<PathBuf>, bool) {
+        (HashSet::new(), false)
+    }
+
     impl Fixture {
         fn execute(&self) -> Result<ApprovedGeneratedExecutionRun> {
             execute_approved_generated_with_ownership(
@@ -964,7 +1027,7 @@ mod tests {
                 &self.digest,
                 &self.candidate,
                 None,
-                Some((HashSet::new(), true)),
+                Some(&unowned_ownership),
                 Some(&self.measurement),
             )
         }
@@ -985,6 +1048,27 @@ mod tests {
         fs::write(&fixture.manifest, &bytes)?;
         fixture.digest = format!("sha256:{:x}", Sha256::digest(&bytes));
         Ok(())
+    }
+
+    fn unignore_candidate(fixture: &mut Fixture) -> Result<()> {
+        fs::write(fixture.repo.join(".gitignore"), "")?;
+        git(&fixture.repo, ["add", ".gitignore"])?;
+        git(
+            &fixture.repo,
+            ["commit", "-m", "unignore generated fixture"],
+        )?;
+        let source = source_identity(&fixture.repo)?;
+        let source_without_candidate =
+            source_identity_excluding(&fixture.repo, &fixture.candidate)?;
+        rewrite_repository_manifest(fixture, |manifest| {
+            manifest["worktrees"][0]["head"] = json!(source.head);
+            manifest["worktrees"][0]["dirty_count"] = json!(source.dirty_count);
+            manifest["worktrees"][0]["status_sha256"] = json!(source.status_sha256);
+            manifest["generated_dirs"][0]["source_dirty_count_without_candidate"] =
+                json!(source_without_candidate.dirty_count);
+            manifest["generated_dirs"][0]["source_status_sha256_without_candidate"] =
+                json!(source_without_candidate.status_sha256);
+        })
     }
 
     fn fixture_for_name(root_manifest: bool, name: &str) -> Result<Fixture> {
@@ -1024,6 +1108,7 @@ mod tests {
         fs::write(candidate.join("cache/artifact"), "generated\n")?;
         let candidate = fs::canonicalize(candidate)?;
         let source = source_identity(&repo)?;
+        let source_without_candidate = source_identity_excluding(&repo, &candidate)?;
         let identity = generated_dir_identity(&candidate)?;
         let measurement = GeneratedDirMeasurement {
             measured_at_unix: 1,
@@ -1073,6 +1158,8 @@ mod tests {
                 "cleanup_class": "pressure",
                 "identity": identity,
                 "measurement": measurement,
+                "source_dirty_count_without_candidate": source_without_candidate.dirty_count,
+                "source_status_sha256_without_candidate": source_without_candidate.status_sha256,
                 "action": "delete",
             }],
         });
@@ -1121,7 +1208,7 @@ mod tests {
             &format!("sha256:{}", "0".repeat(64)),
             &fixture.candidate,
             None,
-            Some((HashSet::new(), true)),
+            Some(&unowned_ownership),
             Some(&fixture.measurement),
         )
         .expect_err("digest drift must fail closed");
@@ -1242,6 +1329,32 @@ mod tests {
     }
 
     #[test]
+    fn default_result_paths_distinguish_candidates_from_one_manifest() -> Result<()> {
+        let temp = TempDir::new()?;
+        let manifest = temp.path().join("approved.json");
+        let first = temp.path().join("first/node_modules");
+        let second = temp.path().join("second/node_modules");
+        let digest = "a".repeat(64);
+
+        let first_result = default_result_path(&manifest, &digest, &first)?;
+        let second_result = default_result_path(&manifest, &digest, &second)?;
+
+        assert_ne!(first_result, second_result);
+        assert_eq!(first_result.parent(), second_result.parent());
+        assert!(first_result
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".execution.json"));
+        assert!(second_result
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".execution.json"));
+        Ok(())
+    }
+
+    #[test]
     fn exact_execution_rejects_incomplete_live_ownership_evidence() -> Result<()> {
         let fixture = fixture(false)?;
         let error = execute_approved_generated_with_ownership(
@@ -1249,7 +1362,7 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             None,
-            Some((HashSet::new(), false)),
+            Some(&incomplete_ownership),
             Some(&fixture.measurement),
         )
         .expect_err("incomplete ownership evidence must fail closed");
@@ -1269,7 +1382,7 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             None,
-            Some((HashSet::from([fixture.candidate.clone()]), true)),
+            Some(&|| (HashSet::from([fixture.candidate.clone()]), true)),
             Some(&fixture.measurement),
         )
         .expect_err("current ownership must fail closed");
@@ -1289,6 +1402,40 @@ mod tests {
         fixture.execute()?;
 
         assert!(!fixture.candidate.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn target_execution_rechecks_ownership_inside_profile_locks() -> Result<()> {
+        let fixture = fixture_for_name(false, "target")?;
+        fs::write(fixture.candidate.join("debug/.cargo-lock"), "")?;
+        let snapshots = std::cell::Cell::new(0);
+        let candidate = fixture.candidate.clone();
+        let ownership = || {
+            let snapshot = snapshots.get() + 1;
+            snapshots.set(snapshot);
+            if snapshot >= 3 {
+                (HashSet::from([candidate.clone()]), true)
+            } else {
+                (HashSet::new(), true)
+            }
+        };
+
+        let error = execute_approved_generated_with_ownership(
+            &fixture.manifest,
+            &fixture.digest,
+            &fixture.candidate,
+            None,
+            Some(&ownership),
+            Some(&fixture.measurement),
+        )
+        .expect_err("ownership appearing during a Cargo lock wait must fail closed");
+
+        assert_eq!(snapshots.get(), 3);
+        assert!(error
+            .to_string()
+            .contains("current process ownership exists"));
+        assert!(fixture.candidate.is_dir());
         Ok(())
     }
 
@@ -1315,13 +1462,45 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             Some(&fixture.repo.join("execution.json")),
-            Some((HashSet::new(), true)),
+            Some(&unowned_ownership),
             Some(&fixture.measurement),
         )
         .expect_err("execution evidence must not dirty the owner worktree");
 
         assert!(error.to_string().contains("outside the owner worktree"));
         assert!(fixture.candidate.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_execution_accepts_untracked_unignored_generated_content() -> Result<()> {
+        let mut fixture = fixture(false)?;
+        unignore_candidate(&mut fixture)?;
+
+        fixture.execute()?;
+
+        assert!(!fixture.candidate.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_execution_recovers_an_untracked_unignored_quarantine() -> Result<()> {
+        let mut fixture = fixture(false)?;
+        unignore_candidate(&mut fixture)?;
+        let digest = fixture.digest.strip_prefix("sha256:").unwrap();
+        let quarantine = quarantine_path(
+            &fs::canonicalize(fixture.repo.join(".git"))?,
+            &fixture.candidate,
+            digest,
+        )?;
+        fs::create_dir_all(quarantine.parent().unwrap())?;
+        fs::rename(&fixture.candidate, &quarantine)?;
+
+        let run = fixture.execute()?;
+
+        assert!(run.result.recovered_quarantine);
+        assert!(!quarantine.exists());
+        assert!(!fixture.candidate.exists());
         Ok(())
     }
 
@@ -1341,7 +1520,7 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             Some(&result_path),
-            Some((HashSet::new(), true)),
+            Some(&unowned_ownership),
             Some(&fixture.measurement),
         )
         .expect_err("an unwritable result must fail before candidate deletion");
