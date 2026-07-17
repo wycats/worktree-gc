@@ -232,6 +232,7 @@ struct GeneratedArgs {
         long = "delete-generated",
         value_name = "NAME",
         value_delimiter = ',',
+        value_parser = parse_generated_name,
         help = "Generated directory name to delete when stale; repeat or comma-separate"
     )]
     delete_generated: Vec<String>,
@@ -240,6 +241,7 @@ struct GeneratedArgs {
         long = "report-generated",
         value_name = "NAME",
         value_delimiter = ',',
+        value_parser = parse_generated_name,
         help = "Generated directory name to report but not delete; repeat or comma-separate"
     )]
     report_generated: Vec<String>,
@@ -275,19 +277,36 @@ struct GeneratedArgs {
     no_default_generated: bool,
 }
 
+fn parse_generated_name(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim();
+    let mut components = Path::new(normalized).components();
+    let is_literal_component = matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(component)), None)
+            if component == OsStr::new(normalized)
+    );
+    if normalized.is_empty()
+        || !is_literal_component
+        || normalized == ".git"
+        || normalized.contains('\0')
+    {
+        return Err(format!(
+            "invalid generated directory name {raw:?}: name must be one literal directory-name component"
+        ));
+    }
+    Ok(normalized.to_string())
+}
+
 fn parse_window_override(raw: &str) -> Result<(String, u64), String> {
     let (name, days) = raw
         .split_once('=')
         .ok_or_else(|| format!("expected NAME=DAYS, got '{raw}'"))?;
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(format!("expected NAME=DAYS, got '{raw}'"));
-    }
+    let name = parse_generated_name(name)?;
     let days = days
         .trim()
         .parse::<u64>()
         .map_err(|_| format!("invalid day count in '{raw}'"))?;
-    Ok((name.to_string(), days))
+    Ok((name, days))
 }
 
 fn parse_sweep_strategy(raw: &str) -> Result<SweepStrategy, String> {
@@ -365,28 +384,14 @@ fn tool_name(tool: &SweepTool) -> &'static str {
 fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<GeneratedDirConfig> {
     let mut delete_generated = Vec::new();
     for name in &cleanup.delete_generated {
-        let normalized = name.trim();
-        anyhow::ensure!(
-            !normalized.is_empty(),
-            "invalid delete_generated name {name:?}: name must not be empty"
-        );
-        let mut components = Path::new(normalized).components();
-        let is_literal_component = matches!(
-            (components.next(), components.next()),
-            (Some(Component::Normal(component)), None)
-                if component == OsStr::new(normalized)
-        );
-        anyhow::ensure!(
-            is_literal_component && normalized != ".git" && !normalized.contains('\0'),
-            "invalid delete_generated name {name:?}: name must be one directory-name component"
-        );
+        let normalized = parse_generated_name(name).map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
             !delete_generated
                 .iter()
-                .any(|existing| existing == normalized),
+                .any(|existing| existing == &normalized),
             "delete_generated names normalize to duplicate name {normalized:?}"
         );
-        delete_generated.push(normalized.to_string());
+        delete_generated.push(normalized);
     }
 
     let mut generated_windows = std::collections::BTreeMap::new();
@@ -1227,9 +1232,44 @@ owner_free_generated = true
             ))?;
             let error = scheduled_generated_config(&cleanup)
                 .expect_err("invalid custom generated names must be rejected");
-            assert!(error.to_string().contains("delete_generated name"));
+            assert!(error.to_string().contains("generated directory name"));
         }
         Ok(())
+    }
+
+    #[test]
+    fn cli_generated_names_require_literal_directory_components() {
+        let valid = cleanup_config(&[
+            "--delete-generated",
+            "node_modules.partial-install",
+            "--report-generated",
+            "coverage",
+            "--generated-window",
+            "node_modules.partial-install=1",
+        ]);
+        assert!(valid
+            .delete_names
+            .iter()
+            .any(|name| name == "node_modules.partial-install"));
+        assert!(valid
+            .report_only_names
+            .iter()
+            .any(|name| name == "coverage"));
+        assert_eq!(valid.effective_days("node_modules.partial-install", 7), 1);
+
+        for option in [
+            "--delete-generated",
+            "--report-generated",
+            "--generated-window",
+        ] {
+            let value = if option == "--generated-window" {
+                "nested/name=1"
+            } else {
+                "nested/name"
+            };
+            let result = Cli::try_parse_from(["worktree-gc", "cleanup", option, value]);
+            assert!(result.is_err(), "{option} accepted a path-like name");
+        }
     }
 
     #[test]
