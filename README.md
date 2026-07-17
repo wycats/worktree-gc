@@ -305,8 +305,10 @@ roots = [
 [cleanup]
 stale_days = 14
 generated_days = 7
+# Add coarse rebuildable roots that are specific to your tools or workflows.
+delete_generated = ["node_modules.partial-install"]
 # Per-directory entries override generated_days and any tighter built-in window.
-generated_windows = { ".next" = 7, ".turbo" = 7, target = 7, node_modules = 7 }
+generated_windows = { ".next" = 7, ".turbo" = 7, target = 7, node_modules = 7, "node_modules.partial-install" = 7 }
 generated_activity_only = true
 check_in_use = true
 cargo_lock_timeout_minutes = 30
@@ -328,9 +330,11 @@ retention_days = 90
 repository_refresh_days = 7
 ```
 
+`delete_generated` has the same meaning as repeated CLI `--delete-generated`
+arguments. Every entry must be one literal directory-name component.
 `generated_windows` has the same meaning as repeated CLI
-`--generated-window NAME=DAYS` arguments and applies to any configured generated
-directory name. Build caches (`.next`, `.turbo`, and `target`) otherwise use a
+`--generated-window NAME=DAYS` arguments and applies to any default or explicitly
+configured generated directory name. Build caches (`.next`, `.turbo`, and `target`) otherwise use a
 tighter built-in window; other names use `generated_days`.
 
 The Cargo lock timeout applies to each generated `target` directory. A

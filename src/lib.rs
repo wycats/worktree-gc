@@ -7388,4 +7388,44 @@ mod tests {
         assert_eq!(logs.action, GeneratedDirAction::ReportOnly);
         Ok(())
     }
+
+    #[test]
+    fn custom_generated_parent_collapses_nested_default_candidates() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("partial-install");
+        add_worktree(&repo, &worktree, "partial-install-branch")?;
+        let partial = worktree.join("node_modules.partial-install");
+        fs::create_dir_all(partial.join(".pnpm/pkg/node_modules"))?;
+        fs::write(partial.join(".pnpm/pkg/node_modules/module.js"), "module\n")?;
+        fs::write(
+            worktree.join(".gitignore"),
+            "node_modules\n.next\n.turbo\ntarget\nnode_modules.partial-install\n",
+        )?;
+
+        let report = triage(
+            Some(&repo),
+            TriageOptions {
+                stale_days: 10_000,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::from_names(
+                    true,
+                    vec!["node_modules.partial-install".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                now: now(),
+            },
+        )?;
+
+        assert_eq!(report.generated_dirs.len(), 1);
+        assert_eq!(report.generated_dirs[0].path, fs::canonicalize(partial)?);
+        assert_eq!(
+            report.generated_dirs[0].name,
+            "node_modules.partial-install"
+        );
+        Ok(())
+    }
 }
