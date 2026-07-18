@@ -405,7 +405,7 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
             (!cleanup.no_default_generated
                 && DEFAULT_GENERATED_DELETE_NAMES.contains(&normalized))
                 || delete_generated.iter().any(|configured| configured == normalized),
-            "invalid generated_windows key {name:?}: name is not a default or configured delete_generated root"
+            "invalid generated_windows key {name:?}: name is not an active default or configured delete_generated root; defaults may be disabled by no_default_generated"
         );
         anyhow::ensure!(
             generated_windows
@@ -1182,7 +1182,12 @@ generated_windows = { ".next" = 1, target = 1, "node_modules.partial-install" = 
         assert!(error
             .to_string()
             .contains("generated_windows key \"node_modules\""));
-        assert!(error.to_string().contains("not a default or configured"));
+        assert!(error
+            .to_string()
+            .contains("not an active default or configured"));
+        assert!(error
+            .to_string()
+            .contains("defaults may be disabled by no_default_generated"));
 
         let unselected_sweep: config::CleanupConfig = toml::from_str(
             "no_default_generated = true\ndelete_generated = ['.next']\ncargo_sweep_max_size = '1GB'",
@@ -1272,7 +1277,9 @@ owner_free_generated = true
         let error = scheduled_generated_config(&typo)
             .expect_err("inactive scheduled names must be rejected");
         assert!(error.to_string().contains("generated_windows key \".nex\""));
-        assert!(error.to_string().contains("not a default or configured"));
+        assert!(error
+            .to_string()
+            .contains("not an active default or configured"));
 
         for invalid in [
             "",
