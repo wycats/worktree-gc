@@ -193,6 +193,7 @@ pub struct CleanupManifest {
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
     pub protections: Vec<ProtectionLease>,
+    pub metadata_prune_enabled: bool,
     pub prune_output: String,
     pub worktrees: Vec<WorktreeDecision>,
     pub generated_dirs: Vec<GeneratedDirDecision>,
@@ -722,10 +723,11 @@ fn plan_cleanup_with_protections_in_roots(
             pressure: options.pressure.as_ref(),
         },
     )?;
-    let prune_output = if roots.is_some() {
-        String::new()
-    } else {
+    let metadata_prune_enabled = roots.is_none();
+    let prune_output = if metadata_prune_enabled {
         run_worktree_prune(&context.current_worktree, false)?
+    } else {
+        String::new()
     };
 
     let worktree_decisions = plan_worktree_cleanup(
@@ -781,6 +783,7 @@ fn plan_cleanup_with_protections_in_roots(
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
         protections: protections.to_vec(),
+        metadata_prune_enabled,
         prune_output,
         worktrees: worktree_decisions,
         generated_dirs: generated_decisions,
@@ -1451,7 +1454,7 @@ fn execute_cleanup_manifest_matching(
         return execute_cleanup(manifest, pass, only_generated_path);
     }
     let worktree_paths = prunable_worktree_paths(&manifest.worktrees);
-    if !manifest.prune_output.trim().is_empty() {
+    if manifest.metadata_prune_enabled {
         match with_protection_guard_for_paths(&worktree_paths, SystemTime::now(), || {
             run_worktree_prune(&manifest.current_worktree, true)
         })? {
@@ -5657,6 +5660,8 @@ mod tests {
             .worktrees
             .iter()
             .any(|d| d.path == expected_worktree && d.action == WorktreeAction::Remove));
+        assert!(run.manifest.metadata_prune_enabled);
+        assert!(run.manifest.prune_output.is_empty());
         Ok(())
     }
 
@@ -5797,6 +5802,7 @@ mod tests {
                 generated_delete_names: Vec::new(),
                 generated_report_only_names: Vec::new(),
                 protections: Vec::new(),
+                metadata_prune_enabled: true,
                 prune_output: String::new(),
                 worktrees: Vec::new(),
                 generated_dirs,
@@ -5918,6 +5924,7 @@ mod tests {
             generated_delete_names: Vec::new(),
             generated_report_only_names: Vec::new(),
             protections: Vec::new(),
+            metadata_prune_enabled: true,
             prune_output: String::new(),
             worktrees: Vec::new(),
             generated_dirs: vec![decision(first.clone()), decision(second.clone())],
@@ -6108,6 +6115,7 @@ mod tests {
         assert_eq!(repository.worktrees[0].path, selected);
         assert_eq!(repository.generated_dirs.len(), 1);
         assert_eq!(repository.generated_dirs[0].path, selected.join(".next"));
+        assert!(!repository.metadata_prune_enabled);
         assert!(repository.prune_output.is_empty());
         Ok(())
     }
