@@ -416,6 +416,11 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
     }
     let mut sweeps = Vec::new();
     if let Some(size) = &cleanup.cargo_sweep_max_size {
+        anyhow::ensure!(
+            !cleanup.no_default_generated
+                || delete_generated.iter().any(|configured| configured == "target"),
+            "cargo_sweep_max_size requires target in delete_generated when no_default_generated = true"
+        );
         let bytes = parse_size::parse_size(size)?;
         sweeps.push(SweepStrategy {
             name: "target".to_string(),
@@ -1178,6 +1183,23 @@ generated_windows = { ".next" = 1, target = 1, "node_modules.partial-install" = 
             .to_string()
             .contains("generated_windows key \"node_modules\""));
         assert!(error.to_string().contains("not a default or configured"));
+
+        let unselected_sweep: config::CleanupConfig = toml::from_str(
+            "no_default_generated = true\ndelete_generated = ['.next']\ncargo_sweep_max_size = '1GB'",
+        )?;
+        let error = scheduled_generated_config(&unselected_sweep)
+            .expect_err("focused Cargo sweeps must select target explicitly");
+        assert!(error
+            .to_string()
+            .contains("requires target in delete_generated"));
+
+        let selected_sweep: config::CleanupConfig = toml::from_str(
+            "no_default_generated = true\ndelete_generated = ['target']\ncargo_sweep_max_size = '1GB'",
+        )?;
+        let generated = scheduled_generated_config(&selected_sweep)?;
+        assert_eq!(generated.delete_names, ["target"]);
+        assert_eq!(generated.sweep_strategies.len(), 1);
+        assert_eq!(generated.sweep_strategies[0].tool, SweepTool::CargoSweep);
         Ok(())
     }
 

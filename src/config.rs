@@ -184,7 +184,7 @@ roots = ["/code", "/plugins"]
 stale_days = 12
 generated_days = 9
 no_default_generated = true
-delete_generated = ["node_modules.partial-install"]
+delete_generated = [".next", ".turbo", "target", "node_modules", "node_modules.partial-install"]
 generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
 cargo_lock_timeout_minutes = 45
 cargo_sweep_max_size = "50GB"
@@ -207,7 +207,13 @@ retention_days = 120
         assert!(config.cleanup.no_default_generated);
         assert_eq!(
             config.cleanup.delete_generated,
-            ["node_modules.partial-install"]
+            [
+                ".next",
+                ".turbo",
+                "target",
+                "node_modules",
+                "node_modules.partial-install"
+            ]
         );
         assert_eq!(config.cleanup.generated_windows[".next"], 7);
         assert_eq!(config.cleanup.generated_windows[".turbo"], 8);

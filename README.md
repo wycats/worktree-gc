@@ -341,9 +341,10 @@ a small set of high-value roots. `delete_generated` has the same meaning as
 repeated CLI `--delete-generated` arguments. Every entry must be one literal
 directory-name component.
 `generated_windows` has the same meaning as repeated CLI
-`--generated-window NAME=DAYS` arguments and applies to any default or explicitly
-configured generated directory name. Build caches (`.next`, `.turbo`, and `target`) otherwise use a
-tighter built-in window; other names use `generated_days`.
+`--generated-window NAME=DAYS` arguments and applies to any active built-in
+delete root or explicitly configured generated directory name. Build caches
+(`.next`, `.turbo`, and `target`) otherwise use a tighter built-in window; other
+names use `generated_days`.
 
 The Cargo lock timeout applies to each generated `target` directory. A
 contended target is deferred to a later run, recorded under
