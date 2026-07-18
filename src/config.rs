@@ -19,6 +19,7 @@ pub(crate) struct Config {
 pub(crate) struct CleanupConfig {
     pub stale_days: u64,
     pub generated_days: u64,
+    pub no_default_generated: bool,
     pub delete_generated: Vec<String>,
     pub generated_windows: BTreeMap<String, u64>,
     pub generated_activity_only: bool,
@@ -67,6 +68,7 @@ impl Default for CleanupConfig {
         Self {
             stale_days: 14,
             generated_days: 7,
+            no_default_generated: false,
             delete_generated: Vec::new(),
             generated_windows: BTreeMap::new(),
             generated_activity_only: true,
@@ -181,7 +183,8 @@ roots = ["/code", "/plugins"]
 [cleanup]
 stale_days = 12
 generated_days = 9
-delete_generated = ["node_modules.partial-install"]
+no_default_generated = true
+delete_generated = [".next", ".turbo", "target", "node_modules", "node_modules.partial-install"]
 generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
 cargo_lock_timeout_minutes = 45
 cargo_sweep_max_size = "50GB"
@@ -201,9 +204,16 @@ retention_days = 120
         assert_eq!(config.roots.len(), 2);
         assert_eq!(config.cleanup.stale_days, 12);
         assert_eq!(config.cleanup.generated_days, 9);
+        assert!(config.cleanup.no_default_generated);
         assert_eq!(
             config.cleanup.delete_generated,
-            ["node_modules.partial-install"]
+            [
+                ".next",
+                ".turbo",
+                "target",
+                "node_modules",
+                "node_modules.partial-install"
+            ]
         );
         assert_eq!(config.cleanup.generated_windows[".next"], 7);
         assert_eq!(config.cleanup.generated_windows[".turbo"], 8);

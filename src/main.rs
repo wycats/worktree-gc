@@ -402,9 +402,10 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
             "invalid generated_windows key {name:?}: name must not be empty"
         );
         anyhow::ensure!(
-            DEFAULT_GENERATED_DELETE_NAMES.contains(&normalized)
+            (!cleanup.no_default_generated
+                && DEFAULT_GENERATED_DELETE_NAMES.contains(&normalized))
                 || delete_generated.iter().any(|configured| configured == normalized),
-            "invalid generated_windows key {name:?}: name is not a default or configured delete_generated root"
+            "invalid generated_windows key {name:?}: name is not an active default or configured delete_generated root; defaults may be disabled by no_default_generated"
         );
         anyhow::ensure!(
             generated_windows
@@ -415,6 +416,11 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
     }
     let mut sweeps = Vec::new();
     if let Some(size) = &cleanup.cargo_sweep_max_size {
+        anyhow::ensure!(
+            !cleanup.no_default_generated
+                || delete_generated.iter().any(|configured| configured == "target"),
+            "cargo_sweep_max_size requires target in delete_generated when no_default_generated = true"
+        );
         let bytes = parse_size::parse_size(size)?;
         sweeps.push(SweepStrategy {
             name: "target".to_string(),
@@ -423,8 +429,8 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
         });
     }
     Ok(GeneratedDirConfig::from_names_with_default_sweeps(
-        true,
-        true,
+        !cleanup.no_default_generated,
+        !cleanup.no_default_generated,
         delete_generated,
         Vec::new(),
         generated_windows.into_iter().collect(),
@@ -1146,6 +1152,63 @@ generated_windows = { "node_modules.partial-install" = 1 }
     }
 
     #[test]
+    fn scheduled_cleanup_can_select_only_explicit_generated_roots() -> Result<()> {
+        let cleanup: config::CleanupConfig = toml::from_str(
+            r#"
+no_default_generated = true
+delete_generated = [".next", "target", "node_modules.partial-install"]
+generated_windows = { ".next" = 1, target = 1, "node_modules.partial-install" = 1 }
+"#,
+        )?;
+        let generated = scheduled_generated_config(&cleanup)?;
+
+        assert_eq!(
+            generated.delete_names,
+            [".next", "target", "node_modules.partial-install"]
+        );
+        assert!(generated.report_only_names.is_empty());
+        assert!(generated.sweep_strategies.is_empty());
+        assert!(!generated
+            .delete_names
+            .iter()
+            .any(|name| name == "node_modules"));
+        assert!(!generated.delete_names.iter().any(|name| name == ".turbo"));
+
+        let inactive_window: config::CleanupConfig = toml::from_str(
+            "no_default_generated = true\ngenerated_windows = { node_modules = 1 }",
+        )?;
+        let error = scheduled_generated_config(&inactive_window)
+            .expect_err("window overrides for excluded defaults must fail");
+        assert!(error
+            .to_string()
+            .contains("generated_windows key \"node_modules\""));
+        assert!(error
+            .to_string()
+            .contains("not an active default or configured"));
+        assert!(error
+            .to_string()
+            .contains("defaults may be disabled by no_default_generated"));
+
+        let unselected_sweep: config::CleanupConfig = toml::from_str(
+            "no_default_generated = true\ndelete_generated = ['.next']\ncargo_sweep_max_size = '1GB'",
+        )?;
+        let error = scheduled_generated_config(&unselected_sweep)
+            .expect_err("focused Cargo sweeps must select target explicitly");
+        assert!(error
+            .to_string()
+            .contains("requires target in delete_generated"));
+
+        let selected_sweep: config::CleanupConfig = toml::from_str(
+            "no_default_generated = true\ndelete_generated = ['target']\ncargo_sweep_max_size = '1GB'",
+        )?;
+        let generated = scheduled_generated_config(&selected_sweep)?;
+        assert_eq!(generated.delete_names, ["target"]);
+        assert_eq!(generated.sweep_strategies.len(), 1);
+        assert_eq!(generated.sweep_strategies[0].tool, SweepTool::CargoSweep);
+        Ok(())
+    }
+
+    #[test]
     fn scheduled_pressure_policy_uses_free_space_hysteresis() -> Result<()> {
         let pressure: config::PressureConfig = toml::from_str(
             r#"
@@ -1214,7 +1277,9 @@ owner_free_generated = true
         let error = scheduled_generated_config(&typo)
             .expect_err("inactive scheduled names must be rejected");
         assert!(error.to_string().contains("generated_windows key \".nex\""));
-        assert!(error.to_string().contains("not a default or configured"));
+        assert!(error
+            .to_string()
+            .contains("not an active default or configured"));
 
         for invalid in [
             "",
