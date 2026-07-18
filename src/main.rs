@@ -402,7 +402,8 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
             "invalid generated_windows key {name:?}: name must not be empty"
         );
         anyhow::ensure!(
-            DEFAULT_GENERATED_DELETE_NAMES.contains(&normalized)
+            (!cleanup.no_default_generated
+                && DEFAULT_GENERATED_DELETE_NAMES.contains(&normalized))
                 || delete_generated.iter().any(|configured| configured == normalized),
             "invalid generated_windows key {name:?}: name is not a default or configured delete_generated root"
         );
@@ -423,8 +424,8 @@ fn scheduled_generated_config(cleanup: &config::CleanupConfig) -> Result<Generat
         });
     }
     Ok(GeneratedDirConfig::from_names_with_default_sweeps(
-        true,
-        true,
+        !cleanup.no_default_generated,
+        !cleanup.no_default_generated,
         delete_generated,
         Vec::new(),
         generated_windows.into_iter().collect(),
@@ -1142,6 +1143,41 @@ generated_windows = { "node_modules.partial-install" = 1 }
             generated.effective_days("node_modules.partial-install", cleanup.generated_days),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_cleanup_can_select_only_explicit_generated_roots() -> Result<()> {
+        let cleanup: config::CleanupConfig = toml::from_str(
+            r#"
+no_default_generated = true
+delete_generated = [".next", "target", "node_modules.partial-install"]
+generated_windows = { ".next" = 1, target = 1, "node_modules.partial-install" = 1 }
+"#,
+        )?;
+        let generated = scheduled_generated_config(&cleanup)?;
+
+        assert_eq!(
+            generated.delete_names,
+            [".next", "target", "node_modules.partial-install"]
+        );
+        assert!(generated.report_only_names.is_empty());
+        assert!(generated.sweep_strategies.is_empty());
+        assert!(!generated
+            .delete_names
+            .iter()
+            .any(|name| name == "node_modules"));
+        assert!(!generated.delete_names.iter().any(|name| name == ".turbo"));
+
+        let inactive_window: config::CleanupConfig = toml::from_str(
+            "no_default_generated = true\ngenerated_windows = { node_modules = 1 }",
+        )?;
+        let error = scheduled_generated_config(&inactive_window)
+            .expect_err("window overrides for excluded defaults must fail");
+        assert!(error
+            .to_string()
+            .contains("generated_windows key \"node_modules\""));
+        assert!(error.to_string().contains("not a default or configured"));
         Ok(())
     }
 

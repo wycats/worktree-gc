@@ -305,6 +305,9 @@ roots = [
 [cleanup]
 stale_days = 14
 generated_days = 7
+# Set true for a focused supervised cycle that should consider only the names
+# listed in delete_generated. The default is false.
+no_default_generated = false
 # Add coarse rebuildable roots that are specific to your tools or workflows.
 delete_generated = ["node_modules.partial-install"]
 # Per-directory entries override generated_days and any tighter built-in window.
@@ -330,8 +333,13 @@ retention_days = 90
 repository_refresh_days = 7
 ```
 
-`delete_generated` has the same meaning as repeated CLI `--delete-generated`
-arguments. Every entry must be one literal directory-name component.
+`no_default_generated = true` has the same meaning as the CLI
+`--no-default-generated` flag: scheduled cleanup considers only explicitly
+configured `delete_generated` roots and disables built-in sweeps. This is useful
+for bounded supervised pressure cycles that need to concentrate measurement on
+a small set of high-value roots. `delete_generated` has the same meaning as
+repeated CLI `--delete-generated` arguments. Every entry must be one literal
+directory-name component.
 `generated_windows` has the same meaning as repeated CLI
 `--generated-window NAME=DAYS` arguments and applies to any default or explicitly
 configured generated directory name. Build caches (`.next`, `.turbo`, and `target`) otherwise use a
