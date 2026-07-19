@@ -5738,6 +5738,7 @@ mod tests {
     #[test]
     fn metadata_prune_includes_orphan_admin_dirs_missing_from_worktree_list() -> Result<()> {
         let (_temp, repo) = init_repo()?;
+        git_output(&repo, ["config", "gc.worktreePruneExpire", "now"])?;
         let orphan = repo.join(".git/worktrees/orphan-admin");
         fs::create_dir_all(&orphan)?;
         set_mtime(&orphan, unix_days_before_now(120))?;
