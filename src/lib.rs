@@ -31,7 +31,8 @@ use walkdir::WalkDir;
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
 pub use exact_generated::{
-    execute_approved_generated, ApprovedGeneratedExecutionResult, ApprovedGeneratedExecutionRun,
+    execute_approved_generated, ApprovedGeneratedExecutionRefusal,
+    ApprovedGeneratedExecutionResult, ApprovedGeneratedExecutionRun,
 };
 pub use gateway_storage::{
     gateway_storage_report, print_gateway_storage_report, GatewayStorageOptions,
@@ -597,6 +598,35 @@ pub(crate) enum OpenHandleSnapshot {
     Available(HashSet<PathBuf>),
     Unavailable,
     Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessOwnershipEvidenceKind {
+    ProcessCwd,
+    ProcessRoot,
+    MappedFile,
+    OpenFile,
+    LsofPath,
+    TestOverride,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProcessOwnershipObservation {
+    pub pid: Option<u32>,
+    pub command: Option<String>,
+    pub evidence_kind: ProcessOwnershipEvidenceKind,
+    pub observed_path: PathBuf,
+    pub matched_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProcessOwnershipEvidence {
+    pub observed_at_unix: u64,
+    pub backend: String,
+    pub complete: bool,
+    pub error: Option<String>,
+    pub observations: Vec<ProcessOwnershipObservation>,
 }
 
 pub fn triage(repo: Option<&Path>, options: TriageOptions) -> Result<TriageReport> {
@@ -2772,6 +2802,240 @@ fn parse_lsof_snapshot_paths(output: &[u8]) -> HashSet<PathBuf> {
         .map(|line| PathBuf::from(std::ffi::OsString::from_vec(line.to_vec())))
         .filter(|path| path.is_absolute())
         .collect()
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct RawProcessOwnershipObservation {
+    pid: u32,
+    command: Option<String>,
+    evidence_kind: ProcessOwnershipEvidenceKind,
+    observed_path: PathBuf,
+}
+
+#[cfg(unix)]
+fn parse_lsof_process_ownership(output: &[u8]) -> Vec<RawProcessOwnershipObservation> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut pid = None;
+    let mut command = None;
+    let mut evidence_kind = ProcessOwnershipEvidenceKind::LsofPath;
+    let mut observations = Vec::new();
+    for field in output
+        .split(|byte| *byte == b'\0')
+        .map(|field| field.strip_prefix(b"\n").unwrap_or(field))
+    {
+        let Some((&kind, value)) = field.split_first() else {
+            continue;
+        };
+        match kind {
+            b'p' => {
+                pid = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|value| value.parse().ok());
+                command = None;
+                evidence_kind = ProcessOwnershipEvidenceKind::LsofPath;
+            }
+            b'c' => command = Some(String::from_utf8_lossy(value).into_owned()),
+            b'f' => {
+                evidence_kind = match value {
+                    b"cwd" => ProcessOwnershipEvidenceKind::ProcessCwd,
+                    b"rtd" => ProcessOwnershipEvidenceKind::ProcessRoot,
+                    b"txt" | b"mem" => ProcessOwnershipEvidenceKind::MappedFile,
+                    _ => ProcessOwnershipEvidenceKind::OpenFile,
+                };
+            }
+            b'n' => {
+                let Some(pid) = pid else {
+                    continue;
+                };
+                let path = PathBuf::from(OsString::from_vec(value.to_vec()));
+                if path.is_absolute() {
+                    observations.push(RawProcessOwnershipObservation {
+                        pid,
+                        command: command.clone(),
+                        evidence_kind: evidence_kind.clone(),
+                        observed_path: path,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    observations
+}
+
+#[cfg(unix)]
+fn match_process_ownership(
+    candidates: &[PathBuf],
+    observations: impl IntoIterator<Item = RawProcessOwnershipObservation>,
+) -> Vec<ProcessOwnershipObservation> {
+    let candidates = candidates.iter().cloned().collect::<HashSet<_>>();
+    let mut matches = observations
+        .into_iter()
+        .flat_map(|observation| {
+            observation
+                .observed_path
+                .ancestors()
+                .filter(|ancestor| candidates.contains(*ancestor))
+                .map(|matched_path| ProcessOwnershipObservation {
+                    pid: Some(observation.pid),
+                    command: observation.command.clone(),
+                    evidence_kind: observation.evidence_kind.clone(),
+                    observed_path: observation.observed_path.clone(),
+                    matched_path: matched_path.to_path_buf(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        (
+            left.matched_path.as_os_str(),
+            left.pid,
+            left.observed_path.as_os_str(),
+        )
+            .cmp(&(
+                right.matched_path.as_os_str(),
+                right.pid,
+                right.observed_path.as_os_str(),
+            ))
+    });
+    matches.dedup();
+    matches
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> ProcessOwnershipEvidence {
+    let observed_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if paths.is_empty() {
+        return ProcessOwnershipEvidence {
+            observed_at_unix,
+            backend: "macos_libproc".to_string(),
+            complete: true,
+            error: None,
+            observations: Vec::new(),
+        };
+    }
+    match macos_open_handles::capture_with_evidence() {
+        Ok(observations) => {
+            let observations =
+                observations
+                    .into_iter()
+                    .map(|observation| RawProcessOwnershipObservation {
+                        pid: observation.pid,
+                        command: None,
+                        evidence_kind: match observation.kind {
+                            macos_open_handles::ProcessPathKind::Cwd => {
+                                ProcessOwnershipEvidenceKind::ProcessCwd
+                            }
+                            macos_open_handles::ProcessPathKind::Root => {
+                                ProcessOwnershipEvidenceKind::ProcessRoot
+                            }
+                            macos_open_handles::ProcessPathKind::MappedFile => {
+                                ProcessOwnershipEvidenceKind::MappedFile
+                            }
+                            macos_open_handles::ProcessPathKind::OpenFile => {
+                                ProcessOwnershipEvidenceKind::OpenFile
+                            }
+                        },
+                        observed_path: observation.path,
+                    });
+            ProcessOwnershipEvidence {
+                observed_at_unix,
+                backend: "macos_libproc".to_string(),
+                complete: true,
+                error: None,
+                observations: match_process_ownership(paths, observations),
+            }
+        }
+        Err(error) if macos_open_handles::is_resource_limit(&error) => ProcessOwnershipEvidence {
+            observed_at_unix,
+            backend: "macos_libproc".to_string(),
+            complete: false,
+            error: Some(error.to_string()),
+            observations: Vec::new(),
+        },
+        Err(error) => capture_lsof_process_ownership(paths, observed_at_unix, Some(error)),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> ProcessOwnershipEvidence {
+    let observed_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    capture_lsof_process_ownership(paths, observed_at_unix, None)
+}
+
+#[cfg(unix)]
+fn capture_lsof_process_ownership(
+    paths: &[PathBuf],
+    observed_at_unix: u64,
+    prior_error: Option<io::Error>,
+) -> ProcessOwnershipEvidence {
+    let output = match Command::new("lsof")
+        .args(["-nP", "-F0pcfn"])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return ProcessOwnershipEvidence {
+                observed_at_unix,
+                backend: "lsof".to_string(),
+                complete: false,
+                error: Some(match prior_error {
+                    Some(prior) => {
+                        format!("native snapshot failed ({prior}); lsof failed ({error})")
+                    }
+                    None => error.to_string(),
+                }),
+                observations: Vec::new(),
+            };
+        }
+    };
+    if let Some(error) = lsof_probe_error(
+        output.status.success(),
+        output.status.code(),
+        &output.stderr,
+        None,
+    ) {
+        return ProcessOwnershipEvidence {
+            observed_at_unix,
+            backend: "lsof".to_string(),
+            complete: false,
+            error: Some(match prior_error {
+                Some(prior) => format!("native snapshot failed ({prior}); lsof failed ({error})"),
+                None => error.to_string(),
+            }),
+            observations: Vec::new(),
+        };
+    }
+    ProcessOwnershipEvidence {
+        observed_at_unix,
+        backend: "lsof".to_string(),
+        complete: true,
+        error: prior_error.map(|error| error.to_string()),
+        observations: match_process_ownership(paths, parse_lsof_process_ownership(&output.stdout)),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> ProcessOwnershipEvidence {
+    ProcessOwnershipEvidence {
+        observed_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        backend: "unsupported".to_string(),
+        complete: paths.is_empty(),
+        error: (!paths.is_empty()).then(|| "no supported process ownership backend".to_string()),
+        observations: Vec::new(),
+    }
 }
 
 #[cfg(unix)]
@@ -5343,6 +5607,32 @@ mod tests {
                 PathBuf::from("/tmp/cache\nwith-newline/held"),
                 PathBuf::from("/tmp/other")
             ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detailed_lsof_snapshot_preserves_process_and_evidence_kind() {
+        let output = b"p42\0ccargo\0fcwd\0n/tmp/worktree\0fmem\0n/tmp/worktree/target/debug/tool\0";
+        let observations = match_process_ownership(
+            &[PathBuf::from("/tmp/worktree/target")],
+            parse_lsof_process_ownership(output),
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].pid, Some(42));
+        assert_eq!(observations[0].command.as_deref(), Some("cargo"));
+        assert_eq!(
+            observations[0].evidence_kind,
+            ProcessOwnershipEvidenceKind::MappedFile
+        );
+        assert_eq!(
+            observations[0].observed_path,
+            PathBuf::from("/tmp/worktree/target/debug/tool")
+        );
+        assert_eq!(
+            observations[0].matched_path,
+            PathBuf::from("/tmp/worktree/target")
         );
     }
 
