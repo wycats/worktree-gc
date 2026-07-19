@@ -167,6 +167,11 @@ fn capture_pids(
     let mut regions_seen = 0_usize;
     for pid in pids {
         ensure_time_budget(started)?;
+        let evidence_pid = u32::try_from(pid).map_err(|_| {
+            io::Error::other(format!(
+                "native process list returned invalid process id {pid}"
+            ))
+        })?;
         let Some(process_paths) = process_vnode_paths(pid)? else {
             continue;
         };
@@ -177,7 +182,7 @@ fn capture_pids(
             if let Some(path) = path {
                 unique_paths.insert(path.clone());
                 paths.push(ProcessPathEvidence {
-                    pid: u32::try_from(pid).unwrap_or_default(),
+                    pid: evidence_pid,
                     path,
                     kind,
                 });
@@ -190,7 +195,7 @@ fn capture_pids(
         paths.extend(region_paths.into_iter().map(|path| {
             unique_paths.insert(path.clone());
             ProcessPathEvidence {
-                pid: u32::try_from(pid).unwrap_or_default(),
+                pid: evidence_pid,
                 path,
                 kind: ProcessPathKind::MappedFile,
             }
@@ -207,7 +212,7 @@ fn capture_pids(
             if let Some(path) = vnode_path(pid, fd.proc_fd)? {
                 unique_paths.insert(path.clone());
                 paths.push(ProcessPathEvidence {
-                    pid: u32::try_from(pid).unwrap_or_default(),
+                    pid: evidence_pid,
                     path,
                     kind: ProcessPathKind::OpenFile,
                 });
@@ -681,6 +686,15 @@ mod tests {
 
         assert!(is_resource_limit(&limit));
         assert!(!is_resource_limit(&ordinary));
+    }
+
+    #[test]
+    fn invalid_native_process_id_fails_closed() {
+        let error = capture_pids([-1], Instant::now()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("native process list returned invalid process id -1"));
     }
 
     #[test]
