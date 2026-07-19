@@ -730,8 +730,7 @@ fn plan_cleanup_with_protections_in_roots(
         protections,
         options.pressure.as_ref(),
     )?;
-    let metadata_prune_enabled =
-        roots.is_none() && !prunable_worktree_paths(&worktree_decisions).is_empty();
+    let metadata_prune_enabled = roots.is_none();
     let prune_output = if metadata_prune_enabled {
         run_worktree_prune(&context.current_worktree, false)?
     } else {
@@ -1458,26 +1457,24 @@ fn execute_cleanup_manifest_matching(
 }
 
 fn execute_planned_metadata_prune(manifest: &CleanupManifest) -> Result<()> {
-    let planned_paths = prunable_worktree_paths(&manifest.worktrees);
-    if !manifest.metadata_prune_enabled || planned_paths.is_empty() {
+    if !manifest.metadata_prune_enabled {
         return Ok(());
     }
 
-    let current_paths = current_prunable_worktree_paths(&manifest.current_worktree)?;
-    if current_paths
-        .iter()
-        .any(|path| !planned_paths.contains(path))
-    {
+    let current_output = run_worktree_prune(&manifest.current_worktree, false)?;
+    if current_output != manifest.prune_output {
         eprintln!(
             "skipping worktree metadata prune because prunable metadata changed after planning"
         );
         return Ok(());
     }
-    if current_paths.is_empty() {
+    if current_output.trim().is_empty() {
         return Ok(());
     }
 
-    match with_protection_guard_for_paths(&current_paths, SystemTime::now(), || {
+    let mut guarded_paths = prunable_worktree_paths(&manifest.worktrees);
+    guarded_paths.push(manifest.git_common_dir.clone());
+    match with_protection_guard_for_paths(&guarded_paths, SystemTime::now(), || {
         run_worktree_prune(&manifest.current_worktree, true)
     })? {
         ProtectionGuardOutcome::Protected(lease) => {
@@ -1504,6 +1501,7 @@ fn prunable_worktree_paths(worktrees: &[WorktreeDecision]) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(test)]
 fn current_prunable_worktree_paths(repo: &Path) -> Result<Vec<PathBuf>> {
     Ok(
         parse_worktree_list(&git_output(repo, ["worktree", "list", "--porcelain"])?)
@@ -5692,7 +5690,7 @@ mod tests {
             .worktrees
             .iter()
             .any(|d| d.path == expected_worktree && d.action == WorktreeAction::Remove));
-        assert!(!run.manifest.metadata_prune_enabled);
+        assert!(run.manifest.metadata_prune_enabled);
         assert!(run.manifest.prune_output.is_empty());
         Ok(())
     }
@@ -5728,6 +5726,42 @@ mod tests {
     }
 
     #[test]
+    fn metadata_prune_includes_orphan_admin_dirs_missing_from_worktree_list() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let orphan = repo.join(".git/worktrees/orphan-admin");
+        fs::create_dir_all(&orphan)?;
+        set_mtime(&orphan, unix_days_before_now(120))?;
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+
+        assert!(run.manifest.metadata_prune_enabled);
+        assert!(run.manifest.prune_output.contains("orphan-admin"));
+        assert!(run
+            .manifest
+            .worktrees
+            .iter()
+            .all(|decision| !decision.metadata_prunable));
+
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
+        assert!(!orphan.exists());
+        Ok(())
+    }
+
+    #[test]
     fn routine_execution_does_not_prune_metadata_created_after_planning() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let run = cleanup(
@@ -5745,7 +5779,7 @@ mod tests {
                 now: now(),
             },
         )?;
-        assert!(!run.manifest.metadata_prune_enabled);
+        assert!(run.manifest.metadata_prune_enabled);
 
         let worktree = repo.with_file_name("missing-after-plan");
         add_worktree(&repo, &worktree, "missing-after-plan-branch")?;
@@ -5753,8 +5787,7 @@ mod tests {
 
         execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
 
-        let listed = parse_worktree_list(&git_output(&repo, ["worktree", "list", "--porcelain"])?);
-        assert_eq!(listed.len(), 2);
+        assert_eq!(current_prunable_worktree_paths(&repo)?.len(), 1);
         Ok(())
     }
 
@@ -5789,8 +5822,7 @@ mod tests {
 
         execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
 
-        let listed = parse_worktree_list(&git_output(&repo, ["worktree", "list", "--porcelain"])?);
-        assert_eq!(listed.len(), 3);
+        assert_eq!(current_prunable_worktree_paths(&repo)?.len(), 2);
         Ok(())
     }
 
