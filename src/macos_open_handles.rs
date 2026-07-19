@@ -22,6 +22,7 @@ const MAX_FDS_PER_PROCESS: usize = 65_536;
 const MAX_REGIONS_PER_PROCESS: usize = 131_072;
 const MAX_REGIONS_TOTAL: usize = 2_000_000;
 const MAX_OPEN_PATHS: usize = 1_000_000;
+const MAX_PROCESS_PATH_OBSERVATIONS: usize = 2_000_000;
 const MAX_CAPTURE_DURATION: Duration = Duration::from_secs(5);
 const PID_GROWTH_SLACK: usize = 64;
 const FD_GROWTH_SLACK: usize = 32;
@@ -35,6 +36,21 @@ const PROCESS_VNODE_PATH_BUFFER_BYTES: usize = 4_096;
 const ESRCH: c_int = 3;
 const EBADF: c_int = 9;
 const EINVAL: c_int = 22;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessPathKind {
+    Cwd,
+    Root,
+    MappedFile,
+    OpenFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessPathEvidence {
+    pub(crate) pid: u32,
+    pub(crate) path: PathBuf,
+    pub(crate) kind: ProcessPathKind,
+}
 
 #[derive(Debug)]
 struct ResourceLimitError(String);
@@ -130,6 +146,13 @@ extern "C" {
 /// so this shared snapshot enumerates process paths once and matches all
 /// candidate ancestors in memory.
 pub(crate) fn capture() -> io::Result<HashSet<PathBuf>> {
+    Ok(capture_with_evidence()?
+        .into_iter()
+        .map(|evidence| evidence.path)
+        .collect())
+}
+
+pub(crate) fn capture_with_evidence() -> io::Result<Vec<ProcessPathEvidence>> {
     let started = Instant::now();
     let pids = list_all_pids()?;
     capture_pids(pids, started)
@@ -138,29 +161,41 @@ pub(crate) fn capture() -> io::Result<HashSet<PathBuf>> {
 fn capture_pids(
     pids: impl IntoIterator<Item = c_int>,
     started: Instant,
-) -> io::Result<HashSet<PathBuf>> {
-    let mut paths = HashSet::new();
+) -> io::Result<Vec<ProcessPathEvidence>> {
+    let mut paths = Vec::new();
+    let mut unique_paths = HashSet::new();
     let mut regions_seen = 0_usize;
     for pid in pids {
         ensure_time_budget(started)?;
         let Some(process_paths) = process_vnode_paths(pid)? else {
             continue;
         };
-        paths.extend(process_paths.into_iter().flatten());
-        if paths.len() > MAX_OPEN_PATHS {
-            return Err(resource_limit(format!(
-                "native open-handle snapshot exceeded {MAX_OPEN_PATHS} paths"
-            )));
+        for (kind, path) in [ProcessPathKind::Cwd, ProcessPathKind::Root]
+            .into_iter()
+            .zip(process_paths)
+        {
+            if let Some(path) = path {
+                unique_paths.insert(path.clone());
+                paths.push(ProcessPathEvidence {
+                    pid: u32::try_from(pid).unwrap_or_default(),
+                    path,
+                    kind,
+                });
+            }
         }
+        ensure_path_limits(unique_paths.len(), paths.len())?;
         let Some(region_paths) = mapped_vnode_paths(pid, &mut regions_seen, started)? else {
             continue;
         };
-        paths.extend(region_paths);
-        if paths.len() > MAX_OPEN_PATHS {
-            return Err(resource_limit(format!(
-                "native open-handle snapshot exceeded {MAX_OPEN_PATHS} paths"
-            )));
-        }
+        paths.extend(region_paths.into_iter().map(|path| {
+            unique_paths.insert(path.clone());
+            ProcessPathEvidence {
+                pid: u32::try_from(pid).unwrap_or_default(),
+                path,
+                kind: ProcessPathKind::MappedFile,
+            }
+        }));
+        ensure_path_limits(unique_paths.len(), paths.len())?;
         let Some(fds) = list_process_fds(pid)? else {
             continue;
         };
@@ -170,16 +205,31 @@ fn capture_pids(
                 continue;
             }
             if let Some(path) = vnode_path(pid, fd.proc_fd)? {
-                paths.insert(path);
-                if paths.len() > MAX_OPEN_PATHS {
-                    return Err(resource_limit(format!(
-                        "native open-handle snapshot exceeded {MAX_OPEN_PATHS} paths"
-                    )));
-                }
+                unique_paths.insert(path.clone());
+                paths.push(ProcessPathEvidence {
+                    pid: u32::try_from(pid).unwrap_or_default(),
+                    path,
+                    kind: ProcessPathKind::OpenFile,
+                });
+                ensure_path_limits(unique_paths.len(), paths.len())?;
             }
         }
     }
     Ok(paths)
+}
+
+fn ensure_path_limits(unique_paths: usize, observations: usize) -> io::Result<()> {
+    if unique_paths > MAX_OPEN_PATHS {
+        return Err(resource_limit(format!(
+            "native open-handle snapshot exceeded {MAX_OPEN_PATHS} unique paths"
+        )));
+    }
+    if observations > MAX_PROCESS_PATH_OBSERVATIONS {
+        return Err(resource_limit(format!(
+            "native open-handle snapshot exceeded {MAX_PROCESS_PATH_OBSERVATIONS} process-path observations"
+        )));
+    }
+    Ok(())
 }
 
 /// Capture file-backed virtual-memory regions. `lsof` reports these mappings
@@ -653,9 +703,16 @@ mod tests {
         let cwd = std::env::current_dir()?.canonicalize()?;
         let executable = std::env::current_exe()?.canonicalize()?;
 
-        assert!(paths.contains(&cwd), "native snapshot omitted cwd {cwd:?}");
         assert!(
-            paths.contains(&executable),
+            paths.iter().any(|evidence| evidence.path == cwd
+                && evidence.pid == u32::try_from(pid).unwrap()
+                && evidence.kind == ProcessPathKind::Cwd),
+            "native snapshot omitted cwd {cwd:?}"
+        );
+        assert!(
+            paths.iter().any(|evidence| evidence.path == executable
+                && evidence.pid == u32::try_from(pid).unwrap()
+                && evidence.kind == ProcessPathKind::MappedFile),
             "native snapshot omitted executable mapping {executable:?}"
         );
         Ok(())

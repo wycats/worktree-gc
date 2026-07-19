@@ -396,7 +396,7 @@ worktree-gc execute-generated \
   --candidate /absolute/path/to/worktree/chat/.next
 ```
 
-The command accepts only a measured owner-free pressure deletion. It requires
+The command accepts a measured owner-free routine or pressure deletion. It requires
 complete ownership and APFS-private evidence, revalidates the candidate's
 canonical path and filesystem identity, verifies the exact Git HEAD and
 porcelain status digest, rejects tracked content and current protections, and
@@ -405,8 +405,15 @@ before mutation. It atomically
 renames the candidate into a digest-bound quarantine below the repository Git
 common directory, verifies the renamed inode, removes only that quarantine,
 and writes a structured execution result next to the approved manifest.
-It also rechecks live free space immediately before quarantine and retains the
-candidate when the approved pressure target is already satisfied.
+Pressure candidates additionally recheck live free space immediately before
+quarantine and remain in place when the approved pressure target is already
+satisfied. Routine candidates must already be delete decisions in the approved
+manifest and do not depend on an active pressure policy.
+Ownership refusals write a timestamped structured sidecar beside the requested
+execution result. The sidecar preserves the snapshot backend, completeness,
+matched worktree or candidate path, refusal stage, and PID and evidence kind
+when the backend provides them, so a short-lived owner remains diagnosable
+after it exits.
 An intact digest-bound quarantine interrupted after rename and before removal
 can be resumed with the same command and approval. Identity or measurement
 drift, including partial removal, fails closed and requires a new recovery

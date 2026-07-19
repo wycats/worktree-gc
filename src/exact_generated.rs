@@ -1,8 +1,9 @@
 use crate::inventory::inventory_with_root_limit;
 use crate::{
-    cargo_profile_locks_present, generated_dir_identity, open_handle_evidence_for_paths,
+    cargo_profile_locks_present, generated_dir_identity, process_ownership_evidence_for_paths,
     with_cargo_profile_locks_timeout, with_protection_guard_for_paths, CleanupClass, CleanupMode,
     GeneratedDirAction, GeneratedDirIdentity, GeneratedDirMeasurement, InventoryOptions,
+    ProcessOwnershipEvidence, ProcessOwnershipEvidenceKind, ProcessOwnershipObservation,
     ProtectionGuardOutcome, MANIFEST_VERSION,
 };
 use anyhow::{bail, Context, Result};
@@ -34,6 +35,7 @@ pub struct ApprovedGeneratedExecutionResult {
     pub approval_digest: String,
     pub candidate: PathBuf,
     pub worktree: PathBuf,
+    pub cleanup_class: CleanupClass,
     pub quarantine: PathBuf,
     pub recovered_quarantine: bool,
     pub available_bytes_before: u64,
@@ -42,6 +44,19 @@ pub struct ApprovedGeneratedExecutionResult {
     pub source_head: String,
     pub source_status_sha256: String,
     pub measurement: GeneratedDirMeasurement,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApprovedGeneratedExecutionRefusal {
+    pub manifest_version: u64,
+    pub refused_at_unix: u64,
+    pub approval_manifest: PathBuf,
+    pub approval_digest: String,
+    pub candidate: PathBuf,
+    pub worktree: PathBuf,
+    pub cleanup_class: CleanupClass,
+    pub stage: String,
+    pub ownership: ProcessOwnershipEvidence,
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,22 +254,28 @@ fn execute_approved_generated_with_ownership(
         approved_measurement.filesystem == identity.filesystem,
         "approved identity and measurement refer to different filesystems"
     );
-    let pressure = manifest
-        .pressure
-        .as_ref()
-        .context("approved pressure candidate has no pressure policy")?;
-    anyhow::ensure!(pressure.active, "approved pressure policy was not active");
-    anyhow::ensure!(
-        pressure.owner_free_generated,
-        "approved pressure policy did not enable owner-free generated cleanup"
-    );
-    anyhow::ensure!(
-        pressure
-            .entered_filesystems
-            .iter()
-            .any(|filesystem| filesystem == &identity.filesystem),
-        "approved pressure policy did not enter the candidate filesystem"
-    );
+    let pressure_target_bytes = match decision.cleanup_class {
+        CleanupClass::Routine => None,
+        CleanupClass::Pressure => {
+            let pressure = manifest
+                .pressure
+                .as_ref()
+                .context("approved pressure candidate has no pressure policy")?;
+            anyhow::ensure!(pressure.active, "approved pressure policy was not active");
+            anyhow::ensure!(
+                pressure.owner_free_generated,
+                "approved pressure policy did not enable owner-free generated cleanup"
+            );
+            anyhow::ensure!(
+                pressure
+                    .entered_filesystems
+                    .iter()
+                    .any(|filesystem| filesystem == &identity.filesystem),
+                "approved pressure policy did not enter the candidate filesystem"
+            );
+            Some(pressure.target_bytes)
+        }
+    };
 
     let worktree = canonical_existing_directory(&decision.worktree_path, "worktree")?;
     anyhow::ensure!(
@@ -321,7 +342,9 @@ fn execute_approved_generated_with_ownership(
         "worktree source identity changed since approval"
     );
     if !recovered_quarantine {
-        ensure_pressure_still_needed(active_path, pressure.target_bytes)?;
+        if let Some(target_bytes) = pressure_target_bytes {
+            ensure_pressure_still_needed(active_path, target_bytes)?;
+        }
     }
 
     let live_identity = generated_dir_identity(active_path)?;
@@ -335,14 +358,26 @@ fn execute_approved_generated_with_ownership(
         "candidate measurement changed since approval"
     );
 
-    let ownership_paths = vec![worktree.clone(), active_path.to_path_buf()];
-    validate_current_ownership(&ownership_paths, ownership_override)?;
-
     let result_path = match result_path {
         Some(path) => path.to_path_buf(),
         None => default_result_path(manifest_path, &actual_digest, candidate)?,
     };
     validate_result_path(&result_path, &worktree, &git_common_dir, &quarantine)?;
+    let approval_digest = format!("{APPROVAL_DIGEST_PREFIX}{actual_digest}");
+    let ownership_paths = vec![worktree.clone(), active_path.to_path_buf()];
+    validate_current_ownership(
+        &ownership_paths,
+        ownership_override,
+        OwnershipRefusalContext {
+            manifest_path,
+            approval_digest: &approval_digest,
+            candidate,
+            worktree: &worktree,
+            cleanup_class: decision.cleanup_class,
+            result_path: &result_path,
+            stage: "preflight",
+        },
+    )?;
 
     let target_lock_timeout = if decision.name == "target" && !recovered_quarantine {
         let lock_timeout = manifest
@@ -366,7 +401,19 @@ fn execute_approved_generated_with_ownership(
     ];
     let execution = with_protection_guard_for_paths(&guard_paths, SystemTime::now(), || {
         if let Some(lock_timeout) = target_lock_timeout {
-            validate_current_ownership(&ownership_paths, ownership_override)?;
+            validate_current_ownership(
+                &ownership_paths,
+                ownership_override,
+                OwnershipRefusalContext {
+                    manifest_path,
+                    approval_digest: &approval_digest,
+                    candidate,
+                    worktree: &worktree,
+                    cleanup_class: decision.cleanup_class,
+                    result_path: &result_path,
+                    stage: "cargo_profile_lock",
+                },
+            )?;
             with_cargo_profile_locks_timeout(candidate, &worktree, Some(lock_timeout), || {
                 CandidateExecution {
                     candidate,
@@ -377,10 +424,13 @@ fn execute_approved_generated_with_ownership(
                     approved_source: &approved_source,
                     approved_source_without_candidate: &approved_source_without_candidate,
                     recovered_quarantine,
-                    pressure_target_bytes: pressure.target_bytes,
+                    pressure_target_bytes,
                     recheck_ownership: true,
                     ownership_override,
                     measurement_override,
+                    manifest_path,
+                    approval_digest: &approval_digest,
+                    cleanup_class: decision.cleanup_class,
                     result_path: &result_path,
                 }
                 .execute()
@@ -395,10 +445,13 @@ fn execute_approved_generated_with_ownership(
                 approved_source: &approved_source,
                 approved_source_without_candidate: &approved_source_without_candidate,
                 recovered_quarantine,
-                pressure_target_bytes: pressure.target_bytes,
+                pressure_target_bytes,
                 recheck_ownership: true,
                 ownership_override,
                 measurement_override,
+                manifest_path,
+                approval_digest: &approval_digest,
+                cleanup_class: decision.cleanup_class,
                 result_path: &result_path,
             }
             .execute()
@@ -435,9 +488,10 @@ fn execute_approved_generated_with_ownership(
         manifest_version: MANIFEST_VERSION,
         completed_at_unix: unix_seconds(SystemTime::now()),
         approval_manifest: manifest_path.to_path_buf(),
-        approval_digest: format!("{APPROVAL_DIGEST_PREFIX}{actual_digest}"),
+        approval_digest,
         candidate: candidate.to_path_buf(),
         worktree,
+        cleanup_class: decision.cleanup_class,
         quarantine,
         recovered_quarantine,
         available_bytes_before: available_before,
@@ -484,14 +538,12 @@ fn validate_approved_decision(decision: &ApprovedGeneratedDecision) -> Result<()
         decision.action == GeneratedDirAction::Delete,
         "approved candidate action is not delete"
     );
-    anyhow::ensure!(
-        decision.cleanup_class == CleanupClass::Pressure,
-        "approved candidate is not a pressure candidate"
-    );
-    anyhow::ensure!(
-        decision.owner_free_pressure,
-        "approved candidate is not owner-free pressure cleanup"
-    );
+    if decision.cleanup_class == CleanupClass::Pressure {
+        anyhow::ensure!(
+            decision.owner_free_pressure,
+            "approved pressure candidate is not owner-free pressure cleanup"
+        );
+    }
     anyhow::ensure!(
         decision.ownership_evidence_complete && !decision.in_use && !decision.worktree_in_use,
         "approved candidate lacks complete owner-free evidence"
@@ -895,27 +947,123 @@ fn measurements_match(approved: &GeneratedDirMeasurement, live: &GeneratedDirMea
         && approved.metrics == live.metrics
 }
 
+#[derive(Clone, Copy)]
+struct OwnershipRefusalContext<'a> {
+    manifest_path: &'a Path,
+    approval_digest: &'a str,
+    candidate: &'a Path,
+    worktree: &'a Path,
+    cleanup_class: CleanupClass,
+    result_path: &'a Path,
+    stage: &'a str,
+}
+
 fn validate_current_ownership(
     paths: &[PathBuf],
     ownership_override: Option<&dyn Fn() -> (HashSet<PathBuf>, bool)>,
+    context: OwnershipRefusalContext<'_>,
 ) -> Result<()> {
-    let (owned_paths, ownership_complete) = ownership_override
-        .map(|capture| capture())
-        .unwrap_or_else(|| open_handle_evidence_for_paths(paths));
-    anyhow::ensure!(
-        ownership_complete,
-        "current ownership evidence is incomplete; refusing exact generated execution"
-    );
-    anyhow::ensure!(
-        owned_paths.is_empty(),
-        "current process ownership exists for: {}",
-        owned_paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    Ok(())
+    let ownership = match ownership_override {
+        Some(capture) => {
+            let observed_at_unix = unix_seconds(SystemTime::now());
+            let (owned_paths, complete) = capture();
+            let mut observations = owned_paths
+                .into_iter()
+                .map(|path| ProcessOwnershipObservation {
+                    pid: None,
+                    command: None,
+                    evidence_kind: ProcessOwnershipEvidenceKind::TestOverride,
+                    observed_path: path.clone(),
+                    matched_path: path,
+                })
+                .collect::<Vec<_>>();
+            observations.sort_by(|left, right| left.matched_path.cmp(&right.matched_path));
+            ProcessOwnershipEvidence {
+                observed_at_unix,
+                backend: "override".to_string(),
+                complete,
+                error: None,
+                observations,
+            }
+        }
+        None => process_ownership_evidence_for_paths(paths),
+    };
+    if ownership.complete && ownership.observations.is_empty() {
+        return Ok(());
+    }
+
+    let refusal = ApprovedGeneratedExecutionRefusal {
+        manifest_version: MANIFEST_VERSION,
+        refused_at_unix: unix_seconds(SystemTime::now()),
+        approval_manifest: context.manifest_path.to_path_buf(),
+        approval_digest: context.approval_digest.to_string(),
+        candidate: context.candidate.to_path_buf(),
+        worktree: context.worktree.to_path_buf(),
+        cleanup_class: context.cleanup_class,
+        stage: context.stage.to_string(),
+        ownership,
+    };
+    let refusal_path = write_ownership_refusal(context.result_path, &refusal)?;
+    if !refusal.ownership.complete {
+        bail!(
+            "current ownership evidence is incomplete; refusing exact generated execution; evidence written to {}",
+            refusal_path.display()
+        );
+    }
+    let owners = refusal
+        .ownership
+        .observations
+        .iter()
+        .map(|observation| match observation.pid {
+            Some(pid) => format!("{} (pid {pid})", observation.matched_path.display()),
+            None => observation.matched_path.display().to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "current process ownership exists for: {owners}; evidence written to {}",
+        refusal_path.display()
+    )
+}
+
+fn write_ownership_refusal(
+    result_path: &Path,
+    refusal: &ApprovedGeneratedExecutionRefusal,
+) -> Result<PathBuf> {
+    let parent = result_path
+        .parent()
+        .context("execution result path has no parent")?;
+    let filename = result_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("execution.json");
+    let observed_at_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = parent.join(format!(
+        "{filename}.ownership-refusal-{observed_at_nanos}.json"
+    ));
+    let mut file = AtomicWriteFile::open(&path).with_context(|| {
+        format!(
+            "failed to prepare ownership refusal result {}",
+            path.display()
+        )
+    })?;
+    file.write_all(&serde_json::to_vec_pretty(refusal)?)
+        .with_context(|| {
+            format!(
+                "failed to write ownership refusal result {}",
+                path.display()
+            )
+        })?;
+    file.commit().with_context(|| {
+        format!(
+            "failed to commit ownership refusal result {}",
+            path.display()
+        )
+    })?;
+    Ok(path)
 }
 
 fn ensure_pressure_still_needed(path: &Path, target_bytes: u64) -> Result<()> {
@@ -936,10 +1084,13 @@ struct CandidateExecution<'a> {
     approved_source: &'a SourceIdentity,
     approved_source_without_candidate: &'a SourceIdentity,
     recovered_quarantine: bool,
-    pressure_target_bytes: u64,
+    pressure_target_bytes: Option<u64>,
     recheck_ownership: bool,
     ownership_override: Option<&'a dyn Fn() -> (HashSet<PathBuf>, bool)>,
     measurement_override: Option<&'a GeneratedDirMeasurement>,
+    manifest_path: &'a Path,
+    approval_digest: &'a str,
+    cleanup_class: CleanupClass,
     result_path: &'a Path,
 }
 
@@ -977,12 +1128,23 @@ impl CandidateExecution<'_> {
             "candidate changed immediately before quarantine"
         );
         if !self.recovered_quarantine {
-            ensure_pressure_still_needed(active_path, self.pressure_target_bytes)?;
+            if let Some(target_bytes) = self.pressure_target_bytes {
+                ensure_pressure_still_needed(active_path, target_bytes)?;
+            }
         }
         if self.recheck_ownership {
             validate_current_ownership(
                 &[self.worktree.to_path_buf(), active_path.to_path_buf()],
                 self.ownership_override,
+                OwnershipRefusalContext {
+                    manifest_path: self.manifest_path,
+                    approval_digest: self.approval_digest,
+                    candidate: self.candidate,
+                    worktree: self.worktree,
+                    cleanup_class: self.cleanup_class,
+                    result_path: self.result_path,
+                    stage: "pre_quarantine",
+                },
             )?;
         }
         let result_file = AtomicWriteFile::open(self.result_path).with_context(|| {
@@ -1366,6 +1528,7 @@ mod tests {
 
         assert!(!fixture.candidate.exists());
         assert!(!run.result.quarantine.exists());
+        assert_eq!(run.result.cleanup_class, CleanupClass::Pressure);
         assert_eq!(source_identity(&fixture.repo)?, source_before);
         assert!(run.result_path.is_file());
         Ok(())
@@ -1418,17 +1581,23 @@ mod tests {
     }
 
     #[test]
-    fn exact_execution_rejects_routine_and_protected_candidates() -> Result<()> {
+    fn exact_execution_accepts_owner_free_routine_candidates() -> Result<()> {
         let mut routine = fixture(false)?;
         rewrite_repository_manifest(&mut routine, |manifest| {
             manifest["generated_dirs"][0]["cleanup_class"] = json!("routine");
+            manifest["generated_dirs"][0]["owner_free_pressure"] = json!(false);
+            manifest.as_object_mut().unwrap().remove("pressure");
         })?;
-        let error = routine
-            .execute()
-            .expect_err("routine candidates must stay on the routine path");
-        assert!(error.to_string().contains("not a pressure candidate"));
-        assert!(routine.candidate.is_dir());
 
+        let run = routine.execute()?;
+
+        assert_eq!(run.result.cleanup_class, CleanupClass::Routine);
+        assert!(!routine.candidate.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_execution_rejects_protected_candidates() -> Result<()> {
         let mut protected = fixture(false)?;
         rewrite_repository_manifest(&mut protected, |manifest| {
             manifest["generated_dirs"][0]["protection"] = json!({ "id": "fixture-protection" });
@@ -1693,6 +1862,28 @@ mod tests {
         assert!(error
             .to_string()
             .contains("current process ownership exists"));
+        assert!(error.to_string().contains("evidence written to"));
+        let refusal_path = fs::read_dir(fixture.manifest.parent().unwrap())?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.contains("ownership-refusal"))
+            })
+            .context("missing durable ownership refusal")?;
+        let refusal: serde_json::Value = serde_json::from_slice(&fs::read(refusal_path)?)?;
+        assert_eq!(refusal["stage"], "preflight");
+        assert_eq!(refusal["cleanup_class"], "pressure");
+        assert_eq!(refusal["ownership"]["backend"], "override");
+        assert_eq!(refusal["ownership"]["complete"], true);
+        assert_eq!(
+            refusal["ownership"]["observations"][0]["matched_path"],
+            fixture.candidate.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            refusal["ownership"]["observations"][0]["evidence_kind"],
+            "test_override"
+        );
         assert!(fixture.candidate.is_dir());
         Ok(())
     }
