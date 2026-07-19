@@ -723,13 +723,23 @@ fn plan_cleanup_with_protections_in_roots(
             pressure: options.pressure.as_ref(),
         },
     )?;
-    let worktree_decisions = plan_worktree_cleanup(
+    let mut worktree_decisions = plan_worktree_cleanup(
         &worktrees,
         options.stale_days,
         options.now,
         protections,
         options.pressure.as_ref(),
     )?;
+    if roots.is_some() {
+        for decision in &mut worktree_decisions {
+            if decision.action == WorktreeAction::PruneMetadata {
+                decision.action = WorktreeAction::Keep;
+                decision.reason =
+                    "root-scoped cleanup does not run repository-global metadata pruning"
+                        .to_string();
+            }
+        }
+    }
     let metadata_prune_enabled = roots.is_none();
     let prune_output = if metadata_prune_enabled {
         run_worktree_prune(&context.current_worktree, false)?
@@ -6276,6 +6286,46 @@ mod tests {
         assert_eq!(repository.worktrees[0].path, selected);
         assert_eq!(repository.generated_dirs.len(), 1);
         assert_eq!(repository.generated_dirs[0].path, selected.join(".next"));
+        assert!(!repository.metadata_prune_enabled);
+        assert!(repository.prune_output.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn root_cleanup_retains_prunable_metadata_it_cannot_execute() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let scope = temp.path().join("scope");
+        fs::create_dir_all(&scope)?;
+        let missing = scope.join("missing-linked");
+        add_worktree(&repo, &missing, "missing-linked-branch")?;
+        fs::remove_dir_all(&missing)?;
+        let scope = fs::canonicalize(scope)?;
+
+        let run = cleanup_repositories(
+            std::slice::from_ref(&scope),
+            std::slice::from_ref(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+
+        let repository = &run.manifest.repositories[0].manifest;
+        let decision = repository
+            .worktrees
+            .iter()
+            .find(|decision| decision.metadata_prunable)
+            .context("missing root-scoped prunable metadata decision")?;
+        assert_eq!(decision.action, WorktreeAction::Keep);
+        assert!(decision.reason.contains("root-scoped cleanup"));
         assert!(!repository.metadata_prune_enabled);
         assert!(repository.prune_output.is_empty());
         Ok(())
