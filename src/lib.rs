@@ -193,6 +193,7 @@ pub struct CleanupManifest {
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
     pub protections: Vec<ProtectionLease>,
+    pub metadata_prune_enabled: bool,
     pub prune_output: String,
     pub worktrees: Vec<WorktreeDecision>,
     pub generated_dirs: Vec<GeneratedDirDecision>,
@@ -697,8 +698,18 @@ fn plan_cleanup_with_protections(
     protections: &[ProtectionLease],
     open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<CleanupRun> {
+    plan_cleanup_with_protections_in_roots(repo, options, protections, open_handles, None)
+}
+
+fn plan_cleanup_with_protections_in_roots(
+    repo: Option<&Path>,
+    options: CleanupOptions,
+    protections: &[ProtectionLease],
+    open_handles: Option<&OpenHandleSnapshot>,
+    roots: Option<&[PathBuf]>,
+) -> Result<CleanupRun> {
     let context = repo_context(repo)?;
-    let worktrees = inspect_worktrees(&context, options.now)?;
+    let worktrees = inspect_worktrees_in_roots(&context, roots, options.now)?;
     let generated_dirs = scan_generated_dirs(
         &worktrees,
         &options.generated_config,
@@ -712,15 +723,29 @@ fn plan_cleanup_with_protections(
             pressure: options.pressure.as_ref(),
         },
     )?;
-    let prune_output = run_worktree_prune(&context.current_worktree, false)?;
-
-    let worktree_decisions = plan_worktree_cleanup(
+    let mut worktree_decisions = plan_worktree_cleanup(
         &worktrees,
         options.stale_days,
         options.now,
         protections,
         options.pressure.as_ref(),
     )?;
+    if roots.is_some() {
+        for decision in &mut worktree_decisions {
+            if decision.action == WorktreeAction::PruneMetadata {
+                decision.action = WorktreeAction::Keep;
+                decision.reason =
+                    "root-scoped cleanup does not run repository-global metadata pruning"
+                        .to_string();
+            }
+        }
+    }
+    let metadata_prune_enabled = roots.is_none();
+    let prune_output = if metadata_prune_enabled {
+        run_worktree_prune(&context.current_worktree, false)?
+    } else {
+        String::new()
+    };
     let generated_decisions = generated_dirs
         .iter()
         .map(|dir| GeneratedDirDecision {
@@ -767,6 +792,7 @@ fn plan_cleanup_with_protections(
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
         protections: protections.to_vec(),
+        metadata_prune_enabled,
         prune_output,
         worktrees: worktree_decisions,
         generated_dirs: generated_decisions,
@@ -1031,11 +1057,12 @@ pub fn cleanup_repositories(
     let mut repositories = repositories
         .par_iter()
         .map(|repo| {
-            plan_cleanup_with_protections(
+            plan_cleanup_with_protections_in_roots(
                 Some(repo),
                 options.clone(),
                 &protections,
                 open_handles.as_ref(),
+                Some(&roots),
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1044,7 +1071,7 @@ pub fn cleanup_repositories(
         manifest_version: MANIFEST_VERSION,
         mode,
         generated_at,
-        roots,
+        roots: roots.clone(),
         pressure,
         repositories,
     };
@@ -1059,11 +1086,12 @@ pub fn cleanup_repositories(
             let refreshed_open_handles = refreshed_options
                 .check_in_use
                 .then(capture_open_handle_snapshot);
-            let mut refreshed = plan_cleanup_with_protections(
+            let mut refreshed = plan_cleanup_with_protections_in_roots(
                 Some(&repo_root),
                 refreshed_options,
                 &refreshed_protections,
                 refreshed_open_handles.as_ref(),
+                Some(&roots),
             )?;
             carry_generated_measurements(&manifest.repositories[index], &mut refreshed)?;
             refreshed.manifest_path =
@@ -1204,7 +1232,7 @@ fn pressure_observation_paths(
     let mut paths = roots.to_vec();
     for repository in repositories {
         let context = repo_context(Some(repository))?;
-        let worktrees = inspect_worktrees(&context, now)?;
+        let worktrees = inspect_worktrees_in_roots(&context, Some(roots), now)?;
         for worktree in worktrees
             .iter()
             .filter(|worktree| worktree.exists && worktree.prunable.is_none())
@@ -1234,11 +1262,13 @@ fn refresh_and_execute_repository(
     let refreshed_open_handles = refreshed_options
         .check_in_use
         .then(capture_open_handle_snapshot);
-    let mut refreshed = plan_cleanup_with_protections(
+    let roots = manifest.roots.clone();
+    let mut refreshed = plan_cleanup_with_protections_in_roots(
         Some(&repo_root),
         refreshed_options,
         &refreshed_protections,
         refreshed_open_handles.as_ref(),
+        Some(&roots),
     )?;
     carry_generated_measurements(&manifest.repositories[index], &mut refreshed)?;
     if let Some(path) = only_generated_path {
@@ -1432,8 +1462,29 @@ fn execute_cleanup_manifest_matching(
     if pass != ExecutionPass::Routine {
         return execute_cleanup(manifest, pass, only_generated_path);
     }
-    let worktree_paths = prunable_worktree_paths(&manifest.worktrees);
-    match with_protection_guard_for_paths(&worktree_paths, SystemTime::now(), || {
+    execute_planned_metadata_prune(manifest)?;
+    execute_cleanup(manifest, pass, only_generated_path)
+}
+
+fn execute_planned_metadata_prune(manifest: &CleanupManifest) -> Result<()> {
+    if !manifest.metadata_prune_enabled {
+        return Ok(());
+    }
+
+    let current_output = run_worktree_prune(&manifest.current_worktree, false)?;
+    if current_output != manifest.prune_output {
+        eprintln!(
+            "skipping worktree metadata prune because prunable metadata changed after planning"
+        );
+        return Ok(());
+    }
+    if current_output.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut guarded_paths = prunable_worktree_paths(&manifest.worktrees);
+    guarded_paths.push(manifest.git_common_dir.clone());
+    match with_protection_guard_for_paths(&guarded_paths, SystemTime::now(), || {
         run_worktree_prune(&manifest.current_worktree, true)
     })? {
         ProtectionGuardOutcome::Protected(lease) => {
@@ -1449,7 +1500,7 @@ fn execute_cleanup_manifest_matching(
             result?;
         }
     }
-    execute_cleanup(manifest, pass, only_generated_path)
+    Ok(())
 }
 
 fn prunable_worktree_paths(worktrees: &[WorktreeDecision]) -> Vec<PathBuf> {
@@ -1458,6 +1509,17 @@ fn prunable_worktree_paths(worktrees: &[WorktreeDecision]) -> Vec<PathBuf> {
         .filter(|worktree| worktree.metadata_prunable)
         .map(|worktree| worktree.path.clone())
         .collect()
+}
+
+#[cfg(test)]
+fn current_prunable_worktree_paths(repo: &Path) -> Result<Vec<PathBuf>> {
+    Ok(
+        parse_worktree_list(&git_output(repo, ["worktree", "list", "--porcelain"])?)
+            .into_iter()
+            .filter(|worktree| worktree.prunable.is_some() || !worktree.path.exists())
+            .map(|worktree| worktree.path)
+            .collect(),
+    )
 }
 
 pub fn discover_repositories(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -1945,16 +2007,32 @@ fn repo_context(repo: Option<&Path>) -> Result<RepoContext> {
 }
 
 fn inspect_worktrees(context: &RepoContext, now: SystemTime) -> Result<Vec<WorktreeInfo>> {
-    let raw = parse_worktree_list(&git_output(
+    inspect_worktrees_in_roots(context, None, now)
+}
+
+fn inspect_worktrees_in_roots(
+    context: &RepoContext,
+    roots: Option<&[PathBuf]>,
+    now: SystemTime,
+) -> Result<Vec<WorktreeInfo>> {
+    let mut raw = parse_worktree_list(&git_output(
         &context.current_worktree,
         ["worktree", "list", "--porcelain"],
     )?);
+    if let Some(roots) = roots {
+        raw.retain(|entry| path_is_within_roots(&entry.path, roots));
+    }
     let current_canonical = fs::canonicalize(&context.current_worktree)?;
 
     raw.into_par_iter()
         .filter(|entry| !entry.bare)
         .map(|entry| inspect_worktree(entry, &current_canonical, now))
         .collect()
+}
+
+fn path_is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    roots.iter().any(|root| resolved.starts_with(root))
 }
 
 fn inspect_worktree(
@@ -2304,8 +2382,9 @@ fn scan_generated_dirs_for_worktree(
         let routine_active = routine_worktree_recent || routine_dir_recent;
         let candidate_in_use = open_generated_dirs.contains(&candidate.path);
         let active = worktree_recent || dir_recent;
-        let owner_free_age_bypass = owner_free_pressure_mode && active;
-        let worktree_in_use = if owner_free_age_bypass {
+        let owner_free_pressure_candidate = owner_free_pressure_mode && routine_active;
+        let owner_free_age_bypass = owner_free_pressure_candidate && active;
+        let worktree_in_use = if owner_free_pressure_candidate {
             *worktree_in_use.get_or_insert_with(|| {
                 policy.check_in_use
                     && dirs_with_open_handles(
@@ -2325,8 +2404,8 @@ fn scan_generated_dirs_for_worktree(
             && !worktree_recent
             && !dir_recent
             && !has_tracked_files;
-        let in_use = candidate_in_use && (deletable_so_far || owner_free_pressure_mode);
-        let owner_free_pressure = owner_free_age_bypass
+        let in_use = candidate_in_use && (deletable_so_far || owner_free_pressure_candidate);
+        let owner_free_pressure = owner_free_pressure_candidate
             && ownership_evidence_complete
             && !worktree_in_use
             && !candidate_in_use
@@ -2366,7 +2445,7 @@ fn scan_generated_dirs_for_worktree(
                     lease.reason
                 ),
             )
-        } else if owner_free_age_bypass && !ownership_evidence_complete {
+        } else if owner_free_pressure_candidate && !ownership_evidence_complete {
             (
                 GeneratedDirAction::Skip,
                 "owner-free pressure cleanup requires complete ownership evidence".to_string(),
@@ -2376,7 +2455,7 @@ fn scan_generated_dirs_for_worktree(
                 GeneratedDirAction::Skip,
                 "a running process has open files in this directory".to_string(),
             )
-        } else if owner_free_age_bypass && worktree_in_use {
+        } else if owner_free_pressure_candidate && worktree_in_use {
             if has_sweep_work {
                 let descriptions = sweeps
                     .iter()
@@ -2489,8 +2568,10 @@ fn scan_generated_dirs_for_worktree(
         } else {
             CleanupClass::Routine
         };
-        let reason = if owner_free_pressure {
+        let reason = if owner_free_pressure && owner_free_age_bypass {
             format!("pressure cleanup bypasses artifact age: {reason}")
+        } else if owner_free_pressure {
+            format!("owner-free pressure cleanup: {reason}")
         } else if cleanup_class == CleanupClass::Pressure {
             format!("pressure cleanup below the {routine_days}-day routine window: {reason}")
         } else {
@@ -5619,6 +5700,140 @@ mod tests {
             .worktrees
             .iter()
             .any(|d| d.path == expected_worktree && d.action == WorktreeAction::Remove));
+        assert!(run.manifest.metadata_prune_enabled);
+        assert!(run.manifest.prune_output.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_enables_metadata_prune_only_for_observed_prunable_paths() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree = repo.with_file_name("missing-worktree");
+        add_worktree(&repo, &worktree, "missing-worktree-branch")?;
+        fs::remove_dir_all(&worktree)?;
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+
+        assert!(run.manifest.metadata_prune_enabled);
+        assert!(run.manifest.worktrees.iter().any(|decision| {
+            decision.metadata_prunable && decision.action == WorktreeAction::PruneMetadata
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_prune_includes_orphan_admin_dirs_missing_from_worktree_list() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        git_output(&repo, ["config", "gc.worktreePruneExpire", "now"])?;
+        let orphan = repo.join(".git/worktrees/orphan-admin");
+        fs::create_dir_all(&orphan)?;
+        set_mtime(&orphan, unix_days_before_now(120))?;
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+
+        assert!(run.manifest.metadata_prune_enabled);
+        assert!(run.manifest.prune_output.contains("orphan-admin"));
+        assert!(run
+            .manifest
+            .worktrees
+            .iter()
+            .all(|decision| !decision.metadata_prunable));
+
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
+        assert!(!orphan.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn routine_execution_does_not_prune_metadata_created_after_planning() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+        assert!(run.manifest.metadata_prune_enabled);
+
+        let worktree = repo.with_file_name("missing-after-plan");
+        add_worktree(&repo, &worktree, "missing-after-plan-branch")?;
+        fs::remove_dir_all(&worktree)?;
+
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
+
+        assert_eq!(current_prunable_worktree_paths(&repo)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn routine_execution_fails_closed_when_prunable_metadata_changes_after_planning() -> Result<()>
+    {
+        let (_temp, repo) = init_repo()?;
+        let planned = repo.with_file_name("missing-before-plan");
+        add_worktree(&repo, &planned, "missing-before-plan-branch")?;
+        fs::remove_dir_all(&planned)?;
+
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: false,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+        assert!(run.manifest.metadata_prune_enabled);
+
+        let unplanned = repo.with_file_name("missing-after-plan");
+        add_worktree(&repo, &unplanned, "missing-after-plan-branch")?;
+        fs::remove_dir_all(&unplanned)?;
+
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
+
+        assert_eq!(current_prunable_worktree_paths(&repo)?.len(), 2);
         Ok(())
     }
 
@@ -5759,6 +5974,7 @@ mod tests {
                 generated_delete_names: Vec::new(),
                 generated_report_only_names: Vec::new(),
                 protections: Vec::new(),
+                metadata_prune_enabled: true,
                 prune_output: String::new(),
                 worktrees: Vec::new(),
                 generated_dirs,
@@ -5880,6 +6096,7 @@ mod tests {
             generated_delete_names: Vec::new(),
             generated_report_only_names: Vec::new(),
             protections: Vec::new(),
+            metadata_prune_enabled: true,
             prune_output: String::new(),
             worktrees: Vec::new(),
             generated_dirs: vec![decision(first.clone()), decision(second.clone())],
@@ -6013,9 +6230,10 @@ mod tests {
         add_worktree(&repo, &linked, "pressure-linked-branch")?;
         fs::create_dir_all(linked.join("target/debug"))?;
         fs::write(linked.join("target/debug/.cargo-lock"), "")?;
+        let root = fs::canonicalize(temp.path())?;
 
         let paths = pressure_observation_paths(
-            &[temp.path().to_path_buf()],
+            std::slice::from_ref(&root),
             std::slice::from_ref(&repo),
             &GeneratedDirConfig::default(),
             now(),
@@ -6031,6 +6249,86 @@ mod tests {
             .collect::<Result<HashSet<_>>>()?
             .len();
         assert_eq!(observations.len(), device_count);
+        Ok(())
+    }
+
+    #[test]
+    fn root_cleanup_plans_only_worktrees_within_configured_roots() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let selected = temp.path().join("selected-linked");
+        let sibling = temp.path().join("sibling-linked");
+        add_worktree(&repo, &selected, "selected-linked-branch")?;
+        add_worktree(&repo, &sibling, "sibling-linked-branch")?;
+        fs::create_dir_all(selected.join(".next/cache"))?;
+        fs::create_dir_all(sibling.join(".next/cache"))?;
+        fs::write(selected.join(".next/cache/selected"), "selected")?;
+        fs::write(sibling.join(".next/cache/sibling"), "sibling")?;
+
+        let selected = fs::canonicalize(selected)?;
+        let run = cleanup_repositories(
+            std::slice::from_ref(&selected),
+            std::slice::from_ref(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 0,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+
+        let repository = &run.manifest.repositories[0].manifest;
+        assert_eq!(repository.worktrees.len(), 1);
+        assert_eq!(repository.worktrees[0].path, selected);
+        assert_eq!(repository.generated_dirs.len(), 1);
+        assert_eq!(repository.generated_dirs[0].path, selected.join(".next"));
+        assert!(!repository.metadata_prune_enabled);
+        assert!(repository.prune_output.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn root_cleanup_retains_prunable_metadata_it_cannot_execute() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let scope = temp.path().join("scope");
+        fs::create_dir_all(&scope)?;
+        let missing = scope.join("missing-linked");
+        add_worktree(&repo, &missing, "missing-linked-branch")?;
+        fs::remove_dir_all(&missing)?;
+        let scope = fs::canonicalize(scope)?;
+
+        let run = cleanup_repositories(
+            std::slice::from_ref(&scope),
+            std::slice::from_ref(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                now: now(),
+            },
+        )?;
+
+        let repository = &run.manifest.repositories[0].manifest;
+        let decision = repository
+            .worktrees
+            .iter()
+            .find(|decision| decision.metadata_prunable)
+            .context("missing root-scoped prunable metadata decision")?;
+        assert_eq!(decision.action, WorktreeAction::Keep);
+        assert!(decision.reason.contains("root-scoped cleanup"));
+        assert!(!repository.metadata_prune_enabled);
+        assert!(repository.prune_output.is_empty());
         Ok(())
     }
 
@@ -6871,7 +7169,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_free_pressure_keeps_expired_generated_dirs_routine() -> Result<()> {
+    fn owner_free_pressure_keeps_expired_generated_dirs_in_routine_pass() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let package = repo.join("node_modules/pkg");
         fs::create_dir_all(&package)?;
@@ -6917,11 +7215,12 @@ mod tests {
         assert_eq!(decision.action, GeneratedDirAction::Delete);
         assert_eq!(decision.cleanup_class, CleanupClass::Routine);
         assert!(!decision.owner_free_pressure);
+        assert!(!decision.worktree_in_use);
         Ok(())
     }
 
     #[test]
-    fn source_ownership_does_not_block_expired_generated_dirs() -> Result<()> {
+    fn owner_free_pressure_does_not_block_expired_generated_dirs_owned_elsewhere() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let package = repo.join("node_modules/pkg");
         fs::create_dir_all(&package)?;
@@ -6969,7 +7268,10 @@ mod tests {
             .context("missing node_modules decision")?;
         assert_eq!(decision.action, GeneratedDirAction::Delete);
         assert_eq!(decision.cleanup_class, CleanupClass::Routine);
+        assert!(!decision.worktree_in_use);
         assert!(!decision.owner_free_pressure);
+        execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
+        assert!(!repo.join("node_modules").exists());
         Ok(())
     }
 
