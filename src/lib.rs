@@ -2,6 +2,7 @@ mod cargo_incremental;
 mod cargo_profiles;
 mod exact_generated;
 mod gateway_storage;
+mod generated;
 mod inventory;
 #[cfg(target_os = "macos")]
 mod macos_open_handles;
@@ -38,6 +39,13 @@ pub use gateway_storage::{
     gateway_storage_report, print_gateway_storage_report, GatewayStorageOptions,
     GatewayStorageReport, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES,
     DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT,
+};
+pub use generated::{
+    collect_generated, print_generated_collect, GeneratedArtifactMeasurement,
+    GeneratedArtifactObservation, GeneratedArtifactSummary, GeneratedCollectAction,
+    GeneratedCollectManifest, GeneratedCollectOptions, GeneratedCollectPlan,
+    GeneratedCollectPolicy, GeneratedCollectRun, GeneratedRebuildCost, GeneratedRebuildCostSummary,
+    GeneratedRootCoverage, DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
 };
 pub use inventory::{
     inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
@@ -1027,6 +1035,14 @@ fn measure_cleanup_runs_matching(
 pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTriageReport> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
+    triage_repositories(&roots, &repositories, options)
+}
+
+pub(crate) fn triage_repositories(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    options: TriageOptions,
+) -> Result<RootTriageReport> {
     let protections = active_protections(options.now)?;
     let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
     let repositories = repositories
@@ -1042,9 +1058,39 @@ pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTri
         .collect::<Result<Vec<_>>>()?;
 
     Ok(RootTriageReport {
-        roots,
+        roots: roots.to_vec(),
         repositories,
     })
+}
+
+pub(crate) fn triage_repositories_serial_with_errors(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    options: TriageOptions,
+) -> Result<(RootTriageReport, Vec<(PathBuf, String)>)> {
+    let protections = active_protections(options.now)?;
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
+    let mut reports = Vec::new();
+    let mut errors = Vec::new();
+    for repository in repositories {
+        match triage_with_protections(
+            Some(repository),
+            options.clone(),
+            &protections,
+            open_handles.as_ref(),
+        ) {
+            Ok(report) => reports.push(report),
+            Err(error) => errors.push((repository.clone(), format!("{error:#}"))),
+        }
+    }
+
+    Ok((
+        RootTriageReport {
+            roots: roots.to_vec(),
+            repositories: reports,
+        },
+        errors,
+    ))
 }
 
 pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootCleanupRun> {
@@ -4644,6 +4690,37 @@ mod tests {
         git_output(&repo, ["add", "."])?;
         commit_with_date(&repo, "initial", "2025-01-01T00:00:00Z")?;
         Ok((temp, repo))
+    }
+
+    #[test]
+    fn serial_repository_triage_preserves_good_reports_when_one_repository_fails() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let missing = repo
+            .parent()
+            .context("fixture repo has no parent")?
+            .join("missing");
+        let roots = vec![repo.clone(), missing.clone()];
+
+        let (report, errors) = triage_repositories_serial_with_errors(
+            &roots,
+            &[repo.clone(), missing.clone()],
+            TriageOptions {
+                stale_days: DEFAULT_STALE_DAYS,
+                generated_days: DEFAULT_GENERATED_DAYS,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        assert_eq!(report.roots, roots);
+        assert_eq!(report.repositories.len(), 1);
+        assert_eq!(report.repositories[0].repo_root, repo.canonicalize()?);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, missing);
+        assert!(!errors[0].1.is_empty());
+        Ok(())
     }
 
     #[cfg(unix)]

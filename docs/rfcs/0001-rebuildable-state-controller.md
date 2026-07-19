@@ -23,17 +23,19 @@ state.
 | APFS-aware inventory and exact physical measurement | Landed | Retain |
 | Measured pressure candidates and exact execution manifests | Landed | Retain |
 | Report-only owner adapters for durable domains | Landed | Retain |
-| Bounded scheduling, direct generated-root discovery, generated opportunity reporting, and bounded pressure waves | Validated on an unpublished stack | Publish as controller foundations |
+| Bounded scheduling and pressure waves | Landed | Retain |
+| Bounded generated-root discovery and opportunity coverage | In delivery | Publish as the machine coverage ledger before activation |
 | Workday-aware artifact age | Validated on an unpublished stack | Retain as evidence and optional cooldown; remove as primary eligibility authority |
 | Scoped source, artifact, runtime, and legacy protections | Not implemented | Build before weakening broad worktree protection |
-| Owner-free coarse cleanup independent of source recency | Partially present behind age and broad-protection gates | Make the immediate implementation priority |
+| Owner-free coarse cleanup independent of source recency | Exact routine and pressure execution landed; coverage in delivery | Complete supervised activation without weakening broad protections |
 | Granular active Cargo-target pruning | Partially landed | Extend with measured size policy after owner-free coarse cleanup |
 | Unattended 100–150 GiB controller | Not active | Gate on supervised cycles and acceptance criteria |
 
-The unpublished generated-retention stack must be reconciled against this
-table before publication. Its discovery, measurement, parallelism, reporting,
-and batching work remain useful. Its hard three-workday retention direction
-does not become policy merely because the implementation has been validated.
+The generated-retention stack is being selectively reconciled against this
+table rather than published wholesale. Its discovery, measurement, reporting,
+and bounded scheduling foundations remain useful. Its hard three-workday
+retention direction does not become policy merely because the implementation
+was validated.
 
 ## Summary
 

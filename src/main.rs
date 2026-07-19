@@ -6,15 +6,16 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories, cleanup_roots, discover_repositories,
-    execute_approved_generated, gateway_storage_report, inventory, list_protections, print_cleanup,
-    print_gateway_storage_report, print_inventory, print_root_cleanup, print_root_triage,
-    print_triage, remove_protection, renew_protection, triage, triage_roots, CleanupOptions,
-    GatewayStorageOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit,
+    add_protection, cleanup, cleanup_repositories, cleanup_roots, collect_generated,
+    discover_repositories, execute_approved_generated, gateway_storage_report, inventory,
+    list_protections, print_cleanup, print_gateway_storage_report, print_generated_collect,
+    print_inventory, print_root_cleanup, print_root_triage, print_triage, remove_protection,
+    renew_protection, triage, triage_roots, CleanupOptions, GatewayStorageOptions,
+    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit,
     SweepStrategy, SweepTool, TriageOptions, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES,
     DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT, DEFAULT_GENERATED_DAYS,
-    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
-    MAX_PROTECTION_TTL_DAYS,
+    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
+    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -88,6 +89,11 @@ enum Command {
 
         #[arg(long, help = "Write the complete report-only correlation as JSON")]
         json: bool,
+    },
+    /// Run a report-only domain collector
+    Collect {
+        #[command(subcommand)]
+        command: CollectorCommand,
     },
     #[command(visible_alias = "audit")]
     Triage {
@@ -176,6 +182,36 @@ enum Command {
     Protect {
         #[command(subcommand)]
         command: ProtectCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CollectorCommand {
+    /// Inventory generated build and dependency roots across Git repositories
+    Generated {
+        #[arg(value_name = "PATH", required = true)]
+        roots: Vec<PathBuf>,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_GENERATED_DAYS,
+            help = "Retain the cleanup activity classification alongside opportunity coverage"
+        )]
+        generated_days: u64,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
+            help = "Maximum entries to visit while discovering repositories across all roots"
+        )]
+        max_discovery_entries: u64,
+
+        #[arg(
+            long,
+            default_value_t = 2_000_000,
+            help = "Maximum entries to APFS-measure across all generated roots"
+        )]
+        max_entries: u64,
     },
 }
 
@@ -549,6 +585,29 @@ fn main() -> Result<()> {
                 println!();
             } else {
                 print_gateway_storage_report(&report);
+            }
+        }
+        Command::Collect { command } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "collect takes domain roots as positional arguments; do not pass --repo or --root"
+            );
+            match command {
+                CollectorCommand::Generated {
+                    roots,
+                    generated_days,
+                    max_discovery_entries,
+                    max_entries,
+                } => {
+                    let run = collect_generated(GeneratedCollectOptions {
+                        roots,
+                        generated_days,
+                        max_discovery_entries,
+                        max_entries,
+                        now,
+                    })?;
+                    print_generated_collect(&run);
+                }
             }
         }
         Command::Triage {
@@ -1040,6 +1099,52 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn generated_collector_accepts_bounded_multi_root_options() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "generated",
+            "/tmp/one",
+            "/tmp/two",
+            "--generated-days",
+            "3",
+            "--max-discovery-entries",
+            "77",
+            "--max-entries",
+            "99",
+        ])
+        .expect("generated collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::Generated {
+                        roots,
+                        generated_days,
+                        max_discovery_entries,
+                        max_entries,
+                    },
+            } => {
+                assert_eq!(
+                    roots,
+                    [PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
+                );
+                assert_eq!(generated_days, 3);
+                assert_eq!(max_discovery_entries, 77);
+                assert_eq!(max_entries, 99);
+            }
+            _ => unreachable!(),
+        }
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "generated",
+            "/tmp/one",
+            "--execute",
+        ])
+        .is_err());
     }
 
     #[test]
