@@ -1266,6 +1266,19 @@ mod tests {
         }
     }
 
+    fn assert_filesystem_measurement_succeeded(measurement: &GeneratedArtifactMeasurement) {
+        assert!(measurement.measured_at_unix.is_some());
+        assert!(measurement.filesystem.is_some());
+        assert!(measurement.visited_entries > 0);
+        assert!(measurement.metrics.logical_bytes > 0);
+        assert!(measurement.metrics.allocated_bytes > 0);
+        assert!(measurement.error.is_none());
+        assert_eq!(
+            measurement.complete,
+            measurement.metrics.private_reclaimable_complete
+        );
+    }
+
     #[test]
     fn active_or_skipped_generated_roots_are_still_measured() {
         let temp = tempfile::tempdir().unwrap();
@@ -1276,8 +1289,7 @@ mod tests {
 
         measure_artifacts(&mut artifacts, 100).unwrap();
 
-        assert!(artifacts[0].measurement.complete);
-        assert!(artifacts[0].measurement.metrics.allocated_bytes > 0);
+        assert_filesystem_measurement_succeeded(&artifacts[0].measurement);
     }
 
     #[test]
@@ -1318,8 +1330,7 @@ mod tests {
 
         assert!(!artifacts[0].measurement.complete);
         assert!(artifacts[0].measurement.error.is_some());
-        assert!(artifacts[1].measurement.complete);
-        assert!(artifacts[1].measurement.metrics.allocated_bytes > 0);
+        assert_filesystem_measurement_succeeded(&artifacts[1].measurement);
     }
 
     #[test]
