@@ -10,7 +10,7 @@ use atomic_write_file::AtomicWriteFile;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -332,26 +332,64 @@ fn discover_one_root(requested_root: &Path, max_entries: u64) -> RootDiscovery {
             walker.skip_current_dir();
             continue;
         }
-        if entry.path().join(".git").exists() {
-            candidates.push(entry.path().to_path_buf());
-            walker.skip_current_dir();
+        match has_git_marker(entry.path()) {
+            Ok(true) => {
+                candidates.push(entry.path().to_path_buf());
+                walker.skip_current_dir();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                discovery.discovery_complete = false;
+                discovery.discovery_errors.push(format!(
+                    "inspect Git marker under {}: {error}",
+                    entry.path().display()
+                ));
+                walker.skip_current_dir();
+            }
         }
     }
 
     if !candidates.is_empty() {
-        match discover_repositories(&candidates) {
-            Ok(repositories) => discovery.repositories = repositories,
-            Err(error) => {
-                discovery.discovery_complete = false;
-                discovery
-                    .discovery_errors
-                    .push(format!("resolve discovered repositories: {error:#}"));
-            }
+        let (repositories, errors) = resolve_repository_candidates(&candidates);
+        discovery.repositories = repositories;
+        if !errors.is_empty() {
+            discovery.discovery_complete = false;
+            discovery.discovery_errors.extend(errors);
         }
     }
     discovery.repositories.sort();
     discovery.repositories.dedup();
     discovery
+}
+
+fn has_git_marker(directory: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(directory.join(".git")) {
+        Ok(metadata) => Ok(metadata.is_file() || metadata.is_dir() || metadata.is_symlink()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_repository_candidates(candidates: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
+    let mut repositories = BTreeSet::new();
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        match discover_repositories(std::slice::from_ref(candidate)) {
+            Ok(discovered) => repositories.extend(discovered),
+            Err(error) => errors.push(format!(
+                "resolve discovered repository {}: {error:#}",
+                candidate.display()
+            )),
+        }
+    }
+    (repositories.into_iter().collect(), errors)
+}
+
+fn requested_manifest_roots(discoveries: &[RootDiscovery]) -> Vec<PathBuf> {
+    discoveries
+        .iter()
+        .map(|discovery| discovery.requested_root.clone())
+        .collect()
 }
 
 pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCollectRun> {
@@ -369,8 +407,9 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
         "max_discovery_entries must be at least 1"
     );
 
-    let (mut discoveries, roots, repository_paths) =
+    let (mut discoveries, canonical_roots, repository_paths) =
         discover_requested_roots(&options.roots, options.max_discovery_entries);
+    let requested_roots = requested_manifest_roots(&discoveries);
     let triage_options = TriageOptions {
         stale_days: DEFAULT_STALE_DAYS,
         generated_days: options.generated_days,
@@ -382,7 +421,11 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
     let reports = if repository_paths.is_empty() {
         Vec::new()
     } else {
-        match triage_repositories_serial_with_errors(&roots, &repository_paths, triage_options) {
+        match triage_repositories_serial_with_errors(
+            &canonical_roots,
+            &repository_paths,
+            triage_options,
+        ) {
             Ok((triage, errors)) => {
                 record_repository_errors(&mut discoveries, errors);
                 triage.repositories
@@ -489,7 +532,7 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
         run_id: format!("{}-{}", unix_nanos(options.now), std::process::id()),
         mode: CleanupMode::DryRun,
         generated_at_unix: unix_seconds(options.now),
-        roots,
+        roots: requested_roots,
         policy: GeneratedCollectPolicy {
             owner_contract: "Git worktree ownership plus tracked/ignored state, domain-shaped activity, open handles, and recursive protection leases",
             execution: "report-only; generate a fresh cleanup manifest before any mutation",
@@ -758,12 +801,24 @@ fn summarize_roots(
                         .flatten()
                         .cloned()
                 })
+                .filter(|worktree| {
+                    discovery
+                        .canonical_root
+                        .as_ref()
+                        .is_some_and(|root| worktree.starts_with(root))
+                })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
             let root_artifacts = artifacts
                 .iter()
-                .filter(|artifact| repositories.contains(&artifact.repository))
+                .filter(|artifact| {
+                    repositories.contains(&artifact.repository)
+                        && discovery
+                            .canonical_root
+                            .as_ref()
+                            .is_some_and(|root| artifact.worktree_path.starts_with(root))
+                })
                 .collect::<Vec<_>>();
             let ownership_complete = discovery.classification_errors.is_empty()
                 && root_artifacts
@@ -1401,6 +1456,59 @@ mod tests {
     }
 
     #[test]
+    fn manifest_roots_preserve_valid_and_missing_requested_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid");
+        let missing = temp.path().join("missing");
+        fs::create_dir(&valid).unwrap();
+
+        let (discoveries, canonical_roots, _) =
+            discover_requested_roots(&[missing.clone(), valid.clone()], 100);
+
+        assert_eq!(
+            requested_manifest_roots(&discoveries),
+            [missing, valid.clone()]
+        );
+        assert_eq!(canonical_roots, [fs::canonicalize(valid).unwrap()]);
+        assert_eq!(discoveries.len(), 2);
+        assert!(discoveries.iter().any(|root| !root.discovery_complete));
+    }
+
+    #[test]
+    fn repository_discovery_preserves_valid_repositories_when_one_marker_is_broken() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp.path().join("valid");
+        let broken = temp.path().join("broken");
+        init_repo(&valid);
+        fs::create_dir(&broken).unwrap();
+        fs::write(broken.join(".git"), "gitdir: missing\n").unwrap();
+
+        let discovery = discover_one_root(temp.path(), 100);
+
+        assert!(!discovery.discovery_complete);
+        assert_eq!(discovery.repositories, [valid.canonicalize().unwrap()]);
+        assert!(discovery.discovery_errors.iter().any(|error| error
+            .contains("resolve discovered repository")
+            && error.contains("broken")));
+    }
+
+    #[test]
+    fn git_marker_probe_distinguishes_missing_markers_from_present_files_and_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let file = temp.path().join("file");
+        let directory = temp.path().join("directory");
+        fs::create_dir(&missing).unwrap();
+        fs::create_dir(&file).unwrap();
+        fs::write(file.join(".git"), "gitdir: elsewhere\n").unwrap();
+        fs::create_dir_all(directory.join(".git")).unwrap();
+
+        assert!(!has_git_marker(&missing).unwrap());
+        assert!(has_git_marker(&file).unwrap());
+        assert!(has_git_marker(&directory).unwrap());
+    }
+
+    #[test]
     fn repository_discovery_finds_hidden_linked_worktree_git_files() {
         let temp = tempfile::tempdir().unwrap();
         let primary = temp.path().join("primary");
@@ -1525,8 +1633,8 @@ mod tests {
         let repository = PathBuf::from("/tmp/repo");
         let discoveries = vec![
             RootDiscovery {
-                requested_root: PathBuf::from("/tmp/one"),
-                canonical_root: Some(PathBuf::from("/tmp/one")),
+                requested_root: PathBuf::from("/tmp"),
+                canonical_root: Some(PathBuf::from("/tmp")),
                 discovery_complete: true,
                 visited_entries: 1,
                 discovery_errors: Vec::new(),
@@ -1534,8 +1642,8 @@ mod tests {
                 repositories: vec![repository.clone()],
             },
             RootDiscovery {
-                requested_root: PathBuf::from("/tmp/two"),
-                canonical_root: Some(PathBuf::from("/tmp/two")),
+                requested_root: PathBuf::from("/tmp/repo"),
+                canonical_root: Some(PathBuf::from("/tmp/repo")),
                 discovery_complete: true,
                 visited_entries: 1,
                 discovery_errors: Vec::new(),
