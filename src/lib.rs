@@ -519,7 +519,13 @@ impl GeneratedDirConfig {
     }
 
     pub fn with_sweep_paths(mut self, sweep_paths: Vec<PathBuf>) -> Self {
-        self.sweep_paths = sweep_paths;
+        // Existing generated roots must use the same physical spelling as
+        // candidates discovered from canonical worktree paths. Keep missing
+        // paths unchanged so an unmatched exact filter remains a safe no-op.
+        self.sweep_paths = sweep_paths
+            .into_iter()
+            .map(|path| fs::canonicalize(&path).unwrap_or(path))
+            .collect();
         self.sweep_paths.sort();
         self.sweep_paths.dedup();
         self
@@ -2107,10 +2113,11 @@ fn inspect_worktree(
         None
     };
     let is_current = canonical.as_deref() == Some(current_canonical);
+    let path = canonical.unwrap_or_else(|| entry.path.clone());
 
     if entry.prunable.is_some() || !exists {
         return Ok(WorktreeInfo {
-            path: entry.path,
+            path,
             head: entry.head,
             branch: entry.branch,
             detached: entry.detached,
@@ -2129,21 +2136,21 @@ fn inspect_worktree(
         });
     }
 
-    let status = dirty_status(&entry.path)?;
-    let upstream = git_output_allow_failure(&entry.path, ["rev-parse", "--abbrev-ref", "@{u}"])
+    let status = dirty_status(&path)?;
+    let upstream = git_output_allow_failure(&path, ["rev-parse", "--abbrev-ref", "@{u}"])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let (behind, ahead) = upstream
         .as_deref()
-        .and_then(|upstream| ahead_behind(&entry.path, upstream).ok())
+        .and_then(|upstream| ahead_behind(&path, upstream).ok())
         .unwrap_or((None, None));
-    let last_commit_unix = git_output(&entry.path, ["log", "-1", "--format=%ct"])
+    let last_commit_unix = git_output(&path, ["log", "-1", "--format=%ct"])
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok());
     let activity_unix = max_time(last_commit_unix, status.newest_dirty_mtime_unix);
 
     Ok(WorktreeInfo {
-        path: entry.path,
+        path,
         head: entry.head,
         branch: entry.branch,
         detached: entry.detached,
@@ -4916,6 +4923,56 @@ mod tests {
         )
         .with_sweep_paths(vec![selected.clone()]);
 
+        let candidates = generated_candidates(&worktree, &config)?;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect::<Vec<_>>(),
+            vec![selected]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_sweep_paths_match_symlinked_worktree_aliases() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = init_repo()?;
+        let alias = temp.path().join("repo-alias");
+        symlink(&repo, &alias)?;
+        fs::create_dir_all(repo.join("target/debug"))?;
+        fs::write(repo.join("target/debug/selected"), "selected")?;
+
+        let canonical_repo = fs::canonicalize(&repo)?;
+        let worktree = inspect_worktree(
+            RawWorktree {
+                path: alias.clone(),
+                ..RawWorktree::default()
+            },
+            &canonical_repo,
+            now(),
+        )?;
+        assert_eq!(worktree.path, canonical_repo);
+
+        let selected_alias = alias.join("target");
+        let selected = fs::canonicalize(repo.join("target"))?;
+        let config = GeneratedDirConfig::from_names_with_default_sweeps(
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![SweepStrategy {
+                name: "target".to_string(),
+                tool: SweepTool::RustcIncremental,
+                limit: SweepLimit::AgeDays { days: 14 },
+            }],
+        )
+        .with_sweep_paths(vec![selected_alias]);
+
+        assert_eq!(config.sweep_paths, vec![selected.clone()]);
         let candidates = generated_candidates(&worktree, &config)?;
         assert_eq!(
             candidates
