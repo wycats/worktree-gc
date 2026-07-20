@@ -17,7 +17,7 @@ use crate::{open_handle_evidence_for_paths, SweepCandidateAction};
 // generated files can add another directory or two. Keep this bounded while
 // sampling deeply enough that rewriting an existing output is visible.
 const PROFILE_ACTIVITY_SAMPLE_DEPTH: usize = 6;
-type CargoProfileOwnershipProbe = dyn Fn(&[PathBuf]) -> (HashSet<PathBuf>, bool);
+type CargoProfileOwnershipProbe<'a> = dyn Fn(&[PathBuf]) -> (HashSet<PathBuf>, bool) + 'a;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CargoProfileCandidateDecision {
@@ -249,7 +249,7 @@ fn execute_cargo_profile_reset_with_ownership(
     days: u64,
     run_id: &str,
     timeout: Option<Duration>,
-    ownership_probe: &CargoProfileOwnershipProbe,
+    ownership_probe: &CargoProfileOwnershipProbe<'_>,
 ) -> Result<()> {
     let target_dir = fs::canonicalize(target_dir)
         .with_context(|| format!("failed to resolve {}", target_dir.display()))?;
@@ -269,52 +269,75 @@ fn execute_cargo_profile_reset_with_ownership(
     }
     remove_empty_trash_root(&trash_root)?;
 
-    for candidate in candidates
+    let planned = candidates
         .iter()
         .filter(|candidate| candidate.action == SweepCandidateAction::Delete)
-    {
-        let Some(profile) = candidate.cargo_profile.as_deref() else {
-            continue;
-        };
-        if !candidate.path.exists() {
-            continue;
-        }
-        if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
-            eprintln!(
-                "  keeping refreshed Cargo profile {}",
-                candidate.path.display()
-            );
-            continue;
-        }
+        .filter(|candidate| candidate.cargo_profile.is_some() && candidate.path.exists())
+        .collect::<Vec<_>>();
+    if planned.is_empty() {
+        return Ok(());
+    }
 
-        let quarantined = with_cargo_profile_locks_timeout(
-            &target_dir,
-            worktree,
-            timeout,
-            || -> Result<Option<PathBuf>> {
+    let quarantined = with_cargo_profile_locks_timeout(
+        &target_dir,
+        worktree,
+        timeout,
+        || -> Result<Vec<(PathBuf, PathBuf)>> {
+            let mut stale = Vec::new();
+            for candidate in &planned {
+                let profile = candidate
+                    .cargo_profile
+                    .as_deref()
+                    .context("Cargo profile candidate has no profile identity")?;
                 if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
                     eprintln!(
                         "  keeping Cargo profile refreshed while waiting for its lock {}",
                         candidate.path.display()
                     );
-                    return Ok(None);
+                    continue;
                 }
-                let (open_profiles, complete) =
-                    ownership_probe(std::slice::from_ref(&candidate.path));
-                if !complete {
+                stale.push((*candidate, profile));
+            }
+            if stale.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let stale_paths = stale
+                .iter()
+                .map(|(candidate, _)| candidate.path.clone())
+                .collect::<Vec<_>>();
+            let (open_profiles, complete) = ownership_probe(&stale_paths);
+            if !complete {
+                for (candidate, _) in stale {
                     eprintln!(
                         "  keeping Cargo profile with incomplete ownership evidence {}",
                         candidate.path.display()
                     );
-                    return Ok(None);
+                }
+                return Ok(Vec::new());
+            }
+
+            let mut eligible = Vec::new();
+            for (candidate, profile) in stale {
+                if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
+                    eprintln!(
+                        "  keeping Cargo profile refreshed during ownership verification {}",
+                        candidate.path.display()
+                    );
+                    continue;
                 }
                 if open_profiles.contains(&candidate.path) {
                     eprintln!(
                         "  keeping Cargo profile owned by a running process {}",
                         candidate.path.display()
                     );
-                    return Ok(None);
+                    continue;
                 }
+                eligible.push((candidate, profile));
+            }
+
+            let mut quarantined = Vec::new();
+            for (candidate, profile) in eligible {
                 let metadata = fs::symlink_metadata(&candidate.path)?;
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     bail!(
@@ -356,14 +379,15 @@ fn execute_cargo_profile_reset_with_ownership(
                         candidate.path.display()
                     )
                 })?;
-                Ok(Some(destination))
-            },
-        )??;
-        if let Some(quarantined) = quarantined {
-            remove_quarantine_entry(&quarantined)?;
-            remove_empty_ancestors(&quarantined, &trash_root)?;
-            eprintln!("  reset stale Cargo profile {}", candidate.path.display());
-        }
+                quarantined.push((candidate.path.clone(), destination));
+            }
+            Ok(quarantined)
+        },
+    )??;
+    for (original, quarantined) in quarantined {
+        remove_quarantine_entry(&quarantined)?;
+        remove_empty_ancestors(&quarantined, &trash_root)?;
+        eprintln!("  reset stale Cargo profile {}", original.display());
     }
     Ok(())
 }
@@ -629,6 +653,7 @@ fn format_unix_time(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::HashSet;
     use std::fs::File;
     use std::thread;
@@ -963,16 +988,25 @@ mod tests {
             cross_profiles.push(profile);
         }
         let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let probe_calls = Cell::new(0);
+        let observed_profiles = Cell::new(0);
 
-        execute_profile_reset_for_test(
+        execute_cargo_profile_reset_with_ownership(
             &target,
             &repo,
             &plan.candidates,
             7,
             "test-run",
             Some(Duration::from_secs(10)),
+            &|paths| {
+                probe_calls.set(probe_calls.get() + 1);
+                observed_profiles.set(paths.len());
+                (HashSet::new(), true)
+            },
         )?;
 
+        assert_eq!(probe_calls.get(), 1);
+        assert_eq!(observed_profiles.get(), 2);
         assert!(cross_profiles.iter().all(|profile| !profile.exists()));
         assert!(host_profile.exists());
         assert!(!target.join(TRASH_DIR_NAME).exists());

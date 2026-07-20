@@ -152,6 +152,8 @@ file, mapped executable, or other live process path. Execution waits for Cargo's
 profile lock, rechecks activity and ownership, atomically moves the stale
 profile into a tool-owned quarantine, releases the lock, and then deletes the
 quarantine. A later execution recovers quarantine left by an interrupted run.
+This candidate-scoped ownership requirement always applies to profile reset;
+`--check-in-use` controls the broader generated-directory and worktree checks.
 
 The legacy `cargo-sweep` backend remains available as an additional explicit
 strategy for fingerprint-associated outputs. It can prune by age or keep an

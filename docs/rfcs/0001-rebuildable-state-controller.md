@@ -191,6 +191,8 @@ For Cargo targets, the initial strategies are:
 
 Other domains need equally explicit owner contracts. Granular pruning must not
 be approximated by deleting arbitrary old files from private layouts.
+Cargo profile reset therefore retains this candidate-scoped ownership check
+even when broad generated-directory ownership checking is disabled.
 
 ### Tier 2: coarse cleanup of owner-free generated trees
 
