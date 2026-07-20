@@ -122,6 +122,20 @@ Override the Cargo profile window independently:
 cargo run -- cleanup --repo /path/to/repo --sweep target=cargo-profile-reset:14 --execute
 ```
 
+Restrict an explicit sweep to one exact generated tree when a repository family
+contains linked worktrees or nested Cargo projects:
+
+```sh
+cargo run -- cleanup --repo /path/to/repo --no-default-generated \
+  --sweep target=rustc-incremental:14 \
+  --sweep target=cargo-profile-reset:1 \
+  --sweep-path /path/to/repo/target
+```
+
+`--sweep-path` only narrows in-place sweep planning. It never makes a generated
+tree eligible for wholesale deletion, and unmatched generated trees are not
+traversed looking for a nested match.
+
 Profile reset deliberately works at Cargo's profile boundary instead
 of interpreting private fingerprint JSON or reconstructing artifact hashes.
 This reclaims the profile's `deps`, `.fingerprint`, `build`, and incremental

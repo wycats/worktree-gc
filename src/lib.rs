@@ -148,6 +148,7 @@ pub struct TriageReport {
     pub check_in_use: bool,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
+    pub generated_sweep_paths: Vec<PathBuf>,
     pub protections: Vec<ProtectionLease>,
     pub worktrees: Vec<WorktreeInfo>,
     pub worktree_decisions: Vec<WorktreeDecision>,
@@ -201,6 +202,7 @@ pub struct CleanupManifest {
     pub pressure: Option<PressurePolicy>,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
+    pub generated_sweep_paths: Vec<PathBuf>,
     pub protections: Vec<ProtectionLease>,
     pub metadata_prune_enabled: bool,
     pub prune_output: String,
@@ -351,6 +353,7 @@ pub struct GeneratedDirConfig {
     pub report_only_names: Vec<String>,
     pub window_overrides: Vec<GeneratedWindowOverride>,
     pub sweep_strategies: Vec<SweepStrategy>,
+    pub sweep_paths: Vec<PathBuf>,
 }
 
 // An in-place pruning strategy for generated dirs that are too active to
@@ -519,7 +522,21 @@ impl GeneratedDirConfig {
             report_only_names: normalize_names(report_only),
             window_overrides: windows,
             sweep_strategies: normalize_sweep_strategies(sweeps),
+            sweep_paths: Vec::new(),
         }
+    }
+
+    pub fn with_sweep_paths(mut self, sweep_paths: Vec<PathBuf>) -> Self {
+        // Existing generated roots must use the same physical spelling as
+        // candidates discovered from canonical worktree paths. Keep missing
+        // paths unchanged so an unmatched exact filter remains a safe no-op.
+        self.sweep_paths = sweep_paths
+            .into_iter()
+            .map(|path| fs::canonicalize(&path).unwrap_or(path))
+            .collect();
+        self.sweep_paths.sort();
+        self.sweep_paths.dedup();
+        self
     }
 
     // Later entries win so custom overrides shadow the build-cache defaults.
@@ -539,7 +556,28 @@ impl GeneratedDirConfig {
             .collect()
     }
 
-    fn candidate_action(&self, name: &str) -> Option<GeneratedCandidateAction> {
+    fn sweep_strategies_for(&self, path: &Path, name: &str) -> Vec<&SweepStrategy> {
+        if !self.sweep_paths.is_empty()
+            && !self.sweep_paths.iter().any(|candidate| candidate == path)
+        {
+            return Vec::new();
+        }
+        self.sweep_strategies(name)
+    }
+
+    fn recognizes_name(&self, name: &str) -> bool {
+        self.delete_names.iter().any(|candidate| candidate == name)
+            || self
+                .report_only_names
+                .iter()
+                .any(|candidate| candidate == name)
+            || self
+                .sweep_strategies
+                .iter()
+                .any(|strategy| strategy.name == name)
+    }
+
+    fn candidate_action(&self, path: &Path, name: &str) -> Option<GeneratedCandidateAction> {
         if self
             .report_only_names
             .iter()
@@ -548,11 +586,7 @@ impl GeneratedDirConfig {
             Some(GeneratedCandidateAction::ReportOnly)
         } else if self.delete_names.iter().any(|candidate| candidate == name) {
             Some(GeneratedCandidateAction::Delete)
-        } else if self
-            .sweep_strategies
-            .iter()
-            .any(|strategy| strategy.name == name)
-        {
+        } else if !self.sweep_strategies_for(path, name).is_empty() {
             Some(GeneratedCandidateAction::SweepOnly)
         } else {
             None
@@ -695,6 +729,7 @@ fn triage_with_protections_in_roots(
         check_in_use: options.check_in_use,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
+        generated_sweep_paths: options.generated_config.sweep_paths,
         protections: protections.to_vec(),
         worktrees,
         worktree_decisions,
@@ -843,6 +878,7 @@ fn plan_cleanup_with_protections_in_roots(
         pressure: options.pressure,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
+        generated_sweep_paths: options.generated_config.sweep_paths,
         protections: protections.to_vec(),
         metadata_prune_enabled,
         prune_output,
@@ -2140,10 +2176,11 @@ fn inspect_worktree(
         None
     };
     let is_current = canonical.as_deref() == Some(current_canonical);
+    let path = canonical.unwrap_or_else(|| entry.path.clone());
 
     if entry.prunable.is_some() || !exists {
         return Ok(WorktreeInfo {
-            path: entry.path,
+            path,
             head: entry.head,
             branch: entry.branch,
             detached: entry.detached,
@@ -2162,21 +2199,21 @@ fn inspect_worktree(
         });
     }
 
-    let status = dirty_status(&entry.path)?;
-    let upstream = git_output_allow_failure(&entry.path, ["rev-parse", "--abbrev-ref", "@{u}"])
+    let status = dirty_status(&path)?;
+    let upstream = git_output_allow_failure(&path, ["rev-parse", "--abbrev-ref", "@{u}"])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let (behind, ahead) = upstream
         .as_deref()
-        .and_then(|upstream| ahead_behind(&entry.path, upstream).ok())
+        .and_then(|upstream| ahead_behind(&path, upstream).ok())
         .unwrap_or((None, None));
-    let last_commit_unix = git_output(&entry.path, ["log", "-1", "--format=%ct"])
+    let last_commit_unix = git_output(&path, ["log", "-1", "--format=%ct"])
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok());
     let activity_unix = max_time(last_commit_unix, status.newest_dirty_mtime_unix);
 
     Ok(WorktreeInfo {
-        path: entry.path,
+        path,
         head: entry.head,
         branch: entry.branch,
         detached: entry.detached,
@@ -2506,7 +2543,7 @@ fn scan_generated_dirs_for_worktree(
             && protection.is_none()
             && candidate.action == GeneratedCandidateAction::Delete
             && !has_tracked_files;
-        let sweep_strategies = config.sweep_strategies(&candidate.name);
+        let sweep_strategies = config.sweep_strategies_for(&candidate.path, &candidate.name);
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
             && protection.is_none()
             && (routine_active || candidate.action == GeneratedCandidateAction::SweepOnly)
@@ -3331,10 +3368,14 @@ fn generated_candidates(
         for component in listed.components() {
             relative.push(component.as_os_str());
             let name = component.as_os_str().to_string_lossy();
-            let Some(action) = config.candidate_action(&name) else {
+            let path = worktree.path.join(&relative);
+            let Some(action) = config.candidate_action(&path, &name) else {
+                if config.recognizes_name(&name) {
+                    matched = true;
+                    break;
+                }
                 continue;
             };
-            let path = worktree.path.join(&relative);
             let is_real_dir = fs::symlink_metadata(&path)
                 .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
                 .unwrap_or(false);
@@ -3411,7 +3452,7 @@ fn discover_generated_descendants(
                 continue;
             }
             let child_relative = relative.join(entry.file_name());
-            if let Some(action) = config.candidate_action(&name) {
+            if let Some(action) = config.candidate_action(&entry.path(), &name) {
                 candidates
                     .entry(child_relative.clone())
                     .or_insert_with(|| GeneratedCandidate {
@@ -3420,7 +3461,7 @@ fn discover_generated_descendants(
                         name,
                         action,
                     });
-            } else {
+            } else if !config.recognizes_name(&name) {
                 stack.push((entry.path(), child_relative));
             }
         }
@@ -5026,6 +5067,111 @@ mod tests {
     }
 
     #[test]
+    fn exact_sweep_paths_exclude_other_matching_generated_trees() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let selected = repo.join("target");
+        let unrelated = repo.join("nested/target");
+        fs::create_dir_all(selected.join("debug"))?;
+        fs::create_dir_all(unrelated.join("debug"))?;
+        fs::write(selected.join("debug/selected"), "selected")?;
+        fs::write(unrelated.join("debug/unrelated"), "unrelated")?;
+
+        let context = repo_context(Some(&repo))?;
+        let worktree = inspect_worktrees(&context, now())?
+            .into_iter()
+            .find(|worktree| worktree.is_current)
+            .context("missing current worktree")?;
+        let selected = fs::canonicalize(selected)?;
+        let config = GeneratedDirConfig::from_names_with_default_sweeps(
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![SweepStrategy {
+                name: "target".to_string(),
+                tool: SweepTool::RustcIncremental,
+                limit: SweepLimit::AgeDays { days: 14 },
+            }],
+        )
+        .with_sweep_paths(vec![selected.clone()]);
+
+        let candidates = generated_candidates(&worktree, &config)?;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect::<Vec<_>>(),
+            vec![selected]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_sweep_paths_match_symlinked_worktree_aliases() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = init_repo()?;
+        let alias = temp.path().join("repo-alias");
+        symlink(&repo, &alias)?;
+        fs::create_dir_all(repo.join("target/debug"))?;
+        fs::write(repo.join("target/debug/selected"), "selected")?;
+
+        let canonical_repo = fs::canonicalize(&repo)?;
+        let worktree = inspect_worktree(
+            RawWorktree {
+                path: alias.clone(),
+                ..RawWorktree::default()
+            },
+            &canonical_repo,
+            now(),
+        )?;
+        assert_eq!(worktree.path, canonical_repo);
+
+        let selected_alias = alias.join("target");
+        let selected = fs::canonicalize(repo.join("target"))?;
+        let config = GeneratedDirConfig::from_names_with_default_sweeps(
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![SweepStrategy {
+                name: "target".to_string(),
+                tool: SweepTool::RustcIncremental,
+                limit: SweepLimit::AgeDays { days: 14 },
+            }],
+        )
+        .with_sweep_paths(vec![selected_alias]);
+
+        assert_eq!(config.sweep_paths, vec![selected.clone()]);
+        let candidates = generated_candidates(&worktree, &config)?;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect::<Vec<_>>(),
+            vec![selected]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_sweep_paths_do_not_narrow_whole_tree_deletion_policy() {
+        let selected = PathBuf::from("/repo/selected/target");
+        let unrelated = PathBuf::from("/repo/unrelated/target");
+        let config = GeneratedDirConfig::default().with_sweep_paths(vec![selected.clone()]);
+
+        assert_eq!(
+            config.candidate_action(&unrelated, "target"),
+            Some(GeneratedCandidateAction::Delete)
+        );
+        assert!(config.sweep_strategies_for(&selected, "target").len() >= 2);
+        assert!(config.sweep_strategies_for(&unrelated, "target").is_empty());
+    }
+
+    #[test]
     fn repository_discovery_stops_at_repo_boundaries_and_deduplicates_worktrees() -> Result<()> {
         let (temp, repo) = init_repo()?;
         let worktrees_dir = temp.path().join("repo.worktrees");
@@ -6436,6 +6582,7 @@ mod tests {
                 pressure: None,
                 generated_delete_names: Vec::new(),
                 generated_report_only_names: Vec::new(),
+                generated_sweep_paths: Vec::new(),
                 protections: Vec::new(),
                 metadata_prune_enabled: true,
                 prune_output: String::new(),
@@ -6558,6 +6705,7 @@ mod tests {
             }),
             generated_delete_names: Vec::new(),
             generated_report_only_names: Vec::new(),
+            generated_sweep_paths: Vec::new(),
             protections: Vec::new(),
             metadata_prune_enabled: true,
             prune_output: String::new(),

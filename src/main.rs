@@ -301,6 +301,14 @@ struct GeneratedArgs {
     sweep: Vec<SweepStrategy>,
 
     #[arg(
+        long = "sweep-path",
+        value_name = "ABSOLUTE_PATH",
+        value_parser = parse_absolute_sweep_path,
+        help = "Restrict in-place sweeps to an exact generated-directory path; repeat for multiple paths"
+    )]
+    sweep_paths: Vec<PathBuf>,
+
+    #[arg(
         long,
         help = "Disable built-in sweep strategies while keeping generated-directory defaults"
     )]
@@ -331,6 +339,23 @@ fn parse_generated_name(raw: &str) -> Result<String, String> {
         ));
     }
     Ok(normalized.to_string())
+}
+
+fn parse_absolute_sweep_path(raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if !path.is_absolute()
+        || raw
+            .split(['/', '\\'])
+            .any(|component| matches!(component, "." | ".."))
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(format!(
+            "invalid sweep path {raw:?}: path must be absolute and contain no '.' or '..' components"
+        ));
+    }
+    Ok(path)
 }
 
 fn parse_window_override(raw: &str) -> Result<(String, u64), String> {
@@ -406,6 +431,7 @@ impl GeneratedArgs {
             self.generated_window.clone(),
             self.sweep.clone(),
         )
+        .with_sweep_paths(self.sweep_paths.clone())
     }
 }
 
@@ -1463,6 +1489,23 @@ owner_free_generated = true
         assert!(parse_sweep_strategy("target=rustc-incremental:nope").is_err());
         assert!(parse_sweep_strategy("target=rustc-incremental:max-size=50GB").is_err());
         assert!(parse_sweep_strategy("target=cargo-sweep:max-size=nope").is_err());
+    }
+
+    #[test]
+    fn sweep_path_cli_requires_an_absolute_traversal_free_path() {
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "cleanup",
+            "--sweep-path",
+            "/tmp/repo/target",
+        ])
+        .is_ok());
+        for invalid in ["target", "/tmp/repo/../other/target", "/tmp/./repo/target"] {
+            assert!(
+                Cli::try_parse_from(["worktree-gc", "cleanup", "--sweep-path", invalid]).is_err(),
+                "accepted invalid exact sweep path {invalid:?}"
+            );
+        }
     }
 
     #[test]
