@@ -261,6 +261,34 @@ derived value does not upgrade liveness or cleanup eligibility.
 JSON output intentionally retains the owner-issued local URIs for local
 reconciliation and is not a support-safe export artifact.
 
+### Generated opportunity coverage
+
+`collect generated` is the report-only repository drill-down used after broad
+inventory identifies a large development root:
+
+```sh
+worktree-gc collect generated \
+  ~/Code ~/plugins ~/.codex/worktrees ~/Documents/Codex ~/Documents/sandboxd \
+  --max-discovery-entries 1000000 \
+  --max-entries 2000000
+```
+
+Repository discovery is hidden-file aware, recognizes linked-worktree `.git`
+files, stops at repository and generated-tree boundaries, and shares a bounded
+entry budget across the requested roots. Classification takes one complete
+ownership snapshot and reuses cleanup's Git, activity, tracked-content, and
+recursive-protection rules. APFS measurement then gives each generated root a
+fair slice of the global measurement budget instead of letting an early large
+tree hide later opportunities.
+
+The manifest reports discovery and measurement completeness per requested
+root, repositories and linked worktrees found, safe/active/protected/tracked/
+incomplete/report-only counts, and cumulative private reclaim by generated
+kind and rebuild-cost class. Overlapping requested roots retain independent,
+explicitly non-additive coverage totals. This command has no execution
+surface: deletion still requires a fresh cleanup manifest and the exact
+manifest/digest-bound executor.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but

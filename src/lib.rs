@@ -2,6 +2,7 @@ mod cargo_incremental;
 mod cargo_profiles;
 mod exact_generated;
 mod gateway_storage;
+mod generated;
 mod inventory;
 #[cfg(target_os = "macos")]
 mod macos_open_handles;
@@ -38,6 +39,13 @@ pub use gateway_storage::{
     gateway_storage_report, print_gateway_storage_report, GatewayStorageOptions,
     GatewayStorageReport, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES,
     DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT,
+};
+pub use generated::{
+    collect_generated, print_generated_collect, GeneratedArtifactMeasurement,
+    GeneratedArtifactObservation, GeneratedArtifactSummary, GeneratedCollectAction,
+    GeneratedCollectManifest, GeneratedCollectOptions, GeneratedCollectPlan,
+    GeneratedCollectPolicy, GeneratedCollectRun, GeneratedRebuildCost, GeneratedRebuildCostSummary,
+    GeneratedRootCoverage, DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
 };
 pub use inventory::{
     inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
@@ -588,6 +596,7 @@ struct GeneratedScanPolicy<'a> {
     generated_days: u64,
     generated_activity_only: bool,
     check_in_use: bool,
+    check_worktree_in_use: bool,
     open_handle_snapshot: Option<&'a OpenHandleSnapshot>,
     now: SystemTime,
     pressure: Option<&'a PressurePolicy>,
@@ -641,8 +650,19 @@ fn triage_with_protections(
     protections: &[ProtectionLease],
     open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<TriageReport> {
+    triage_with_protections_in_roots(repo, options, protections, open_handles, None, false)
+}
+
+fn triage_with_protections_in_roots(
+    repo: Option<&Path>,
+    options: TriageOptions,
+    protections: &[ProtectionLease],
+    open_handles: Option<&OpenHandleSnapshot>,
+    roots: Option<&[PathBuf]>,
+    check_worktree_in_use: bool,
+) -> Result<TriageReport> {
     let context = repo_context(repo)?;
-    let worktrees = inspect_worktrees(&context, options.now)?;
+    let worktrees = inspect_worktrees_in_roots(&context, roots, options.now)?;
     let worktree_decisions = plan_worktree_cleanup(
         &worktrees,
         options.stale_days,
@@ -658,6 +678,7 @@ fn triage_with_protections(
             generated_days: options.generated_days,
             generated_activity_only: options.generated_activity_only,
             check_in_use: options.check_in_use,
+            check_worktree_in_use,
             open_handle_snapshot: open_handles,
             now: options.now,
             pressure: None,
@@ -748,6 +769,7 @@ fn plan_cleanup_with_protections_in_roots(
             generated_days: options.generated_days,
             generated_activity_only: options.generated_activity_only,
             check_in_use: options.check_in_use,
+            check_worktree_in_use: false,
             open_handle_snapshot: open_handles,
             now: options.now,
             pressure: options.pressure.as_ref(),
@@ -1027,6 +1049,14 @@ fn measure_cleanup_runs_matching(
 pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTriageReport> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
+    triage_repositories(&roots, &repositories, options)
+}
+
+pub(crate) fn triage_repositories(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    options: TriageOptions,
+) -> Result<RootTriageReport> {
     let protections = active_protections(options.now)?;
     let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
     let repositories = repositories
@@ -1042,9 +1072,41 @@ pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTri
         .collect::<Result<Vec<_>>>()?;
 
     Ok(RootTriageReport {
-        roots,
+        roots: roots.to_vec(),
         repositories,
     })
+}
+
+pub(crate) fn triage_repositories_serial_with_errors(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    options: TriageOptions,
+) -> Result<(RootTriageReport, Vec<(PathBuf, String)>)> {
+    let protections = active_protections(options.now)?;
+    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
+    let mut reports = Vec::new();
+    let mut errors = Vec::new();
+    for repository in repositories {
+        match triage_with_protections_in_roots(
+            Some(repository),
+            options.clone(),
+            &protections,
+            open_handles.as_ref(),
+            Some(roots),
+            true,
+        ) {
+            Ok(report) => reports.push(report),
+            Err(error) => errors.push((repository.clone(), format!("{error:#}"))),
+        }
+    }
+
+    Ok((
+        RootTriageReport {
+            roots: roots.to_vec(),
+            repositories: reports,
+        },
+        errors,
+    ))
 }
 
 pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootCleanupRun> {
@@ -2036,6 +2098,7 @@ fn repo_context(repo: Option<&Path>) -> Result<RepoContext> {
     })
 }
 
+#[cfg(test)]
 fn inspect_worktrees(context: &RepoContext, now: SystemTime) -> Result<Vec<WorktreeInfo>> {
     inspect_worktrees_in_roots(context, None, now)
 }
@@ -2414,7 +2477,7 @@ fn scan_generated_dirs_for_worktree(
         let active = worktree_recent || dir_recent;
         let owner_free_pressure_candidate = owner_free_pressure_mode && routine_active;
         let owner_free_age_bypass = owner_free_pressure_candidate && active;
-        let worktree_in_use = if owner_free_pressure_candidate {
+        let worktree_in_use = if owner_free_pressure_candidate || policy.check_worktree_in_use {
             *worktree_in_use.get_or_insert_with(|| {
                 policy.check_in_use
                     && dirs_with_open_handles(
@@ -2434,7 +2497,8 @@ fn scan_generated_dirs_for_worktree(
             && !worktree_recent
             && !dir_recent
             && !has_tracked_files;
-        let in_use = candidate_in_use && (deletable_so_far || owner_free_pressure_candidate);
+        let in_use = candidate_in_use
+            && (deletable_so_far || owner_free_pressure_candidate || policy.check_worktree_in_use);
         let owner_free_pressure = owner_free_pressure_candidate
             && ownership_evidence_complete
             && !worktree_in_use
@@ -4646,6 +4710,115 @@ mod tests {
         Ok((temp, repo))
     }
 
+    #[test]
+    fn serial_repository_triage_preserves_good_reports_when_one_repository_fails() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let missing = repo
+            .parent()
+            .context("fixture repo has no parent")?
+            .join("missing");
+        let roots = vec![repo.clone(), missing.clone()];
+
+        let (report, errors) = triage_repositories_serial_with_errors(
+            &roots,
+            &[repo.clone(), missing.clone()],
+            TriageOptions {
+                stale_days: DEFAULT_STALE_DAYS,
+                generated_days: DEFAULT_GENERATED_DAYS,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+        )?;
+
+        assert_eq!(report.roots, roots);
+        assert_eq!(report.repositories.len(), 1);
+        assert_eq!(report.repositories[0].repo_root, repo.canonicalize()?);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, missing);
+        assert!(!errors[0].1.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_repository_triage_keeps_only_worktrees_under_requested_roots() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let linked = temp.path().join("requested/linked");
+        fs::create_dir_all(linked.parent().context("linked fixture has no parent")?)?;
+        add_worktree(&repo, &linked, "scoped-linked")?;
+        fs::create_dir_all(repo.join("target"))?;
+        fs::create_dir_all(linked.join("target"))?;
+        fs::write(repo.join("target/primary-artifact"), "fixture")?;
+        fs::write(linked.join("target/linked-artifact"), "fixture")?;
+        let canonical_linked = fs::canonicalize(&linked)?;
+        let roots = vec![canonical_linked.clone()];
+
+        let report = triage_with_protections_in_roots(
+            Some(&repo),
+            TriageOptions {
+                stale_days: DEFAULT_STALE_DAYS,
+                generated_days: DEFAULT_GENERATED_DAYS,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+            Some(&roots),
+            true,
+        )?;
+
+        assert_eq!(report.worktrees.len(), 1);
+        assert_eq!(report.worktrees[0].path, canonical_linked);
+        assert!(report
+            .generated_dirs
+            .iter()
+            .all(|generated| generated.worktree_path == canonical_linked));
+        assert!(report
+            .generated_dirs
+            .iter()
+            .any(|generated| generated.name == "target"));
+        Ok(())
+    }
+
+    #[test]
+    fn collector_ownership_probe_marks_generated_root_when_worktree_is_owned() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("target"))?;
+        fs::write(repo.join("target/artifact"), "fixture")?;
+        let context = repo_context(Some(&repo))?;
+        let worktrees = inspect_worktrees(&context, now())?;
+        let snapshot = OpenHandleSnapshot::Available(HashSet::from([context
+            .current_worktree
+            .join("README.md")]));
+
+        let generated = scan_generated_dirs(
+            &worktrees,
+            &GeneratedDirConfig::default(),
+            &[],
+            GeneratedScanPolicy {
+                generated_days: DEFAULT_GENERATED_DAYS,
+                generated_activity_only: true,
+                check_in_use: true,
+                check_worktree_in_use: true,
+                open_handle_snapshot: Some(&snapshot),
+                now: now(),
+                pressure: None,
+            },
+        )?;
+        let target = generated
+            .iter()
+            .find(|generated| generated.name == "target")
+            .context("missing target decision")?;
+
+        assert!(!target.in_use);
+        assert!(target.worktree_in_use);
+        assert!(target.ownership_evidence_complete);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn repo_context_canonicalizes_a_symlinked_git_common_dir() -> Result<()> {
@@ -6704,6 +6877,7 @@ mod tests {
                 generated_days: 0,
                 generated_activity_only: true,
                 check_in_use: false,
+                check_worktree_in_use: false,
                 open_handle_snapshot: None,
                 now: now(),
                 pressure: None,

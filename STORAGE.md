@@ -120,6 +120,32 @@ execution surface. Its versioned JSON report is independently readable so a
 later machine-wide survey can compose the completed correlation without
 copying Gateway schema knowledge or repeating the exact-path subpass.
 
+### Machine coverage ledger
+
+The generated-opportunity collector owns repository discovery and report-only
+classification for these requested roots:
+
+| Domain | Contract |
+| --- | --- |
+| `~/Code` | Repository-generated discovery and exact cleanup manifests |
+| `~/plugins` | Repository-generated discovery and exact cleanup manifests |
+| `~/.codex/worktrees` | Hidden linked-worktree discovery and exact cleanup manifests |
+| `~/Documents/Codex` | Nested repository discovery and exact cleanup manifests |
+| `~/Documents/sandboxd` | Repository-generated discovery and exact cleanup manifests |
+
+Each root records its own discovery errors, entry consumption, repositories,
+linked worktrees, generated classifications, and measurement completeness.
+The top-level artifact set is deduplicated. Per-root byte totals are retained
+for coverage diagnosis but are explicitly non-additive because requested roots
+can discover the same repository or linked worktree.
+
+These domains remain owner-report-only: `~/.cache/local-sandbox`,
+`~/.codex/sessions`, and VS Code/Gateway storage. Generic inventory may expose
+their physical size but cannot infer liveness, pin/export state, eligibility,
+or deletion authority. Parallels is explicitly excluded from this controller.
+Any other large inventory domain remains unclassified until a repository or
+owner adapter gives it a recovery contract.
+
 ## Source and rebuildable-state policy
 
 Worktree source and generated artifacts have different durability. Source can
@@ -186,17 +212,20 @@ revision.
    hard-link and clone-aware measurements, manifest identities, and live `df`
    verification establish physical evidence without granting deletion
    authority.
-2. **Landed: measured generated candidates and owner adapters.** Generated
-   roots can be ranked by private reclaim, while Gateway and other durable
-   domains preserve owner-issued liveness and remain report-only.
+2. **Landed: measured generated candidates, exact routine execution, and owner
+   adapters.** Generated roots can be ranked by private reclaim and executed
+   through one manifest-bound path, while Gateway and other durable domains
+   preserve owner-issued liveness and remain report-only.
 3. **Next: split source, artifact, runtime, and legacy protection scopes.** A
    source lease must be able to protect worktree context without indefinitely
    retaining rebuildable descendants. Existing recursive leases stay broad
    until explicitly migrated.
-4. **Next: owner-free coarse generated cleanup.** Make current ownership and
-   recoverability the eligibility boundary for complete generated-tree
-   deletion. Treat elapsed/workday age as cooldown and ranking evidence. Admit
-   project-local `node_modules` after lower rebuild-cost classes.
+4. **In delivery: owner-free coarse generated cleanup and machine coverage.**
+   Current ownership and recoverability are the eligibility boundary for
+   complete generated-tree deletion. The report-only coverage pass explains
+   each requested repository root before supervised pressure activation.
+   Elapsed/workday age remains cooldown and ranking evidence; project-local
+   `node_modules` follows lower rebuild-cost classes.
 5. **Next: active-target granular budgets.** Extend incremental pruning and
    coherent Cargo profile reset with a reviewed active-target size policy so
    current worktrees do not accrete indefinitely.
