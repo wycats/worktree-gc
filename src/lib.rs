@@ -2555,6 +2555,7 @@ fn scan_generated_dirs_for_worktree(
                 &worktree.path,
                 sweep_strategies,
                 policy.now,
+                policy.open_handle_snapshot,
             )?
         } else {
             Vec::new()
@@ -2738,6 +2739,7 @@ fn plan_sweep_decisions(
     worktree: &Path,
     mut strategies: Vec<&SweepStrategy>,
     now: SystemTime,
+    open_handle_snapshot: Option<&OpenHandleSnapshot>,
 ) -> Result<Vec<SweepDecision>> {
     strategies.sort_by_key(|strategy| strategy.tool.clone());
     strategies
@@ -2764,7 +2766,33 @@ fn plan_sweep_decisions(
                     .limit
                     .age_days()
                     .context("cargo-profile-reset requires an age-days limit")?;
-                let plan = plan_cargo_profile_sweep(target_dir, worktree, days, now)?;
+                let mut plan = plan_cargo_profile_sweep(target_dir, worktree, days, now)?;
+                let open_profiles = dirs_with_open_handles(
+                    plan.candidates
+                        .iter()
+                        .filter(|candidate| candidate.action == SweepCandidateAction::Delete)
+                        .map(|candidate| candidate.path.as_path()),
+                    open_handle_snapshot,
+                );
+                for candidate in &mut plan.candidates {
+                    if candidate.action == SweepCandidateAction::Delete
+                        && open_profiles.contains(&candidate.path)
+                    {
+                        candidate.action = SweepCandidateAction::Keep;
+                        candidate.reason =
+                            "Cargo profile has current or incomplete ownership evidence"
+                                .to_string();
+                    }
+                }
+                let delete_count = plan
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.action == SweepCandidateAction::Delete)
+                    .count();
+                plan.reason = format!(
+                    "inspected {} Cargo profiles; {delete_count} stale owner-free profiles",
+                    plan.candidates.len()
+                );
                 Ok(SweepDecision {
                     tool: SweepTool::CargoProfileReset,
                     limit: strategy.limit.clone(),
@@ -5380,6 +5408,46 @@ mod tests {
             .context("explicit sweep did not discover target")?;
         assert_eq!(target.action, GeneratedDirAction::Sweep);
         assert!(explicit_only.manifest.generated_delete_names.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn profile_sweep_planning_preserves_owned_cross_target_profiles() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let target = repo.join("target");
+        let profile = target.join("aarch64-unknown-linux-musl/debug");
+        fs::create_dir_all(profile.join("deps"))?;
+        let lock = profile.join(".cargo-lock");
+        let artifact = profile.join("deps/libfixture.rlib");
+        fs::write(&lock, "")?;
+        fs::write(&artifact, "old")?;
+        let old = unix_days_before_now(20);
+        set_mtime(&artifact, old)?;
+        set_mtime(profile.join("deps").as_path(), old)?;
+        set_mtime(&lock, old)?;
+        set_mtime(&profile, old)?;
+        let strategy = SweepStrategy {
+            name: "target".to_string(),
+            tool: SweepTool::CargoProfileReset,
+            limit: SweepLimit::AgeDays { days: 7 },
+        };
+        let snapshot = OpenHandleSnapshot::Available(HashSet::from([fs::canonicalize(&artifact)?]));
+
+        let sweeps = plan_sweep_decisions(&target, &repo, vec![&strategy], now(), Some(&snapshot))?;
+        let candidate = sweeps[0]
+            .profile_candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&profile).unwrap())
+            .context("missing cross-target profile")?;
+        assert_eq!(candidate.action, SweepCandidateAction::Keep);
+        assert!(candidate.reason.contains("ownership evidence"));
+        assert!(sweeps[0].reason.contains("0 stale owner-free profiles"));
         Ok(())
     }
 

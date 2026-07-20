@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use cargo_metadata::MetadataCommand;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,18 +11,21 @@ use time::OffsetDateTime;
 use walkdir::WalkDir;
 
 use crate::cargo_incremental::{with_cargo_profile_locks_timeout, TRASH_DIR_NAME};
-use crate::SweepCandidateAction;
+use crate::{open_handle_evidence_for_paths, SweepCandidateAction};
 
 // Cargo build-script outputs commonly live below build/<unit>/out, and
 // generated files can add another directory or two. Keep this bounded while
 // sampling deeply enough that rewriting an existing output is visible.
 const PROFILE_ACTIVITY_SAMPLE_DEPTH: usize = 6;
+type CargoProfileOwnershipProbe = dyn Fn(&[PathBuf]) -> (HashSet<PathBuf>, bool);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CargoProfileCandidateDecision {
     pub path: PathBuf,
     pub lock_path: PathBuf,
     pub cargo_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_target: Option<String>,
     pub last_activity_unix: Option<i64>,
     pub last_activity: Option<String>,
     pub activity_age_days: Option<u64>,
@@ -69,6 +73,7 @@ pub(crate) fn plan_cargo_profile_sweep(
                 path,
                 lock_path: trash_root.clone(),
                 cargo_profile: None,
+                cargo_target: None,
                 last_activity_unix,
                 last_activity: last_activity_unix.map(format_unix_time),
                 activity_age_days: last_activity_unix.and_then(|unix| age_days(now, unix)),
@@ -106,11 +111,11 @@ pub(crate) fn plan_cargo_profile_sweep(
             ));
             continue;
         }
-        if entry.depth() != 2 {
+        if entry.depth() != 2 && entry.depth() != 3 {
             candidates.push(skipped_candidate(
                 profile_dir,
                 lock_path,
-                "cross-target Cargo profiles are not yet mapped to a stable profile reset boundary",
+                "Cargo profile has an unsupported output layout",
             ));
             continue;
         }
@@ -133,9 +138,34 @@ pub(crate) fn plan_cargo_profile_sweep(
             continue;
         }
 
-        let output_name = profile_dir
-            .file_name()
-            .and_then(|name| name.to_str())
+        let relative = profile_dir
+            .strip_prefix(&context.build_dir)
+            .context("Cargo profile is outside the build directory")?;
+        let components = relative.components().collect::<Vec<_>>();
+        let cargo_target = match components.as_slice() {
+            [_profile] => None,
+            [target, _profile] => Some(
+                target
+                    .as_os_str()
+                    .to_str()
+                    .context("Cargo target directory has no UTF-8 name")?
+                    .to_string(),
+            ),
+            _ => {
+                candidates.push(skipped_candidate(
+                    profile_dir,
+                    lock_path,
+                    "Cargo profile has an unsupported output layout",
+                ));
+                continue;
+            }
+        };
+        if cargo_target.as_deref() == Some(TRASH_DIR_NAME) {
+            continue;
+        }
+        let output_name = components
+            .last()
+            .and_then(|component| component.as_os_str().to_str())
             .context("Cargo profile directory has no UTF-8 name")?;
         let cargo_profile = match output_name {
             "debug" => "dev",
@@ -170,6 +200,7 @@ pub(crate) fn plan_cargo_profile_sweep(
             path: profile_dir,
             lock_path,
             cargo_profile: Some(cargo_profile),
+            cargo_target,
             last_activity_unix,
             last_activity: last_activity_unix.map(format_unix_time),
             activity_age_days,
@@ -199,6 +230,26 @@ pub(crate) fn execute_cargo_profile_reset(
     days: u64,
     run_id: &str,
     timeout: Option<Duration>,
+) -> Result<()> {
+    execute_cargo_profile_reset_with_ownership(
+        target_dir,
+        worktree,
+        candidates,
+        days,
+        run_id,
+        timeout,
+        &open_handle_evidence_for_paths,
+    )
+}
+
+fn execute_cargo_profile_reset_with_ownership(
+    target_dir: &Path,
+    worktree: &Path,
+    candidates: &[CargoProfileCandidateDecision],
+    days: u64,
+    run_id: &str,
+    timeout: Option<Duration>,
+    ownership_probe: &CargoProfileOwnershipProbe,
 ) -> Result<()> {
     let target_dir = fs::canonicalize(target_dir)
         .with_context(|| format!("failed to resolve {}", target_dir.display()))?;
@@ -248,6 +299,22 @@ pub(crate) fn execute_cargo_profile_reset(
                     );
                     return Ok(None);
                 }
+                let (open_profiles, complete) =
+                    ownership_probe(std::slice::from_ref(&candidate.path));
+                if !complete {
+                    eprintln!(
+                        "  keeping Cargo profile with incomplete ownership evidence {}",
+                        candidate.path.display()
+                    );
+                    return Ok(None);
+                }
+                if open_profiles.contains(&candidate.path) {
+                    eprintln!(
+                        "  keeping Cargo profile owned by a running process {}",
+                        candidate.path.display()
+                    );
+                    return Ok(None);
+                }
                 let metadata = fs::symlink_metadata(&candidate.path)?;
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     bail!(
@@ -255,21 +322,28 @@ pub(crate) fn execute_cargo_profile_reset(
                         candidate.path.display()
                     );
                 }
-                if candidate.path.parent() != Some(target_dir.as_path()) {
-                    bail!(
-                        "Cargo profile is not a direct child of {}: {}",
-                        target_dir.display(),
-                        candidate.path.display()
-                    );
-                }
+                let relative = validated_profile_relative_path(
+                    &target_dir,
+                    &candidate.path,
+                    profile,
+                    candidate.cargo_target.as_deref(),
+                )?;
                 let run_trash = trash_root.join(run_id);
                 fs::create_dir_all(&run_trash)?;
-                let destination = run_trash.join(
-                    candidate
-                        .path
-                        .file_name()
-                        .context("Cargo profile has no directory name")?,
-                );
+                let run_trash = fs::canonicalize(&run_trash)?;
+                let destination = run_trash.join(relative);
+                let destination_parent = destination
+                    .parent()
+                    .context("profile quarantine has no parent")?;
+                fs::create_dir_all(destination_parent)?;
+                let destination_parent = fs::canonicalize(destination_parent)?;
+                if !destination_parent.starts_with(&run_trash) {
+                    bail!(
+                        "profile quarantine resolves outside {}: {}",
+                        run_trash.display(),
+                        destination.display()
+                    );
+                }
                 if destination.exists() {
                     bail!(
                         "profile quarantine already exists: {}",
@@ -309,13 +383,18 @@ fn remove_quarantine_entry(path: &Path) -> Result<()> {
 }
 
 fn remove_empty_ancestors(path: &Path, trash_root: &Path) -> Result<()> {
-    if let Some(run_trash) = path.parent() {
-        match fs::remove_dir(run_trash) {
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        if directory == trash_root {
+            break;
+        }
+        match fs::remove_dir(directory) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        current = directory.parent();
     }
     remove_empty_trash_root(trash_root)
 }
@@ -348,6 +427,38 @@ fn profile_is_stale(
             && refreshed.cargo_profile.as_deref() == Some(profile)
             && refreshed.action == SweepCandidateAction::Delete
     }))
+}
+
+fn validated_profile_relative_path(
+    target_dir: &Path,
+    candidate_path: &Path,
+    cargo_profile: &str,
+    cargo_target: Option<&str>,
+) -> Result<PathBuf> {
+    let output_name = match cargo_profile {
+        "dev" => "debug",
+        "release" => "release",
+        other => bail!("unsupported Cargo profile {other}"),
+    };
+    let expected = match cargo_target {
+        Some(target) => PathBuf::from(target).join(output_name),
+        None => PathBuf::from(output_name),
+    };
+    let relative = candidate_path.strip_prefix(target_dir).with_context(|| {
+        format!(
+            "Cargo profile is outside {}: {}",
+            target_dir.display(),
+            candidate_path.display()
+        )
+    })?;
+    if relative != expected {
+        bail!(
+            "Cargo profile identity changed: expected {}, found {}",
+            expected.display(),
+            relative.display()
+        );
+    }
+    Ok(expected)
 }
 
 struct BuildContext {
@@ -463,6 +574,7 @@ fn skipped_candidate(
         path,
         lock_path,
         cargo_profile: None,
+        cargo_target: None,
         last_activity_unix: None,
         last_activity: None,
         activity_age_days: None,
@@ -517,6 +629,7 @@ fn format_unix_time(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::fs::File;
     use std::thread;
     use tempfile::TempDir;
@@ -567,6 +680,25 @@ mod tests {
         Ok(())
     }
 
+    fn execute_profile_reset_for_test(
+        target_dir: &Path,
+        worktree: &Path,
+        candidates: &[CargoProfileCandidateDecision],
+        days: u64,
+        run_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        execute_cargo_profile_reset_with_ownership(
+            target_dir,
+            worktree,
+            candidates,
+            days,
+            run_id,
+            timeout,
+            &|_| (HashSet::new(), true),
+        )
+    }
+
     #[test]
     fn atomically_resets_a_stale_profile() -> Result<()> {
         let (_temp, repo, profile) = fixture()?;
@@ -574,7 +706,7 @@ mod tests {
         let target = repo.join("target");
         let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
 
-        execute_cargo_profile_reset(
+        execute_profile_reset_for_test(
             &target,
             &repo,
             &plan.candidates,
@@ -596,7 +728,7 @@ mod tests {
         let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
         fs::write(profile.join("deps/new.rlib"), "new artifact")?;
 
-        execute_cargo_profile_reset(
+        execute_profile_reset_for_test(
             &target,
             &repo,
             &plan.candidates,
@@ -607,6 +739,52 @@ mod tests {
 
         assert!(profile.is_dir());
         assert!(profile.join("deps/new.rlib").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_profiles_survive_execution_revalidation() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture(&profile)?;
+        let target = repo.join("target");
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let _open_artifact = File::open(profile.join("deps/libfixture-old.rlib"))?;
+
+        let owned_profile = fs::canonicalize(&profile)?;
+        execute_cargo_profile_reset_with_ownership(
+            &target,
+            &repo,
+            &plan.candidates,
+            7,
+            "test-run",
+            Some(Duration::from_secs(10)),
+            &move |_| (HashSet::from([owned_profile.clone()]), true),
+        )?;
+
+        assert!(profile.is_dir());
+        assert!(profile.join("deps/libfixture-old.rlib").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_ownership_evidence_preserves_profiles() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture(&profile)?;
+        let target = repo.join("target");
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+
+        execute_cargo_profile_reset_with_ownership(
+            &target,
+            &repo,
+            &plan.candidates,
+            7,
+            "test-run",
+            Some(Duration::from_secs(10)),
+            &|_| (HashSet::new(), false),
+        )?;
+
+        assert!(profile.is_dir());
+        assert!(profile.join("deps/libfixture-old.rlib").is_file());
         Ok(())
     }
 
@@ -666,7 +844,7 @@ mod tests {
             Ok(())
         });
 
-        execute_cargo_profile_reset(
+        execute_profile_reset_for_test(
             &target,
             &repo,
             &plan.candidates,
@@ -693,7 +871,7 @@ mod tests {
             .open(profile.join(".cargo-lock"))?;
         held.lock()?;
 
-        let error = execute_cargo_profile_reset(
+        let error = execute_profile_reset_for_test(
             &target,
             &repo,
             &plan.candidates,
@@ -721,7 +899,7 @@ mod tests {
             .iter()
             .any(|candidate| candidate.action == SweepCandidateAction::RecoverTrash));
 
-        execute_cargo_profile_reset(
+        execute_profile_reset_for_test(
             &target,
             &repo,
             &plan.candidates,
@@ -734,9 +912,100 @@ mod tests {
     }
 
     #[test]
-    fn custom_and_cross_target_profiles_are_reported_and_retained() -> Result<()> {
+    fn plans_and_atomically_resets_stale_cross_target_profiles() -> Result<()> {
+        let (_temp, repo, host_profile) = fixture()?;
+        let cross_profile = repo.join("target/aarch64-unknown-linux-musl/debug");
+        fs::create_dir_all(cross_profile.join("deps"))?;
+        fs::write(cross_profile.join(".cargo-lock"), "")?;
+        fs::write(cross_profile.join("deps/libfixture-old.rlib"), "old")?;
+        age_fixture(&cross_profile)?;
+
+        let target = repo.join("target");
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&cross_profile).unwrap())
+            .context("missing cross-target debug profile")?;
+        assert_eq!(candidate.cargo_profile.as_deref(), Some("dev"));
+        assert_eq!(
+            candidate.cargo_target.as_deref(),
+            Some("aarch64-unknown-linux-musl")
+        );
+        assert_eq!(candidate.action, SweepCandidateAction::Delete);
+
+        execute_profile_reset_for_test(
+            &target,
+            &repo,
+            &plan.candidates,
+            7,
+            "test-run",
+            Some(Duration::from_secs(10)),
+        )?;
+
+        assert!(!cross_profile.exists());
+        assert!(host_profile.exists());
+        assert!(!target.join(TRASH_DIR_NAME).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cross_target_profiles_have_distinct_quarantine_paths() -> Result<()> {
+        let (_temp, repo, host_profile) = fixture()?;
+        let target = repo.join("target");
+        let mut cross_profiles = Vec::new();
+        for target_name in ["aarch64-unknown-linux-musl", "x86_64-pc-windows-msvc"] {
+            let profile = target.join(target_name).join("debug");
+            fs::create_dir_all(profile.join("deps"))?;
+            fs::write(profile.join(".cargo-lock"), "")?;
+            fs::write(profile.join("deps/libfixture-old.rlib"), "old")?;
+            age_fixture(&profile)?;
+            cross_profiles.push(profile);
+        }
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+
+        execute_profile_reset_for_test(
+            &target,
+            &repo,
+            &plan.candidates,
+            7,
+            "test-run",
+            Some(Duration::from_secs(10)),
+        )?;
+
+        assert!(cross_profiles.iter().all(|profile| !profile.exists()));
+        assert!(host_profile.exists());
+        assert!(!target.join(TRASH_DIR_NAME).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recent_cross_target_profiles_are_retained() -> Result<()> {
+        let (_temp, repo, _host_profile) = fixture()?;
+        let profile = repo.join("target/aarch64-apple-darwin/release");
+        fs::create_dir_all(profile.join("deps"))?;
+        fs::write(profile.join(".cargo-lock"), "")?;
+        fs::write(profile.join("deps/libfixture.rlib"), "fresh")?;
+
+        let plan = plan_cargo_profile_sweep(&repo.join("target"), &repo, 7, SystemTime::now())?;
+        let candidate = plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&profile).unwrap())
+            .context("missing cross-target release profile")?;
+        assert_eq!(candidate.cargo_profile.as_deref(), Some("release"));
+        assert_eq!(
+            candidate.cargo_target.as_deref(),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(candidate.action, SweepCandidateAction::Keep);
+        Ok(())
+    }
+
+    #[test]
+    fn custom_profile_names_remain_fail_closed() -> Result<()> {
         let (_temp, repo, _profile) = fixture()?;
-        for relative in ["target/custom", "target/aarch64-apple-darwin/debug"] {
+        for relative in ["target/custom", "target/aarch64-apple-darwin/custom"] {
             let profile = repo.join(relative);
             fs::create_dir_all(&profile)?;
             fs::write(profile.join(".cargo-lock"), "")?;
@@ -751,10 +1020,7 @@ mod tests {
         assert_eq!(skipped.len(), 2);
         assert!(skipped
             .iter()
-            .any(|candidate| candidate.reason.contains("custom Cargo profile")));
-        assert!(skipped
-            .iter()
-            .any(|candidate| candidate.reason.contains("cross-target")));
+            .all(|candidate| candidate.reason.contains("custom Cargo profile")));
         Ok(())
     }
 }

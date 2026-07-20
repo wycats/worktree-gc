@@ -103,12 +103,12 @@ cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-u
 Active Rust `target` directories receive a built-in incremental-cache sweep
 during ordinary cleanup planning. They also receive an atomic profile-reset
 pass. Rustc incremental roots with no session activity for 14 days are
-selected for in-place pruning; host Cargo profiles such as `debug` and
-`release` that have been inactive for 7 days are reset as a unit while holding
-their Cargo profile locks. A whole `target` directory that has been inactive for
-3 days remains a wholesale deletion candidate. The dry run records every
-incremental root and Cargo profile, including its path, newest activity, age,
-and planned action.
+selected for in-place pruning; host and cross-target Cargo profiles such as
+`debug` and `release` that have been inactive for 7 days are reset as a unit
+while holding every Cargo profile lock. A whole `target` directory that has
+been inactive for 3 days remains a wholesale deletion candidate. The dry run
+records every incremental root and Cargo profile, including its path, Cargo
+target when present, newest activity, age, and planned action.
 
 Override the built-in incremental window with an explicit strategy:
 
@@ -140,14 +140,18 @@ Profile reset deliberately works at Cargo's profile boundary instead
 of interpreting private fingerprint JSON or reconstructing artifact hashes.
 This reclaims the profile's `deps`, `.fingerprint`, `build`, and incremental
 outputs together while preserving other profiles. Cross-target profiles are
-reported and retained until Cargo exposes enough stable invocation metadata to
-map their output directory back to the exact target specification.
+reset at the same Cargo-owned boundary when their layout is
+`target/<target-spec-name>/<debug|release>` and the profile contains Cargo's
+`.cargo-lock`. Custom profile names and deeper or otherwise unclassified
+layouts remain report-only.
 
 Before pruning, `worktree-gc` verifies the directory against `cargo metadata`
-and leaves shared or external build directories untouched. Execution waits for
-Cargo's profile lock, rechecks activity, atomically moves the stale profile into a
-tool-owned quarantine, releases the lock, and then deletes the quarantine. A
-later execution recovers quarantine left by an interrupted run.
+and leaves shared or external build directories untouched. Planning and
+execution require complete ownership evidence and retain profiles with an open
+file, mapped executable, or other live process path. Execution waits for Cargo's
+profile lock, rechecks activity and ownership, atomically moves the stale
+profile into a tool-owned quarantine, releases the lock, and then deletes the
+quarantine. A later execution recovers quarantine left by an interrupted run.
 
 The legacy `cargo-sweep` backend remains available as an additional explicit
 strategy for fingerprint-associated outputs. It can prune by age or keep an
