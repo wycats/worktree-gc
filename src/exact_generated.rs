@@ -376,6 +376,7 @@ fn execute_approved_generated_with_ownership(
             cleanup_class: decision.cleanup_class,
             result_path: &result_path,
             stage: "preflight",
+            ignored_pid: None,
         },
     )?;
 
@@ -412,6 +413,7 @@ fn execute_approved_generated_with_ownership(
                     cleanup_class: decision.cleanup_class,
                     result_path: &result_path,
                     stage: "cargo_profile_lock",
+                    ignored_pid: None,
                 },
             )?;
             with_cargo_profile_locks_timeout(candidate, &worktree, Some(lock_timeout), |_| {
@@ -432,6 +434,7 @@ fn execute_approved_generated_with_ownership(
                     approval_digest: &approval_digest,
                     cleanup_class: decision.cleanup_class,
                     result_path: &result_path,
+                    ignored_pid: Some(std::process::id()),
                 }
                 .execute()
             })?
@@ -453,6 +456,7 @@ fn execute_approved_generated_with_ownership(
                 approval_digest: &approval_digest,
                 cleanup_class: decision.cleanup_class,
                 result_path: &result_path,
+                ignored_pid: None,
             }
             .execute()
         }
@@ -956,6 +960,7 @@ struct OwnershipRefusalContext<'a> {
     cleanup_class: CleanupClass,
     result_path: &'a Path,
     stage: &'a str,
+    ignored_pid: Option<u32>,
 }
 
 fn validate_current_ownership(
@@ -963,7 +968,7 @@ fn validate_current_ownership(
     ownership_override: Option<&dyn Fn() -> (HashSet<PathBuf>, bool)>,
     context: OwnershipRefusalContext<'_>,
 ) -> Result<()> {
-    let ownership = match ownership_override {
+    let mut ownership = match ownership_override {
         Some(capture) => {
             let observed_at_unix = unix_seconds(SystemTime::now());
             let (owned_paths, complete) = capture();
@@ -988,6 +993,7 @@ fn validate_current_ownership(
         }
         None => process_ownership_evidence_for_paths(paths),
     };
+    ignore_executor_cargo_lock_ownership(&mut ownership, context.ignored_pid, context.candidate);
     if ownership.complete && ownership.observations.is_empty() {
         return Ok(());
     }
@@ -1024,6 +1030,24 @@ fn validate_current_ownership(
         "current process ownership exists for: {owners}; evidence written to {}",
         refusal_path.display()
     )
+}
+
+fn ignore_executor_cargo_lock_ownership(
+    ownership: &mut ProcessOwnershipEvidence,
+    ignored_pid: Option<u32>,
+    candidate: &Path,
+) {
+    if let Some(ignored_pid) = ignored_pid {
+        ownership.observations.retain(|observation| {
+            observation.pid != Some(ignored_pid)
+                || !matches!(
+                    observation.evidence_kind,
+                    ProcessOwnershipEvidenceKind::OpenFile | ProcessOwnershipEvidenceKind::LsofPath
+                )
+                || !observation.observed_path.starts_with(candidate)
+                || observation.observed_path.file_name() != Some(OsStr::new(".cargo-lock"))
+        });
+    }
 }
 
 fn write_ownership_refusal(
@@ -1092,6 +1116,7 @@ struct CandidateExecution<'a> {
     approval_digest: &'a str,
     cleanup_class: CleanupClass,
     result_path: &'a Path,
+    ignored_pid: Option<u32>,
 }
 
 impl CandidateExecution<'_> {
@@ -1144,6 +1169,7 @@ impl CandidateExecution<'_> {
                     cleanup_class: self.cleanup_class,
                     result_path: self.result_path,
                     stage: "pre_quarantine",
+                    ignored_pid: self.ignored_pid,
                 },
             )?;
         }
@@ -1897,6 +1923,67 @@ mod tests {
 
         assert!(!fixture.candidate.exists());
         Ok(())
+    }
+
+    #[test]
+    fn locked_target_recheck_ignores_only_executor_cargo_lock_handles() {
+        let executor_pid = std::process::id();
+        let foreign_pid = executor_pid.saturating_add(1);
+        let candidate = PathBuf::from("/tmp/fixture/target");
+        let lock = candidate.join("debug/.cargo-lock");
+        let artifact = candidate.join("debug/deps/foreign-owner");
+        let mut ownership = ProcessOwnershipEvidence {
+            observed_at_unix: 1,
+            backend: "fixture".to_string(),
+            complete: true,
+            error: None,
+            observations: vec![
+                ProcessOwnershipObservation {
+                    pid: Some(executor_pid),
+                    command: Some("worktree-gc".to_string()),
+                    evidence_kind: ProcessOwnershipEvidenceKind::OpenFile,
+                    observed_path: lock.clone(),
+                    matched_path: candidate.clone(),
+                },
+                ProcessOwnershipObservation {
+                    pid: Some(foreign_pid),
+                    command: Some("cargo".to_string()),
+                    evidence_kind: ProcessOwnershipEvidenceKind::OpenFile,
+                    observed_path: lock.clone(),
+                    matched_path: candidate.clone(),
+                },
+                ProcessOwnershipObservation {
+                    pid: Some(executor_pid),
+                    command: Some("worktree-gc".to_string()),
+                    evidence_kind: ProcessOwnershipEvidenceKind::MappedFile,
+                    observed_path: artifact,
+                    matched_path: candidate.clone(),
+                },
+                ProcessOwnershipObservation {
+                    pid: Some(executor_pid),
+                    command: Some("worktree-gc".to_string()),
+                    evidence_kind: ProcessOwnershipEvidenceKind::OpenFile,
+                    observed_path: PathBuf::from("/tmp/other/target/debug/.cargo-lock"),
+                    matched_path: candidate.clone(),
+                },
+            ],
+        };
+
+        ignore_executor_cargo_lock_ownership(&mut ownership, Some(executor_pid), &candidate);
+
+        assert_eq!(ownership.observations.len(), 3);
+        assert_eq!(ownership.observations[0].pid, Some(foreign_pid));
+        assert_eq!(ownership.observations[0].command.as_deref(), Some("cargo"));
+        assert_eq!(ownership.observations[1].pid, Some(executor_pid));
+        assert_eq!(
+            ownership.observations[1].evidence_kind,
+            ProcessOwnershipEvidenceKind::MappedFile
+        );
+        assert_eq!(ownership.observations[2].pid, Some(executor_pid));
+        assert_eq!(
+            ownership.observations[2].observed_path,
+            PathBuf::from("/tmp/other/target/debug/.cargo-lock")
+        );
     }
 
     #[test]
