@@ -278,50 +278,54 @@ fn execute_cargo_profile_reset_with_ownership(
         return Ok(());
     }
 
+    let mut stale = Vec::new();
+    for candidate in &planned {
+        let profile = candidate
+            .cargo_profile
+            .as_deref()
+            .context("Cargo profile candidate has no profile identity")?;
+        if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
+            eprintln!(
+                "  keeping Cargo profile refreshed before ownership verification {}",
+                candidate.path.display()
+            );
+            continue;
+        }
+        stale.push((*candidate, profile));
+    }
+    if stale.is_empty() {
+        return Ok(());
+    }
+
+    // Capture ownership before acquiring Cargo's profile locks. Those locks are
+    // files inside the candidate profiles, so probing while they are held would
+    // observe this process's own lock descriptors and retain every candidate.
+    // Staleness is revalidated under the locks immediately below.
+    let stale_paths = stale
+        .iter()
+        .map(|(candidate, _)| candidate.path.clone())
+        .collect::<Vec<_>>();
+    let (open_profiles, complete) = ownership_probe(&stale_paths);
+    if !complete {
+        for (candidate, _) in stale {
+            eprintln!(
+                "  keeping Cargo profile with incomplete ownership evidence {}",
+                candidate.path.display()
+            );
+        }
+        return Ok(());
+    }
+
     let quarantined = with_cargo_profile_locks_timeout(
         &target_dir,
         worktree,
         timeout,
         || -> Result<Vec<(PathBuf, PathBuf)>> {
-            let mut stale = Vec::new();
-            for candidate in &planned {
-                let profile = candidate
-                    .cargo_profile
-                    .as_deref()
-                    .context("Cargo profile candidate has no profile identity")?;
+            let mut eligible = Vec::new();
+            for (candidate, profile) in &stale {
                 if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
                     eprintln!(
                         "  keeping Cargo profile refreshed while waiting for its lock {}",
-                        candidate.path.display()
-                    );
-                    continue;
-                }
-                stale.push((*candidate, profile));
-            }
-            if stale.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            let stale_paths = stale
-                .iter()
-                .map(|(candidate, _)| candidate.path.clone())
-                .collect::<Vec<_>>();
-            let (open_profiles, complete) = ownership_probe(&stale_paths);
-            if !complete {
-                for (candidate, _) in stale {
-                    eprintln!(
-                        "  keeping Cargo profile with incomplete ownership evidence {}",
-                        candidate.path.display()
-                    );
-                }
-                return Ok(Vec::new());
-            }
-
-            let mut eligible = Vec::new();
-            for (candidate, profile) in stale {
-                if !profile_is_stale(&target_dir, worktree, &candidate.path, profile, days)? {
-                    eprintln!(
-                        "  keeping Cargo profile refreshed during ownership verification {}",
                         candidate.path.display()
                     );
                     continue;
@@ -333,7 +337,7 @@ fn execute_cargo_profile_reset_with_ownership(
                     );
                     continue;
                 }
-                eligible.push((candidate, profile));
+                eligible.push((*candidate, *profile));
             }
 
             let mut quarantined = Vec::new();
@@ -1010,6 +1014,30 @@ mod tests {
         assert!(cross_profiles.iter().all(|profile| !profile.exists()));
         assert!(host_profile.exists());
         assert!(!target.join(TRASH_DIR_NAME).exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_ownership_probe_runs_before_profile_locks() -> Result<()> {
+        let (_temp, repo, profile) = fixture()?;
+        age_fixture(&profile)?;
+        let target = repo.join("target");
+        let plan = plan_cargo_profile_sweep(&target, &repo, 7, SystemTime::now())?;
+
+        execute_cargo_profile_reset(
+            &target,
+            &repo,
+            &plan.candidates,
+            7,
+            "test-run",
+            Some(Duration::from_secs(10)),
+        )?;
+
+        assert!(
+            !profile.exists(),
+            "the reset process must not classify its own Cargo lock as profile ownership"
+        );
         Ok(())
     }
 

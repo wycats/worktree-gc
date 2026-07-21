@@ -2857,12 +2857,11 @@ fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
 // Every generated candidate is matched against the captured
 // paths in memory, avoiding repeated directory walks while observing ownership
 // at any depth beneath a candidate. Every execution pass takes fresh evidence
-// and rechecks each candidate before mutation. The remaining path-scoped
-// fallback is chunked below the OS argument limit. A failed batch retries one
-// directory at a time and keeps any individually unprobeable directory
-// protected. If the ownership backend is unavailable, an explicitly requested
-// check keeps every candidate rather than degrading to mtime-only deletion
-// authority.
+// and rechecks each candidate before mutation. If no shared snapshot is
+// supplied, callers capture one fresh recursive global snapshot rather than
+// falling back to a descendant-blind path-scoped probe. If the ownership
+// backend is unavailable, an explicitly requested check keeps every candidate
+// rather than degrading to mtime-only deletion authority.
 #[cfg(target_os = "macos")]
 pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
     match macos_open_handles::capture() {
@@ -2909,7 +2908,6 @@ fn capture_lsof_open_handle_snapshot() -> OpenHandleSnapshot {
         output.status.success(),
         output.status.code(),
         &output.stderr,
-        None,
     ) {
         eprintln!(
             "warning: global lsof snapshot failed ({error}); keeping all generated paths protected"
@@ -3131,7 +3129,6 @@ fn capture_lsof_process_ownership(
         output.status.success(),
         output.status.code(),
         &output.stderr,
-        None,
     ) {
         return ProcessOwnershipEvidence {
             observed_at_unix,
@@ -3197,21 +3194,32 @@ fn dirs_with_open_handles<'a>(
     paths: impl Iterator<Item = &'a Path>,
     snapshot: Option<&OpenHandleSnapshot>,
 ) -> HashSet<PathBuf> {
+    dirs_with_open_handles_using(paths, snapshot, capture_open_handle_snapshot)
+}
+
+#[cfg(unix)]
+fn dirs_with_open_handles_using<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    snapshot: Option<&OpenHandleSnapshot>,
+    capture: impl FnOnce() -> OpenHandleSnapshot,
+) -> HashSet<PathBuf> {
     let paths = paths.map(Path::to_path_buf).collect::<Vec<_>>();
     if paths.is_empty() {
         return HashSet::new();
     }
-    if let Some(snapshot) = snapshot {
-        return match snapshot {
-            OpenHandleSnapshot::Available(open_paths) => {
-                match_open_handle_paths(&paths, open_paths)
-            }
-            OpenHandleSnapshot::Unavailable => paths.into_iter().collect(),
-            OpenHandleSnapshot::Indeterminate => paths.into_iter().collect(),
-        };
+    let captured;
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            captured = capture();
+            &captured
+        }
+    };
+    match snapshot {
+        OpenHandleSnapshot::Available(open_paths) => match_open_handle_paths(&paths, open_paths),
+        OpenHandleSnapshot::Unavailable => paths.into_iter().collect(),
+        OpenHandleSnapshot::Indeterminate => paths.into_iter().collect(),
     }
-
-    dirs_with_open_handles_fresh(&paths)
 }
 
 #[cfg(unix)]
@@ -3229,100 +3237,15 @@ fn match_open_handle_paths(
 }
 
 #[cfg(unix)]
-fn dirs_with_open_handles_fresh(paths: &[PathBuf]) -> HashSet<PathBuf> {
-    const LSOF_PATH_CHUNK_SIZE: usize = 64;
-
-    let mut open = HashSet::new();
-    for chunk in paths.chunks(LSOF_PATH_CHUNK_SIZE) {
-        match probe_open_handles(chunk) {
-            Ok(found) => open.extend(found),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return paths.iter().cloned().collect();
-            }
-            Err(error) => {
-                eprintln!(
-                    "warning: batched lsof probe failed ({error}); retrying {} paths individually",
-                    chunk.len()
-                );
-                for path in chunk {
-                    match probe_open_handles(std::slice::from_ref(path)) {
-                        Ok(found) => open.extend(found),
-                        Err(individual_error)
-                            if individual_error.kind() == io::ErrorKind::NotFound =>
-                        {
-                            return paths.iter().cloned().collect();
-                        }
-                        Err(individual_error) => {
-                            eprintln!(
-                                "warning: lsof probe failed for {}; keeping it protected: {individual_error}",
-                                path.display()
-                            );
-                            open.insert(path.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    open
-}
-
-#[cfg(unix)]
-fn probe_open_handles(paths: &[PathBuf]) -> io::Result<HashSet<PathBuf>> {
-    let mut command = Command::new("lsof");
-    command.arg("-Fn");
-    for path in paths {
-        command.arg("+d").arg(path);
-    }
-    let output = command.stdin(Stdio::null()).output()?;
-
-    if let Some(error) = lsof_probe_error(
-        output.status.success(),
-        output.status.code(),
-        &output.stderr,
-        Some(paths),
-    ) {
-        return Err(error);
-    }
-
-    Ok(output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(b"n"))
-        .filter_map(|line| std::str::from_utf8(line).ok())
-        .filter_map(|open_path| {
-            let open_path = Path::new(open_path);
-            paths
-                .iter()
-                .find(|candidate| open_path.starts_with(candidate))
-                .cloned()
-        })
-        .collect())
-}
-
-#[cfg(unix)]
-fn lsof_probe_error(
-    success: bool,
-    status_code: Option<i32>,
-    stderr: &[u8],
-    scoped_paths: Option<&[PathBuf]>,
-) -> Option<io::Error> {
+fn lsof_probe_error(success: bool, status_code: Option<i32>, stderr: &[u8]) -> Option<io::Error> {
     let stderr = String::from_utf8_lossy(stderr);
-    if scoped_paths.is_none() && !stderr.trim().is_empty() {
+    if !stderr.trim().is_empty() {
         return Some(io::Error::other(format!(
             "global lsof snapshot reported incomplete output: {}",
             stderr.trim()
         )));
     }
     if success {
-        return None;
-    }
-
-    let failed_path = scoped_paths.into_iter().flatten().any(|path| {
-        let path = path.to_string_lossy();
-        !path.is_empty() && stderr.contains(path.as_ref())
-    });
-    if scoped_paths.is_some() && status_code == Some(1) && !failed_path {
         return None;
     }
 
@@ -4756,6 +4679,7 @@ fn system_time_to_unix(time: SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use tempfile::TempDir;
 
     fn now() -> SystemTime {
@@ -6049,6 +5973,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn missing_shared_snapshot_captures_recursive_descendant_evidence() {
+        let candidate = PathBuf::from("/tmp/worktree-gc-profile");
+        let descendant = candidate.join("deps/libactive.rlib");
+        let capture_calls = Cell::new(0);
+
+        let open = dirs_with_open_handles_using(std::iter::once(candidate.as_path()), None, || {
+            capture_calls.set(capture_calls.get() + 1);
+            OpenHandleSnapshot::Available(HashSet::from([descendant]))
+        });
+
+        assert_eq!(capture_calls.get(), 1);
+        assert_eq!(open, HashSet::from([candidate]));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn indeterminate_open_handle_snapshot_protects_every_candidate() {
         let candidates = [
             PathBuf::from("/tmp/worktree-gc-first"),
@@ -6193,83 +6133,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn open_handle_probe_chunks_large_candidate_sets() -> Result<()> {
-        if Command::new("lsof")
-            .arg("-v")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
-            eprintln!("skipping: lsof unavailable");
-            return Ok(());
-        }
-
-        let temp = TempDir::new()?;
-        let mut paths = Vec::new();
-        for index in 0..129 {
-            let path = temp.path().join(format!("candidate-{index}"));
-            fs::create_dir(&path)?;
-            paths.push(fs::canonicalize(path)?);
-        }
-        let held_path = paths.last().context("missing final candidate")?;
-        fs::write(held_path.join("held.lock"), "held")?;
-        let _held = fs::File::open(held_path.join("held.lock"))?;
-
-        let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path), None);
-        assert!(open.contains(held_path));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_lsof_probes_are_reported_as_errors() -> Result<()> {
-        if Command::new("lsof")
-            .arg("-v")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
-            eprintln!("skipping: lsof unavailable");
-            return Ok(());
-        }
-
-        let temp = TempDir::new()?;
-        let missing = temp.path().join("missing");
-        let error = probe_open_handles(&[missing]).expect_err("missing path should fail lsof");
-        assert!(error.to_string().contains("lsof exited"));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unrelated_lsof_warnings_do_not_fail_a_no_match_probe() {
-        let candidate = PathBuf::from("/tmp/worktree-gc-candidate");
-        assert!(lsof_probe_error(
-            false,
-            Some(1),
-            b"lsof: WARNING: can't stat() fuse mount /unrelated\n",
-            Some(std::slice::from_ref(&candidate)),
-        )
-        .is_none());
-        assert!(lsof_probe_error(
-            false,
-            Some(1),
-            b"lsof: WARNING: can't stat /tmp/worktree-gc-candidate\n",
-            Some(std::slice::from_ref(&candidate)),
-        )
-        .is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn global_lsof_status_one_is_incomplete_even_without_a_path_specific_error() {
         assert!(lsof_probe_error(
             false,
             Some(1),
-            b"lsof: WARNING: can't stat() fuse mount /unrelated\n",
-            None,
+            b"lsof: WARNING: can't stat() fuse mount /unrelated\n"
         )
         .is_some());
     }
@@ -6280,11 +6148,10 @@ mod tests {
         assert!(lsof_probe_error(
             true,
             Some(0),
-            b"lsof: WARNING: output information may be incomplete\n",
-            None,
+            b"lsof: WARNING: output information may be incomplete\n"
         )
         .is_some());
-        assert!(lsof_probe_error(true, Some(0), b"", None).is_none());
+        assert!(lsof_probe_error(true, Some(0), b"").is_none());
     }
 
     #[test]
