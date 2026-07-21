@@ -2390,6 +2390,34 @@ fn scan_generated_dirs(
     protections: &[ProtectionLease],
     policy: GeneratedScanPolicy<'_>,
 ) -> Result<Vec<GeneratedDirInfo>> {
+    scan_generated_dirs_with_snapshot_capture(
+        worktrees,
+        config,
+        protections,
+        policy,
+        capture_open_handle_snapshot,
+    )
+}
+
+fn scan_generated_dirs_with_snapshot_capture(
+    worktrees: &[WorktreeInfo],
+    config: &GeneratedDirConfig,
+    protections: &[ProtectionLease],
+    policy: GeneratedScanPolicy<'_>,
+    capture: impl FnOnce() -> OpenHandleSnapshot,
+) -> Result<Vec<GeneratedDirInfo>> {
+    let captured_profile_snapshot = (policy.open_handle_snapshot.is_none()
+        && config
+            .sweep_strategies
+            .iter()
+            .any(|strategy| strategy.tool == SweepTool::CargoProfileReset))
+    .then(capture);
+    let policy = GeneratedScanPolicy {
+        open_handle_snapshot: policy
+            .open_handle_snapshot
+            .or(captured_profile_snapshot.as_ref()),
+        ..policy
+    };
     let mut dirs: Vec<GeneratedDirInfo> = worktrees
         .par_iter()
         .map(|worktree| scan_generated_dirs_for_worktree(worktree, config, protections, policy))
@@ -4020,7 +4048,7 @@ fn remove_generated_directory(
             &decision.path,
             &decision.worktree_path,
             cargo_lock_timeout,
-            remove,
+            |_| remove(),
         )??;
     } else if decision.name == "target" && cargo_lock_timeout.is_some() {
         eprintln!(
@@ -4108,7 +4136,7 @@ fn run_sweeps(
                     &decision.path,
                     &decision.worktree_path,
                     cargo_lock_timeout,
-                    || {
+                    |_| {
                         let mut command = Command::new("cargo");
                         command.arg("sweep");
                         match sweep.limit {
@@ -5372,6 +5400,62 @@ mod tests {
         assert_eq!(candidate.action, SweepCandidateAction::Keep);
         assert!(candidate.reason.contains("ownership evidence"));
         assert!(sweeps[0].reason.contains("0 stale owner-free profiles"));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_sweep_planning_shares_one_ownership_snapshot_across_worktrees() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        git_output(&repo, ["add", "."])?;
+        commit_with_date(&repo, "add Cargo fixture", "2025-01-02T00:00:00Z")?;
+        let linked = repo.with_file_name("linked-profile-fixture");
+        add_worktree(&repo, &linked, "linked-profile-fixture")?;
+        for worktree in [&repo, &linked] {
+            let profile = worktree.join("target/debug");
+            fs::create_dir_all(profile.join("deps"))?;
+            fs::write(profile.join(".cargo-lock"), "")?;
+            let artifact = profile.join("deps/libfixture.rlib");
+            fs::write(&artifact, "active")?;
+            set_mtime(&artifact, 1_800_000_000)?;
+        }
+        let context = repo_context(Some(&repo))?;
+        let worktrees = inspect_worktrees(&context, now())?;
+        let capture_calls = Cell::new(0);
+
+        let generated = scan_generated_dirs_with_snapshot_capture(
+            &worktrees,
+            &GeneratedDirConfig::default(),
+            &[],
+            GeneratedScanPolicy {
+                generated_days: DEFAULT_GENERATED_DAYS,
+                generated_activity_only: true,
+                check_in_use: false,
+                check_worktree_in_use: false,
+                open_handle_snapshot: None,
+                now: now(),
+                pressure: None,
+            },
+            || {
+                capture_calls.set(capture_calls.get() + 1);
+                OpenHandleSnapshot::Available(HashSet::new())
+            },
+        )?;
+
+        assert_eq!(capture_calls.get(), 1);
+        assert_eq!(
+            generated
+                .iter()
+                .flat_map(|decision| &decision.sweeps)
+                .filter(|sweep| sweep.tool == SweepTool::CargoProfileReset)
+                .count(),
+            2
+        );
         Ok(())
     }
 
