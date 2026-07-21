@@ -182,14 +182,17 @@ superseded generations are pruned in place.
 For Cargo targets, the initial strategies are:
 
 - remove stale rustc incremental sessions;
-- reset inactive host profiles as coherent units;
+- reset inactive host and cross-target profiles as coherent units;
+- retain profiles with live or incomplete process-ownership evidence;
 - prune fingerprint-associated outputs through a verified owner operation;
 - enforce an optional size budget while preserving locked or recently active
   profiles;
-- retain shared, external, cross-target, or otherwise unclassified layouts.
+- retain shared, external, custom-profile, or otherwise unclassified layouts.
 
 Other domains need equally explicit owner contracts. Granular pruning must not
 be approximated by deleting arbitrary old files from private layouts.
+Cargo profile reset therefore retains this candidate-scoped ownership check
+even when broad generated-directory ownership checking is disabled.
 
 ### Tier 2: coarse cleanup of owner-free generated trees
 
@@ -375,8 +378,9 @@ already conservative and is not the first place to spend implementation risk.
 - Measure the residual composition of active Cargo targets.
 - Apply incremental pruning and coherent profile reset routinely.
 - Add a reviewed size-budget strategy for active targets.
-- Keep shared and cross-target layouts fail-closed until their current working
-  set can be identified safely.
+- Reset inactive host and cross-target Cargo profiles at their lock-coordinated
+  profile boundaries. Keep shared, custom-profile, and otherwise unclassified
+  layouts fail-closed until their current working set can be identified safely.
 
 ### Phase 4: supervised controller activation
 

@@ -414,7 +414,7 @@ fn execute_approved_generated_with_ownership(
                     stage: "cargo_profile_lock",
                 },
             )?;
-            with_cargo_profile_locks_timeout(candidate, &worktree, Some(lock_timeout), || {
+            with_cargo_profile_locks_timeout(candidate, &worktree, Some(lock_timeout), |_| {
                 CandidateExecution {
                     candidate,
                     quarantine: &quarantine,

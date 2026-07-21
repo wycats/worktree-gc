@@ -2390,6 +2390,34 @@ fn scan_generated_dirs(
     protections: &[ProtectionLease],
     policy: GeneratedScanPolicy<'_>,
 ) -> Result<Vec<GeneratedDirInfo>> {
+    scan_generated_dirs_with_snapshot_capture(
+        worktrees,
+        config,
+        protections,
+        policy,
+        capture_open_handle_snapshot,
+    )
+}
+
+fn scan_generated_dirs_with_snapshot_capture(
+    worktrees: &[WorktreeInfo],
+    config: &GeneratedDirConfig,
+    protections: &[ProtectionLease],
+    policy: GeneratedScanPolicy<'_>,
+    capture: impl FnOnce() -> OpenHandleSnapshot,
+) -> Result<Vec<GeneratedDirInfo>> {
+    let captured_profile_snapshot = (policy.open_handle_snapshot.is_none()
+        && config
+            .sweep_strategies
+            .iter()
+            .any(|strategy| strategy.tool == SweepTool::CargoProfileReset))
+    .then(capture);
+    let policy = GeneratedScanPolicy {
+        open_handle_snapshot: policy
+            .open_handle_snapshot
+            .or(captured_profile_snapshot.as_ref()),
+        ..policy
+    };
     let mut dirs: Vec<GeneratedDirInfo> = worktrees
         .par_iter()
         .map(|worktree| scan_generated_dirs_for_worktree(worktree, config, protections, policy))
@@ -2555,6 +2583,7 @@ fn scan_generated_dirs_for_worktree(
                 &worktree.path,
                 sweep_strategies,
                 policy.now,
+                policy.open_handle_snapshot,
             )?
         } else {
             Vec::new()
@@ -2738,6 +2767,7 @@ fn plan_sweep_decisions(
     worktree: &Path,
     mut strategies: Vec<&SweepStrategy>,
     now: SystemTime,
+    open_handle_snapshot: Option<&OpenHandleSnapshot>,
 ) -> Result<Vec<SweepDecision>> {
     strategies.sort_by_key(|strategy| strategy.tool.clone());
     strategies
@@ -2764,7 +2794,33 @@ fn plan_sweep_decisions(
                     .limit
                     .age_days()
                     .context("cargo-profile-reset requires an age-days limit")?;
-                let plan = plan_cargo_profile_sweep(target_dir, worktree, days, now)?;
+                let mut plan = plan_cargo_profile_sweep(target_dir, worktree, days, now)?;
+                let open_profiles = dirs_with_open_handles(
+                    plan.candidates
+                        .iter()
+                        .filter(|candidate| candidate.action == SweepCandidateAction::Delete)
+                        .map(|candidate| candidate.path.as_path()),
+                    open_handle_snapshot,
+                );
+                for candidate in &mut plan.candidates {
+                    if candidate.action == SweepCandidateAction::Delete
+                        && open_profiles.contains(&candidate.path)
+                    {
+                        candidate.action = SweepCandidateAction::Keep;
+                        candidate.reason =
+                            "Cargo profile has current or incomplete ownership evidence"
+                                .to_string();
+                    }
+                }
+                let delete_count = plan
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.action == SweepCandidateAction::Delete)
+                    .count();
+                plan.reason = format!(
+                    "inspected {} Cargo profiles; {delete_count} stale owner-free profiles",
+                    plan.candidates.len()
+                );
                 Ok(SweepDecision {
                     tool: SweepTool::CargoProfileReset,
                     limit: strategy.limit.clone(),
@@ -2829,12 +2885,11 @@ fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
 // Every generated candidate is matched against the captured
 // paths in memory, avoiding repeated directory walks while observing ownership
 // at any depth beneath a candidate. Every execution pass takes fresh evidence
-// and rechecks each candidate before mutation. The remaining path-scoped
-// fallback is chunked below the OS argument limit. A failed batch retries one
-// directory at a time and keeps any individually unprobeable directory
-// protected. If the ownership backend is unavailable, an explicitly requested
-// check keeps every candidate rather than degrading to mtime-only deletion
-// authority.
+// and rechecks each candidate before mutation. If no shared snapshot is
+// supplied, callers capture one fresh recursive global snapshot rather than
+// falling back to a descendant-blind path-scoped probe. If the ownership
+// backend is unavailable, an explicitly requested check keeps every candidate
+// rather than degrading to mtime-only deletion authority.
 #[cfg(target_os = "macos")]
 pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
     match macos_open_handles::capture() {
@@ -2881,7 +2936,6 @@ fn capture_lsof_open_handle_snapshot() -> OpenHandleSnapshot {
         output.status.success(),
         output.status.code(),
         &output.stderr,
-        None,
     ) {
         eprintln!(
             "warning: global lsof snapshot failed ({error}); keeping all generated paths protected"
@@ -3103,7 +3157,6 @@ fn capture_lsof_process_ownership(
         output.status.success(),
         output.status.code(),
         &output.stderr,
-        None,
     ) {
         return ProcessOwnershipEvidence {
             observed_at_unix,
@@ -3169,21 +3222,32 @@ fn dirs_with_open_handles<'a>(
     paths: impl Iterator<Item = &'a Path>,
     snapshot: Option<&OpenHandleSnapshot>,
 ) -> HashSet<PathBuf> {
+    dirs_with_open_handles_using(paths, snapshot, capture_open_handle_snapshot)
+}
+
+#[cfg(unix)]
+fn dirs_with_open_handles_using<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    snapshot: Option<&OpenHandleSnapshot>,
+    capture: impl FnOnce() -> OpenHandleSnapshot,
+) -> HashSet<PathBuf> {
     let paths = paths.map(Path::to_path_buf).collect::<Vec<_>>();
     if paths.is_empty() {
         return HashSet::new();
     }
-    if let Some(snapshot) = snapshot {
-        return match snapshot {
-            OpenHandleSnapshot::Available(open_paths) => {
-                match_open_handle_paths(&paths, open_paths)
-            }
-            OpenHandleSnapshot::Unavailable => paths.into_iter().collect(),
-            OpenHandleSnapshot::Indeterminate => paths.into_iter().collect(),
-        };
+    let captured;
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            captured = capture();
+            &captured
+        }
+    };
+    match snapshot {
+        OpenHandleSnapshot::Available(open_paths) => match_open_handle_paths(&paths, open_paths),
+        OpenHandleSnapshot::Unavailable => paths.into_iter().collect(),
+        OpenHandleSnapshot::Indeterminate => paths.into_iter().collect(),
     }
-
-    dirs_with_open_handles_fresh(&paths)
 }
 
 #[cfg(unix)]
@@ -3201,100 +3265,15 @@ fn match_open_handle_paths(
 }
 
 #[cfg(unix)]
-fn dirs_with_open_handles_fresh(paths: &[PathBuf]) -> HashSet<PathBuf> {
-    const LSOF_PATH_CHUNK_SIZE: usize = 64;
-
-    let mut open = HashSet::new();
-    for chunk in paths.chunks(LSOF_PATH_CHUNK_SIZE) {
-        match probe_open_handles(chunk) {
-            Ok(found) => open.extend(found),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return paths.iter().cloned().collect();
-            }
-            Err(error) => {
-                eprintln!(
-                    "warning: batched lsof probe failed ({error}); retrying {} paths individually",
-                    chunk.len()
-                );
-                for path in chunk {
-                    match probe_open_handles(std::slice::from_ref(path)) {
-                        Ok(found) => open.extend(found),
-                        Err(individual_error)
-                            if individual_error.kind() == io::ErrorKind::NotFound =>
-                        {
-                            return paths.iter().cloned().collect();
-                        }
-                        Err(individual_error) => {
-                            eprintln!(
-                                "warning: lsof probe failed for {}; keeping it protected: {individual_error}",
-                                path.display()
-                            );
-                            open.insert(path.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    open
-}
-
-#[cfg(unix)]
-fn probe_open_handles(paths: &[PathBuf]) -> io::Result<HashSet<PathBuf>> {
-    let mut command = Command::new("lsof");
-    command.arg("-Fn");
-    for path in paths {
-        command.arg("+d").arg(path);
-    }
-    let output = command.stdin(Stdio::null()).output()?;
-
-    if let Some(error) = lsof_probe_error(
-        output.status.success(),
-        output.status.code(),
-        &output.stderr,
-        Some(paths),
-    ) {
-        return Err(error);
-    }
-
-    Ok(output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(b"n"))
-        .filter_map(|line| std::str::from_utf8(line).ok())
-        .filter_map(|open_path| {
-            let open_path = Path::new(open_path);
-            paths
-                .iter()
-                .find(|candidate| open_path.starts_with(candidate))
-                .cloned()
-        })
-        .collect())
-}
-
-#[cfg(unix)]
-fn lsof_probe_error(
-    success: bool,
-    status_code: Option<i32>,
-    stderr: &[u8],
-    scoped_paths: Option<&[PathBuf]>,
-) -> Option<io::Error> {
+fn lsof_probe_error(success: bool, status_code: Option<i32>, stderr: &[u8]) -> Option<io::Error> {
     let stderr = String::from_utf8_lossy(stderr);
-    if scoped_paths.is_none() && !stderr.trim().is_empty() {
+    if !stderr.trim().is_empty() {
         return Some(io::Error::other(format!(
             "global lsof snapshot reported incomplete output: {}",
             stderr.trim()
         )));
     }
     if success {
-        return None;
-    }
-
-    let failed_path = scoped_paths.into_iter().flatten().any(|path| {
-        let path = path.to_string_lossy();
-        !path.is_empty() && stderr.contains(path.as_ref())
-    });
-    if scoped_paths.is_some() && status_code == Some(1) && !failed_path {
         return None;
     }
 
@@ -4069,7 +4048,7 @@ fn remove_generated_directory(
             &decision.path,
             &decision.worktree_path,
             cargo_lock_timeout,
-            remove,
+            |_| remove(),
         )??;
     } else if decision.name == "target" && cargo_lock_timeout.is_some() {
         eprintln!(
@@ -4157,7 +4136,7 @@ fn run_sweeps(
                     &decision.path,
                     &decision.worktree_path,
                     cargo_lock_timeout,
-                    || {
+                    |_| {
                         let mut command = Command::new("cargo");
                         command.arg("sweep");
                         match sweep.limit {
@@ -4728,6 +4707,7 @@ fn system_time_to_unix(time: SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use tempfile::TempDir;
 
     fn now() -> SystemTime {
@@ -5384,6 +5364,102 @@ mod tests {
     }
 
     #[test]
+    fn profile_sweep_planning_preserves_owned_cross_target_profiles() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        let target = repo.join("target");
+        let profile = target.join("aarch64-unknown-linux-musl/debug");
+        fs::create_dir_all(profile.join("deps"))?;
+        let lock = profile.join(".cargo-lock");
+        let artifact = profile.join("deps/libfixture.rlib");
+        fs::write(&lock, "")?;
+        fs::write(&artifact, "old")?;
+        let old = unix_days_before_now(20);
+        set_mtime(&artifact, old)?;
+        set_mtime(profile.join("deps").as_path(), old)?;
+        set_mtime(&lock, old)?;
+        set_mtime(&profile, old)?;
+        let strategy = SweepStrategy {
+            name: "target".to_string(),
+            tool: SweepTool::CargoProfileReset,
+            limit: SweepLimit::AgeDays { days: 7 },
+        };
+        let snapshot = OpenHandleSnapshot::Available(HashSet::from([fs::canonicalize(&artifact)?]));
+
+        let sweeps = plan_sweep_decisions(&target, &repo, vec![&strategy], now(), Some(&snapshot))?;
+        let candidate = sweeps[0]
+            .profile_candidates
+            .iter()
+            .find(|candidate| candidate.path == fs::canonicalize(&profile).unwrap())
+            .context("missing cross-target profile")?;
+        assert_eq!(candidate.action, SweepCandidateAction::Keep);
+        assert!(candidate.reason.contains("ownership evidence"));
+        assert!(sweeps[0].reason.contains("0 stale owner-free profiles"));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_sweep_planning_shares_one_ownership_snapshot_across_worktrees() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::create_dir_all(repo.join("src"))?;
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(repo.join("src/lib.rs"), "pub fn fixture() {}\n")?;
+        git_output(&repo, ["add", "."])?;
+        commit_with_date(&repo, "add Cargo fixture", "2025-01-02T00:00:00Z")?;
+        let linked = repo.with_file_name("linked-profile-fixture");
+        add_worktree(&repo, &linked, "linked-profile-fixture")?;
+        for worktree in [&repo, &linked] {
+            let profile = worktree.join("target/debug");
+            fs::create_dir_all(profile.join("deps"))?;
+            fs::write(profile.join(".cargo-lock"), "")?;
+            let artifact = profile.join("deps/libfixture.rlib");
+            fs::write(&artifact, "active")?;
+            set_mtime(&artifact, 1_800_000_000)?;
+        }
+        let context = repo_context(Some(&repo))?;
+        let worktrees = inspect_worktrees(&context, now())?;
+        let capture_calls = Cell::new(0);
+
+        let generated = scan_generated_dirs_with_snapshot_capture(
+            &worktrees,
+            &GeneratedDirConfig::default(),
+            &[],
+            GeneratedScanPolicy {
+                generated_days: DEFAULT_GENERATED_DAYS,
+                generated_activity_only: true,
+                check_in_use: false,
+                check_worktree_in_use: false,
+                open_handle_snapshot: None,
+                now: now(),
+                pressure: None,
+            },
+            || {
+                capture_calls.set(capture_calls.get() + 1);
+                OpenHandleSnapshot::Available(HashSet::new())
+            },
+        )?;
+
+        assert_eq!(capture_calls.get(), 1);
+        assert_eq!(
+            generated
+                .iter()
+                .flat_map(|decision| &decision.sweeps)
+                .filter(|sweep| sweep.tool == SweepTool::CargoProfileReset)
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
     fn deep_activity_in_generated_dir_prevents_deletion() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let worktree = repo.with_file_name("deep-activity");
@@ -5981,6 +6057,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn missing_shared_snapshot_captures_recursive_descendant_evidence() {
+        let candidate = PathBuf::from("/tmp/worktree-gc-profile");
+        let descendant = candidate.join("deps/libactive.rlib");
+        let capture_calls = Cell::new(0);
+
+        let open = dirs_with_open_handles_using(std::iter::once(candidate.as_path()), None, || {
+            capture_calls.set(capture_calls.get() + 1);
+            OpenHandleSnapshot::Available(HashSet::from([descendant]))
+        });
+
+        assert_eq!(capture_calls.get(), 1);
+        assert_eq!(open, HashSet::from([candidate]));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn indeterminate_open_handle_snapshot_protects_every_candidate() {
         let candidates = [
             PathBuf::from("/tmp/worktree-gc-first"),
@@ -6125,83 +6217,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn open_handle_probe_chunks_large_candidate_sets() -> Result<()> {
-        if Command::new("lsof")
-            .arg("-v")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
-            eprintln!("skipping: lsof unavailable");
-            return Ok(());
-        }
-
-        let temp = TempDir::new()?;
-        let mut paths = Vec::new();
-        for index in 0..129 {
-            let path = temp.path().join(format!("candidate-{index}"));
-            fs::create_dir(&path)?;
-            paths.push(fs::canonicalize(path)?);
-        }
-        let held_path = paths.last().context("missing final candidate")?;
-        fs::write(held_path.join("held.lock"), "held")?;
-        let _held = fs::File::open(held_path.join("held.lock"))?;
-
-        let open = dirs_with_open_handles(paths.iter().map(PathBuf::as_path), None);
-        assert!(open.contains(held_path));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_lsof_probes_are_reported_as_errors() -> Result<()> {
-        if Command::new("lsof")
-            .arg("-v")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
-            eprintln!("skipping: lsof unavailable");
-            return Ok(());
-        }
-
-        let temp = TempDir::new()?;
-        let missing = temp.path().join("missing");
-        let error = probe_open_handles(&[missing]).expect_err("missing path should fail lsof");
-        assert!(error.to_string().contains("lsof exited"));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unrelated_lsof_warnings_do_not_fail_a_no_match_probe() {
-        let candidate = PathBuf::from("/tmp/worktree-gc-candidate");
-        assert!(lsof_probe_error(
-            false,
-            Some(1),
-            b"lsof: WARNING: can't stat() fuse mount /unrelated\n",
-            Some(std::slice::from_ref(&candidate)),
-        )
-        .is_none());
-        assert!(lsof_probe_error(
-            false,
-            Some(1),
-            b"lsof: WARNING: can't stat /tmp/worktree-gc-candidate\n",
-            Some(std::slice::from_ref(&candidate)),
-        )
-        .is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn global_lsof_status_one_is_incomplete_even_without_a_path_specific_error() {
         assert!(lsof_probe_error(
             false,
             Some(1),
-            b"lsof: WARNING: can't stat() fuse mount /unrelated\n",
-            None,
+            b"lsof: WARNING: can't stat() fuse mount /unrelated\n"
         )
         .is_some());
     }
@@ -6212,11 +6232,10 @@ mod tests {
         assert!(lsof_probe_error(
             true,
             Some(0),
-            b"lsof: WARNING: output information may be incomplete\n",
-            None,
+            b"lsof: WARNING: output information may be incomplete\n"
         )
         .is_some());
-        assert!(lsof_probe_error(true, Some(0), b"", None).is_none());
+        assert!(lsof_probe_error(true, Some(0), b"").is_none());
     }
 
     #[test]

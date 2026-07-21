@@ -111,7 +111,7 @@ enum Command {
 
         #[arg(
             long,
-            help = "Skip generated dirs owned by running processes (native macOS snapshot with lsof fallback)"
+            help = "Skip wholesale generated dirs owned by running processes; granular Cargo profile resets always require complete ownership evidence"
         )]
         check_in_use: bool,
 
@@ -136,7 +136,7 @@ enum Command {
 
         #[arg(
             long,
-            help = "Skip generated dirs owned by running processes (native macOS snapshot with lsof fallback)"
+            help = "Skip wholesale generated dirs owned by running processes; granular Cargo profile resets always require complete ownership evidence"
         )]
         check_in_use: bool,
 

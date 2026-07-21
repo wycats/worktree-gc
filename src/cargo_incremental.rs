@@ -456,7 +456,7 @@ pub(crate) fn with_cargo_profile_locks_timeout<T>(
     target_dir: &Path,
     worktree: &Path,
     lock_timeout: Option<Duration>,
-    action: impl FnOnce() -> T,
+    action: impl FnOnce(&[PathBuf]) -> T,
 ) -> Result<T> {
     with_cargo_profile_locks_timeout_observed(target_dir, worktree, lock_timeout, |_| {}, action)
 }
@@ -466,7 +466,7 @@ fn with_cargo_profile_locks_timeout_observed<T>(
     worktree: &Path,
     lock_timeout: Option<Duration>,
     mut observed: impl FnMut(&[PathBuf]),
-    action: impl FnOnce() -> T,
+    action: impl FnOnce(&[PathBuf]) -> T,
 ) -> Result<T> {
     loop {
         let lock_paths = cargo_profile_lock_paths(target_dir, worktree)?;
@@ -478,7 +478,7 @@ fn with_cargo_profile_locks_timeout_observed<T>(
             drop(locks);
             continue;
         }
-        let result = action();
+        let result = action(&lock_paths);
         drop(locks);
         return Ok(result);
     }
@@ -1240,7 +1240,7 @@ mod tests {
                         sender.send(()).unwrap();
                     }
                 },
-                || action_tx.send(()).unwrap(),
+                |_| action_tx.send(()).unwrap(),
             )
         });
         observed_rx.recv_timeout(Duration::from_secs(5))?;
