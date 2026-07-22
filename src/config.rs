@@ -26,6 +26,20 @@ pub(crate) struct CleanupConfig {
     pub check_in_use: bool,
     pub cargo_lock_timeout_minutes: u64,
     pub cargo_sweep_max_size: Option<String>,
+    pub pull_requests: PullRequestConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct PullRequestConfig {
+    pub provider: Option<PullRequestProvider>,
+    pub merged_grace_days: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PullRequestProvider {
+    Github,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +89,16 @@ impl Default for CleanupConfig {
             check_in_use: true,
             cargo_lock_timeout_minutes: 30,
             cargo_sweep_max_size: None,
+            pull_requests: PullRequestConfig::default(),
+        }
+    }
+}
+
+impl Default for PullRequestConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            merged_grace_days: 1,
         }
     }
 }
@@ -189,6 +213,10 @@ generated_windows = { ".next" = 7, ".turbo" = 8, target = 9, node_modules = 10 }
 cargo_lock_timeout_minutes = 45
 cargo_sweep_max_size = "50GB"
 
+[cleanup.pull_requests]
+provider = "github"
+merged_grace_days = 1
+
 [pressure]
 enter_free_space = "100GiB"
 target_free_space = "150GiB"
@@ -220,6 +248,11 @@ retention_days = 120
         assert_eq!(config.cleanup.generated_windows["target"], 9);
         assert_eq!(config.cleanup.generated_windows["node_modules"], 10);
         assert_eq!(config.cleanup.cargo_lock_timeout_minutes, 45);
+        assert_eq!(
+            config.cleanup.pull_requests.provider,
+            Some(PullRequestProvider::Github)
+        );
+        assert_eq!(config.cleanup.pull_requests.merged_grace_days, 1);
         let pressure = config.pressure;
         assert_eq!(pressure.enter_free_space.as_deref(), Some("100GiB"));
         assert_eq!(pressure.target_free_space.as_deref(), Some("150GiB"));

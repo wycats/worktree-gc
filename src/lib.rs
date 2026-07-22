@@ -3,6 +3,7 @@ mod cargo_profiles;
 mod exact_generated;
 mod gateway_storage;
 mod generated;
+mod github_pr;
 mod inventory;
 #[cfg(target_os = "macos")]
 mod macos_open_handles;
@@ -46,6 +47,10 @@ pub use generated::{
     GeneratedCollectManifest, GeneratedCollectOptions, GeneratedCollectPlan,
     GeneratedCollectPolicy, GeneratedCollectRun, GeneratedRebuildCost, GeneratedRebuildCostSummary,
     GeneratedRootCoverage, DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
+};
+pub use github_pr::{
+    PullRequestEvidence, PullRequestLifecycle, PullRequestPolicy, PullRequestRecord,
+    PullRequestState,
 };
 pub use inventory::{
     inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
@@ -108,6 +113,7 @@ pub struct CleanupOptions {
     pub cargo_lock_timeout: Option<Duration>,
     pub defer_lock_timeouts: bool,
     pub pressure: Option<PressurePolicy>,
+    pub pull_requests: Option<PullRequestPolicy>,
     pub now: SystemTime,
 }
 
@@ -200,6 +206,7 @@ pub struct CleanupManifest {
     pub cargo_lock_timeout_secs: Option<u64>,
     pub defer_lock_timeouts: bool,
     pub pressure: Option<PressurePolicy>,
+    pub pull_requests: Option<PullRequestPolicy>,
     pub generated_delete_names: Vec<String>,
     pub generated_report_only_names: Vec<String>,
     pub generated_sweep_paths: Vec<PathBuf>,
@@ -275,12 +282,21 @@ pub struct WorktreeDecision {
     pub metadata_prunable: bool,
     pub action: WorktreeAction,
     pub cleanup_class: CleanupClass,
+    pub removal_trigger: Option<WorktreeRemovalTrigger>,
     pub reason: String,
     pub protection: Option<ProtectionMatch>,
     pub dirty_count: Option<usize>,
     pub status_sha256: Option<String>,
     pub last_commit: Option<String>,
     pub activity_age_days: Option<u64>,
+    pub pull_request: Option<PullRequestEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeRemovalTrigger {
+    Age,
+    MergedPullRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -796,6 +812,39 @@ fn plan_cleanup_with_protections_in_roots(
 ) -> Result<CleanupRun> {
     let context = repo_context(repo)?;
     let worktrees = inspect_worktrees_in_roots(&context, roots, options.now)?;
+    if options.pull_requests.is_some() {
+        anyhow::ensure!(
+            options.check_in_use,
+            "pull-request lifecycle cleanup requires check_in_use = true"
+        );
+        anyhow::ensure!(
+            options
+                .pull_requests
+                .as_ref()
+                .is_some_and(|policy| policy.merged_grace_days > 0),
+            "pull-request merged_grace_days must be at least 1"
+        );
+    }
+    let pull_request_evidence = options
+        .pull_requests
+        .as_ref()
+        .map(|_| {
+            github_pr::observe_pull_requests(&context.current_worktree, &worktrees, options.now)
+        })
+        .unwrap_or_default();
+    let pull_request_ownership_complete = options.pull_requests.is_none()
+        || matches!(open_handles, Some(OpenHandleSnapshot::Available(_)));
+    let pull_request_owned_worktrees = if options.pull_requests.is_some() {
+        dirs_with_open_handles(
+            worktrees
+                .iter()
+                .filter(|worktree| worktree.exists && worktree.prunable.is_none())
+                .map(|worktree| worktree.path.as_path()),
+            open_handles,
+        )
+    } else {
+        HashSet::new()
+    };
     let generated_dirs = scan_generated_dirs(
         &worktrees,
         &options.generated_config,
@@ -810,12 +859,16 @@ fn plan_cleanup_with_protections_in_roots(
             pressure: options.pressure.as_ref(),
         },
     )?;
-    let mut worktree_decisions = plan_worktree_cleanup(
+    let mut worktree_decisions = plan_worktree_cleanup_with_pull_requests(
         &worktrees,
         options.stale_days,
         options.now,
         protections,
         options.pressure.as_ref(),
+        options.pull_requests.as_ref(),
+        &pull_request_evidence,
+        pull_request_ownership_complete,
+        &pull_request_owned_worktrees,
     )?;
     if roots.is_some() {
         for decision in &mut worktree_decisions {
@@ -876,6 +929,7 @@ fn plan_cleanup_with_protections_in_roots(
         cargo_lock_timeout_secs: options.cargo_lock_timeout.map(|timeout| timeout.as_secs()),
         defer_lock_timeouts: options.defer_lock_timeouts,
         pressure: options.pressure,
+        pull_requests: options.pull_requests,
         generated_delete_names: options.generated_config.delete_names,
         generated_report_only_names: options.generated_config.report_only_names,
         generated_sweep_paths: options.generated_config.sweep_paths,
@@ -3513,6 +3567,31 @@ fn plan_worktree_cleanup(
     protections: &[ProtectionLease],
     pressure: Option<&PressurePolicy>,
 ) -> Result<Vec<WorktreeDecision>> {
+    plan_worktree_cleanup_with_pull_requests(
+        worktrees,
+        stale_days,
+        now,
+        protections,
+        pressure,
+        None,
+        &BTreeMap::new(),
+        true,
+        &HashSet::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_worktree_cleanup_with_pull_requests(
+    worktrees: &[WorktreeInfo],
+    stale_days: u64,
+    now: SystemTime,
+    protections: &[ProtectionLease],
+    pressure: Option<&PressurePolicy>,
+    pull_request_policy: Option<&PullRequestPolicy>,
+    pull_request_evidence: &BTreeMap<(String, String), PullRequestEvidence>,
+    ownership_evidence_complete: bool,
+    owned_worktrees: &HashSet<PathBuf>,
+) -> Result<Vec<WorktreeDecision>> {
     worktrees
         .iter()
         .map(|worktree| -> Result<WorktreeDecision> {
@@ -3530,7 +3609,11 @@ fn plan_worktree_cleanup(
             let age = worktree
                 .last_commit_unix
                 .and_then(|unix| age_days(now, unix));
-            let (action, reason) = if let Some(lease) = &protection {
+            let pull_request = pull_request_policy.and_then(|_| {
+                let key = (worktree.branch.clone()?, worktree.head.clone()?);
+                pull_request_evidence.get(&key).cloned()
+            });
+            let (action, reason, removal_trigger) = if let Some(lease) = &protection {
                 (
                     WorktreeAction::Keep,
                     format!(
@@ -3539,6 +3622,7 @@ fn plan_worktree_cleanup(
                         format_unix_seconds(lease.expires_at_unix),
                         lease.reason
                     ),
+                    None,
                 )
             } else if worktree.prunable.is_some() || !worktree.exists {
                 (
@@ -3547,34 +3631,119 @@ fn plan_worktree_cleanup(
                         .prunable
                         .clone()
                         .unwrap_or_else(|| "worktree path does not exist".to_string()),
+                    None,
                 )
             } else if worktree.is_current {
                 (
                     WorktreeAction::Keep,
                     "current worktree is never removed".to_string(),
+                    None,
                 )
             } else if worktree.dirty_count.unwrap_or_default() > 0 {
                 (
                     WorktreeAction::Keep,
                     "dirty worktree is reserved for a second pass".to_string(),
+                    None,
                 )
             } else if worktree.detached || worktree.branch.is_none() {
                 (
                     WorktreeAction::Keep,
                     "detached worktree is kept to preserve commit reachability".to_string(),
+                    None,
+                )
+            } else if pull_request_policy.is_some() && pull_request.is_none() {
+                (
+                    WorktreeAction::Keep,
+                    "GitHub pull-request evidence is missing for the exact worktree branch and head"
+                        .to_string(),
+                    None,
+                )
+            } else if pull_request
+                .as_ref()
+                .is_some_and(|evidence| !evidence.complete)
+            {
+                (
+                    WorktreeAction::Keep,
+                    format!(
+                        "GitHub pull-request evidence is incomplete: {}",
+                        pull_request
+                            .as_ref()
+                            .and_then(|evidence| evidence.error.as_deref())
+                            .unwrap_or("owner query did not complete")
+                    ),
+                    None,
+                )
+            } else if pull_request
+                .as_ref()
+                .is_some_and(|evidence| evidence.lifecycle == PullRequestLifecycle::Open)
+            {
+                (
+                    WorktreeAction::Keep,
+                    "exact worktree head has an open GitHub pull request".to_string(),
+                    None,
+                )
+            } else if let Some((record, merged_age_days)) = pull_request
+                .as_ref()
+                .filter(|evidence| evidence.lifecycle == PullRequestLifecycle::Merged)
+                .and_then(|evidence| most_recent_merged_pull_request(evidence, now))
+            {
+                let policy = pull_request_policy.expect("merged PR evidence requires policy");
+                if merged_age_days < policy.merged_grace_days {
+                    (
+                        WorktreeAction::Keep,
+                        format!(
+                            "GitHub PR #{} merged {} days ago; waiting for the {}-day grace period",
+                            record.number, merged_age_days, policy.merged_grace_days
+                        ),
+                        None,
+                    )
+                } else if !ownership_evidence_complete {
+                    (
+                        WorktreeAction::Keep,
+                        "merged-PR cleanup requires complete process ownership evidence"
+                            .to_string(),
+                        None,
+                    )
+                } else if owned_worktrees.contains(&worktree.path) {
+                    (
+                        WorktreeAction::Keep,
+                        "merged-PR worktree is currently owned by a running process".to_string(),
+                        None,
+                    )
+                } else {
+                    (
+                        WorktreeAction::Remove,
+                        format!(
+                            "exact head of GitHub PR #{} merged at least {} days ago ({})",
+                            record.number, policy.merged_grace_days, record.url
+                        ),
+                        Some(WorktreeRemovalTrigger::MergedPullRequest),
+                    )
+                }
+            } else if pull_request
+                .as_ref()
+                .is_some_and(|evidence| evidence.lifecycle == PullRequestLifecycle::Merged)
+            {
+                (
+                    WorktreeAction::Keep,
+                    "merged GitHub PR evidence has no valid non-future merge timestamp".to_string(),
+                    None,
                 )
             } else if age.is_some_and(|days| days >= effective_days) {
                 (
                     WorktreeAction::Remove,
                     format!("clean worktree last committed at least {effective_days} days ago"),
+                    Some(WorktreeRemovalTrigger::Age),
                 )
             } else {
                 (
                     WorktreeAction::Keep,
                     format!("not older than {effective_days} days"),
+                    None,
                 )
             };
             let cleanup_class = if action == WorktreeAction::Remove
+                && removal_trigger == Some(WorktreeRemovalTrigger::Age)
                 && pressure_applies
                 && effective_days < stale_days
                 && age.is_some_and(|days| days < stale_days)
@@ -3596,15 +3765,34 @@ fn plan_worktree_cleanup(
                 metadata_prunable: worktree.prunable.is_some() || !worktree.exists,
                 action,
                 cleanup_class,
+                removal_trigger,
                 reason,
                 protection,
                 dirty_count: worktree.dirty_count,
                 status_sha256: worktree.status_sha256.clone(),
                 last_commit: worktree.last_commit.clone(),
                 activity_age_days: worktree.activity_age_days,
+                pull_request,
             })
         })
         .collect()
+}
+
+fn most_recent_merged_pull_request(
+    evidence: &PullRequestEvidence,
+    now: SystemTime,
+) -> Option<(&PullRequestRecord, u64)> {
+    evidence
+        .pull_requests
+        .iter()
+        .filter(|record| record.state == PullRequestState::Merged)
+        .filter_map(|record| {
+            record
+                .merged_at_unix
+                .and_then(|merged_at| age_days(now, merged_at))
+                .map(|age| (record, age))
+        })
+        .min_by_key(|(_, age)| *age)
 }
 
 fn sort_generated_deletions(
@@ -3866,6 +4054,13 @@ fn execute_worktree_removals(
         {
             continue;
         }
+        if pull_request_revalidation_required(
+            manifest.pull_requests.as_ref(),
+            decision.removal_trigger,
+        ) && !revalidate_pull_request_removal(manifest, decision)?
+        {
+            continue;
+        }
         eprintln!(
             "[worktree {}/{}] removing {}",
             index + 1,
@@ -3892,6 +4087,145 @@ fn execute_worktree_removals(
     }
 
     Ok(())
+}
+
+fn pull_request_revalidation_required(
+    policy: Option<&PullRequestPolicy>,
+    trigger: Option<WorktreeRemovalTrigger>,
+) -> bool {
+    policy.is_some() && trigger.is_some()
+}
+
+fn revalidate_pull_request_removal(
+    manifest: &CleanupManifest,
+    decision: &WorktreeDecision,
+) -> Result<bool> {
+    let Some(policy) = manifest.pull_requests.as_ref() else {
+        eprintln!(
+            "  keeping {} because PR-policy removal has no manifest policy",
+            decision.path.display()
+        );
+        return Ok(false);
+    };
+    let Some(planned_evidence) = decision.pull_request.as_ref() else {
+        eprintln!(
+            "  keeping {} because PR-policy removal has no planned pull-request evidence",
+            decision.path.display()
+        );
+        return Ok(false);
+    };
+
+    let context = repo_context(Some(&manifest.current_worktree))?;
+    if context.git_common_dir != manifest.git_common_dir {
+        eprintln!(
+            "  keeping {} because the Git common-directory identity changed",
+            decision.path.display()
+        );
+        return Ok(false);
+    }
+    let now = SystemTime::now();
+    let live_worktree = inspect_worktrees_in_roots(&context, None, now)?
+        .into_iter()
+        .find(|worktree| worktree.path == decision.path);
+    let Some(live_worktree) = live_worktree else {
+        eprintln!(
+            "  keeping {} because its live worktree identity is absent",
+            decision.path.display()
+        );
+        return Ok(false);
+    };
+    if live_worktree.is_current
+        || live_worktree.detached
+        || live_worktree.head != decision.head
+        || live_worktree.branch != decision.branch
+        || live_worktree.dirty_count != decision.dirty_count
+        || live_worktree.status_sha256 != decision.status_sha256
+    {
+        eprintln!(
+            "  keeping {} because its head, branch, current-worktree, or source status changed",
+            decision.path.display()
+        );
+        return Ok(false);
+    }
+
+    let fresh = github_pr::observe_pull_requests(
+        &manifest.current_worktree,
+        std::slice::from_ref(&live_worktree),
+        now,
+    );
+    let fresh_evidence = live_worktree.branch.as_ref().and_then(|branch| {
+        live_worktree
+            .head
+            .as_ref()
+            .and_then(|head| fresh.get(&(branch.clone(), head.clone())))
+    });
+    let evidence_matches = fresh_evidence.is_some_and(|evidence| match decision.removal_trigger {
+        Some(WorktreeRemovalTrigger::MergedPullRequest) => {
+            merged_pull_request_evidence_matches(planned_evidence, evidence, policy, now)
+        }
+        Some(WorktreeRemovalTrigger::Age) => {
+            age_pull_request_evidence_matches(planned_evidence, evidence)
+        }
+        None => false,
+    });
+    if !evidence_matches {
+        eprintln!(
+            "  keeping {} because exact-head merged-PR evidence is incomplete, changed, or inside the grace period",
+            decision.path.display()
+        );
+        return Ok(false);
+    }
+
+    let ownership = process_ownership_evidence_for_paths(std::slice::from_ref(&decision.path));
+    if !ownership.complete || !ownership.observations.is_empty() {
+        eprintln!(
+            "  keeping {} because fresh ownership evidence is incomplete or active: {}",
+            decision.path.display(),
+            serde_json::to_string(&ownership).unwrap_or_else(|_| "unavailable".to_string())
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn age_pull_request_evidence_matches(
+    planned: &PullRequestEvidence,
+    fresh: &PullRequestEvidence,
+) -> bool {
+    planned.complete
+        && fresh.complete
+        && planned.provider == fresh.provider
+        && planned.repositories == fresh.repositories
+        && planned.lifecycle == fresh.lifecycle
+        && matches!(
+            fresh.lifecycle,
+            PullRequestLifecycle::NotApplicable
+                | PullRequestLifecycle::None
+                | PullRequestLifecycle::Closed
+        )
+        && planned.pull_requests == fresh.pull_requests
+}
+
+fn merged_pull_request_evidence_matches(
+    planned: &PullRequestEvidence,
+    fresh: &PullRequestEvidence,
+    policy: &PullRequestPolicy,
+    now: SystemTime,
+) -> bool {
+    if !fresh.complete || fresh.lifecycle != PullRequestLifecycle::Merged {
+        return false;
+    }
+    let Some((fresh_record, age)) = most_recent_merged_pull_request(fresh, now) else {
+        return false;
+    };
+    age >= policy.merged_grace_days
+        && planned.pull_requests.iter().any(|planned_record| {
+            planned_record.repository == fresh_record.repository
+                && planned_record.number == fresh_record.number
+                && planned_record.state == PullRequestState::Merged
+                && planned_record.head_oid == fresh_record.head_oid
+                && planned_record.merged_at_unix == fresh_record.merged_at_unix
+        })
 }
 
 fn execution_matches(class: CleanupClass, pass: ExecutionPass) -> bool {
@@ -5277,6 +5611,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -5349,6 +5684,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -6193,6 +6529,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -6317,6 +6654,7 @@ mod tests {
             cargo_lock_timeout: None,
             defer_lock_timeouts: false,
             pressure: None,
+            pull_requests: None,
             now: now(),
         };
         let run = cleanup(Some(&repo), options)?;
@@ -6352,6 +6690,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -6383,6 +6722,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -6415,6 +6755,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -6450,6 +6791,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -6483,6 +6825,344 @@ mod tests {
         assert_eq!(decision.action, WorktreeAction::Keep);
         assert!(decision.reason.contains("dirty"));
         Ok(())
+    }
+
+    fn pull_request_evidence(
+        head: &str,
+        state: PullRequestState,
+        merged_at_unix: Option<i64>,
+    ) -> PullRequestEvidence {
+        let lifecycle = match state {
+            PullRequestState::Open => PullRequestLifecycle::Open,
+            PullRequestState::Merged => PullRequestLifecycle::Merged,
+            PullRequestState::Closed => PullRequestLifecycle::Closed,
+        };
+        PullRequestEvidence {
+            provider: "github".to_string(),
+            observed_at_unix: 1_800_000_000,
+            complete: true,
+            lifecycle,
+            repositories: vec!["acme/repo".to_string()],
+            pull_requests: vec![PullRequestRecord {
+                repository: "acme/repo".to_string(),
+                number: 42,
+                url: "https://github.com/acme/repo/pull/42".to_string(),
+                state,
+                head_ref_name: "fixture-branch".to_string(),
+                head_oid: head.to_string(),
+                merged_at_unix,
+            }],
+            error: None,
+        }
+    }
+
+    fn plan_with_pull_request(
+        worktree: &WorktreeInfo,
+        evidence: PullRequestEvidence,
+        grace_days: u64,
+        ownership_complete: bool,
+        owned: bool,
+    ) -> Result<WorktreeDecision> {
+        let head = worktree
+            .head
+            .clone()
+            .context("fixture worktree has no head")?;
+        let branch = worktree
+            .branch
+            .clone()
+            .context("fixture worktree has no branch")?;
+        let evidence = BTreeMap::from([((branch, head), evidence)]);
+        let owned_worktrees = owned
+            .then(|| worktree.path.clone())
+            .into_iter()
+            .collect::<HashSet<_>>();
+        plan_worktree_cleanup_with_pull_requests(
+            std::slice::from_ref(worktree),
+            10_000,
+            now(),
+            &[],
+            None,
+            Some(&PullRequestPolicy {
+                merged_grace_days: grace_days,
+            }),
+            &evidence,
+            ownership_complete,
+            &owned_worktrees,
+        )?
+        .into_iter()
+        .next()
+        .context("missing worktree decision")
+    }
+
+    #[test]
+    fn exact_head_merged_pull_request_accelerates_clean_worktree_removal() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree_path = repo.with_file_name("merged-pr");
+        add_worktree(&repo, &worktree_path, "merged-pr-branch")?;
+        let report = audit(Some(&repo), 7, now())?;
+        let worktree = report
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fs::canonicalize(&worktree_path).unwrap())
+            .context("missing merged-PR worktree")?;
+        let evidence = pull_request_evidence(
+            worktree.head.as_deref().context("missing head")?,
+            PullRequestState::Merged,
+            Some(1_800_000_000 - 2 * 86_400),
+        );
+
+        let decision = plan_with_pull_request(worktree, evidence, 1, true, false)?;
+        assert_eq!(decision.action, WorktreeAction::Remove);
+        assert_eq!(
+            decision.removal_trigger,
+            Some(WorktreeRemovalTrigger::MergedPullRequest)
+        );
+        assert_eq!(decision.cleanup_class, CleanupClass::Routine);
+        assert!(decision.reason.contains("PR #42"));
+        Ok(())
+    }
+
+    #[test]
+    fn merged_pr_evidence_does_not_cross_between_branches_at_the_same_head() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let merged_path = repo.with_file_name("merged-pr-branch-a");
+        let unrelated_path = repo.with_file_name("merged-pr-branch-b");
+        add_worktree(&repo, &merged_path, "merged-pr-branch-a")?;
+        add_worktree(&repo, &unrelated_path, "merged-pr-branch-b")?;
+        let report = audit(Some(&repo), 7, now())?;
+        let merged = report
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fs::canonicalize(&merged_path).unwrap())
+            .context("missing merged branch worktree")?;
+        let unrelated = report
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fs::canonicalize(&unrelated_path).unwrap())
+            .context("missing unrelated branch worktree")?;
+        assert_eq!(merged.head, unrelated.head);
+
+        let head = merged.head.clone().context("missing head")?;
+        let branch = merged.branch.clone().context("missing branch")?;
+        let mut evidence = pull_request_evidence(
+            &head,
+            PullRequestState::Merged,
+            Some(1_800_000_000 - 2 * 86_400),
+        );
+        evidence.pull_requests[0].head_ref_name = branch.clone();
+        let decisions = plan_worktree_cleanup_with_pull_requests(
+            &[merged.clone(), unrelated.clone()],
+            10_000,
+            now(),
+            &[],
+            None,
+            Some(&PullRequestPolicy {
+                merged_grace_days: 1,
+            }),
+            &BTreeMap::from([((branch, head), evidence)]),
+            true,
+            &HashSet::new(),
+        )?;
+
+        let merged_decision = decisions
+            .iter()
+            .find(|decision| decision.path == merged.path)
+            .context("missing merged branch decision")?;
+        assert_eq!(merged_decision.action, WorktreeAction::Remove);
+        let unrelated_decision = decisions
+            .iter()
+            .find(|decision| decision.path == unrelated.path)
+            .context("missing unrelated branch decision")?;
+        assert_eq!(unrelated_decision.action, WorktreeAction::Keep);
+        assert!(unrelated_decision
+            .reason
+            .contains("evidence is missing for the exact worktree branch and head"));
+        Ok(())
+    }
+
+    #[test]
+    fn open_pull_request_overrides_ordinary_stale_removal() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree_path = repo.with_file_name("open-pr");
+        add_worktree(&repo, &worktree_path, "open-pr-branch")?;
+        let report = audit(Some(&repo), 7, now())?;
+        let worktree = report
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fs::canonicalize(&worktree_path).unwrap())
+            .context("missing open-PR worktree")?;
+        let evidence = pull_request_evidence(
+            worktree.head.as_deref().context("missing head")?,
+            PullRequestState::Open,
+            None,
+        );
+        let head = worktree.head.clone().context("missing head")?;
+        let branch = worktree.branch.clone().context("missing branch")?;
+        let decisions = plan_worktree_cleanup_with_pull_requests(
+            std::slice::from_ref(worktree),
+            0,
+            now(),
+            &[],
+            None,
+            Some(&PullRequestPolicy {
+                merged_grace_days: 1,
+            }),
+            &BTreeMap::from([((branch, head), evidence)]),
+            true,
+            &HashSet::new(),
+        )?;
+        assert_eq!(decisions[0].action, WorktreeAction::Keep);
+        assert!(decisions[0].reason.contains("open GitHub pull request"));
+        Ok(())
+    }
+
+    #[test]
+    fn merged_pull_request_respects_grace_ownership_and_complete_evidence() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree_path = repo.with_file_name("merged-pr-guards");
+        add_worktree(&repo, &worktree_path, "merged-pr-guards-branch")?;
+        let report = audit(Some(&repo), 7, now())?;
+        let worktree = report
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fs::canonicalize(&worktree_path).unwrap())
+            .context("missing merged-PR worktree")?;
+        let head = worktree.head.as_deref().context("missing head")?;
+        let recent =
+            pull_request_evidence(head, PullRequestState::Merged, Some(1_800_000_000 - 3_600));
+        assert_eq!(
+            plan_with_pull_request(worktree, recent, 1, true, false)?.action,
+            WorktreeAction::Keep
+        );
+
+        let old = || {
+            pull_request_evidence(
+                head,
+                PullRequestState::Merged,
+                Some(1_800_000_000 - 2 * 86_400),
+            )
+        };
+        let incomplete = plan_with_pull_request(worktree, old(), 1, false, false)?;
+        assert_eq!(incomplete.action, WorktreeAction::Keep);
+        assert!(incomplete.reason.contains("complete process ownership"));
+        let owned = plan_with_pull_request(worktree, old(), 1, true, true)?;
+        assert_eq!(owned.action, WorktreeAction::Keep);
+        assert!(owned.reason.contains("running process"));
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_pull_request_evidence_fails_closed() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree_path = repo.with_file_name("incomplete-pr");
+        add_worktree(&repo, &worktree_path, "incomplete-pr-branch")?;
+        let report = audit(Some(&repo), 7, now())?;
+        let worktree = report
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fs::canonicalize(&worktree_path).unwrap())
+            .context("missing incomplete-PR worktree")?;
+        let head = worktree.head.as_deref().context("missing head")?;
+        let mut evidence = pull_request_evidence(head, PullRequestState::Closed, None);
+        evidence.complete = false;
+        evidence.lifecycle = PullRequestLifecycle::Incomplete;
+        evidence.error = Some("GitHub unavailable".to_string());
+        let decision = plan_with_pull_request(worktree, evidence, 1, true, false)?;
+        assert_eq!(decision.action, WorktreeAction::Keep);
+        assert!(decision.reason.contains("GitHub unavailable"));
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_merged_pull_request_must_match_the_planned_exact_pr() {
+        let head = "a".repeat(40);
+        let planned = pull_request_evidence(
+            &head,
+            PullRequestState::Merged,
+            Some(1_800_000_000 - 2 * 86_400),
+        );
+        let mut fresh = planned.clone();
+        assert!(merged_pull_request_evidence_matches(
+            &planned,
+            &fresh,
+            &PullRequestPolicy {
+                merged_grace_days: 1,
+            },
+            now(),
+        ));
+        fresh.pull_requests[0].number = 43;
+        assert!(!merged_pull_request_evidence_matches(
+            &planned,
+            &fresh,
+            &PullRequestPolicy {
+                merged_grace_days: 1,
+            },
+            now(),
+        ));
+        fresh = planned.clone();
+        let mut newer = fresh.pull_requests[0].clone();
+        newer.number = 44;
+        newer.merged_at_unix = Some(1_800_000_000 - 3_600);
+        fresh.pull_requests.push(newer);
+        assert!(!merged_pull_request_evidence_matches(
+            &planned,
+            &fresh,
+            &PullRequestPolicy {
+                merged_grace_days: 1,
+            },
+            now(),
+        ));
+        fresh.lifecycle = PullRequestLifecycle::Open;
+        assert!(!merged_pull_request_evidence_matches(
+            &planned,
+            &fresh,
+            &PullRequestPolicy {
+                merged_grace_days: 1,
+            },
+            now(),
+        ));
+    }
+
+    #[test]
+    fn ordinary_age_removal_requires_unchanged_non_open_pull_request_evidence() {
+        let head = "a".repeat(40);
+        let planned = pull_request_evidence(&head, PullRequestState::Closed, None);
+        assert!(age_pull_request_evidence_matches(&planned, &planned));
+
+        let open = pull_request_evidence(&head, PullRequestState::Open, None);
+        assert!(!age_pull_request_evidence_matches(&planned, &open));
+
+        let mut different_repository = planned.clone();
+        different_repository.repositories = vec!["acme/renamed".to_string()];
+        assert!(!age_pull_request_evidence_matches(
+            &planned,
+            &different_repository
+        ));
+
+        let mut incomplete = planned.clone();
+        incomplete.complete = false;
+        incomplete.lifecycle = PullRequestLifecycle::Incomplete;
+        assert!(!age_pull_request_evidence_matches(&planned, &incomplete));
+    }
+
+    #[test]
+    fn pr_policy_revalidation_does_not_capture_untriggered_removals() {
+        let policy = PullRequestPolicy {
+            merged_grace_days: 1,
+        };
+        assert!(!pull_request_revalidation_required(Some(&policy), None));
+        assert!(!pull_request_revalidation_required(
+            None,
+            Some(WorktreeRemovalTrigger::Age)
+        ));
+        assert!(pull_request_revalidation_required(
+            Some(&policy),
+            Some(WorktreeRemovalTrigger::Age)
+        ));
+        assert!(pull_request_revalidation_required(
+            Some(&policy),
+            Some(WorktreeRemovalTrigger::MergedPullRequest)
+        ));
     }
 
     #[test]
@@ -6523,12 +7203,14 @@ mod tests {
             metadata_prunable,
             action,
             cleanup_class: CleanupClass::Routine,
+            removal_trigger: None,
             reason: "fixture".to_string(),
             protection: None,
             dirty_count: None,
             status_sha256: None,
             last_commit: None,
             activity_age_days: None,
+            pull_request: None,
         };
         let worktrees = vec![
             decision("/worktrees/current", WorktreeAction::Keep, false),
@@ -6599,6 +7281,7 @@ mod tests {
                 cargo_lock_timeout_secs: Some(1800),
                 defer_lock_timeouts: true,
                 pressure: None,
+                pull_requests: None,
                 generated_delete_names: Vec::new(),
                 generated_report_only_names: Vec::new(),
                 generated_sweep_paths: Vec::new(),
@@ -6722,6 +7405,7 @@ mod tests {
                 active: true,
                 entered_filesystems: vec![filesystem_key(temp.path())?],
             }),
+            pull_requests: None,
             generated_delete_names: Vec::new(),
             generated_report_only_names: Vec::new(),
             generated_sweep_paths: Vec::new(),
@@ -6766,6 +7450,7 @@ mod tests {
                     active: false,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
         )
@@ -6908,6 +7593,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -6945,6 +7631,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -7011,6 +7698,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -7079,6 +7767,7 @@ mod tests {
             cargo_lock_timeout: None,
             defer_lock_timeouts: false,
             pressure: None,
+            pull_requests: None,
             now: now(),
         };
         cleanup(Some(&repo), options)?;
@@ -7116,6 +7805,7 @@ mod tests {
                 cargo_lock_timeout: Some(Duration::from_millis(20)),
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -7153,6 +7843,7 @@ mod tests {
             cargo_lock_timeout: None,
             defer_lock_timeouts: false,
             pressure: None,
+            pull_requests: None,
             now: now(),
         };
         cleanup(Some(&repo), options)?;
@@ -7187,6 +7878,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -7273,6 +7965,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -7356,6 +8049,7 @@ mod tests {
             cargo_lock_timeout: None,
             defer_lock_timeouts: false,
             pressure: None,
+            pull_requests: None,
             now: now(),
         };
         let mut previous = plan_cleanup_with_protections(Some(&repo), options.clone(), &[], None)?;
@@ -7403,6 +8097,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -7458,6 +8153,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -7506,6 +8202,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -7593,6 +8290,7 @@ mod tests {
             cargo_lock_timeout: None,
             defer_lock_timeouts: false,
             pressure: None,
+            pull_requests: None,
             now: now(),
         };
         cleanup(Some(&repo), options)?;
@@ -7633,6 +8331,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -7665,6 +8364,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: Some(policy.clone()),
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -7691,6 +8391,7 @@ mod tests {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: Some(policy),
+                pull_requests: None,
                 now: now(),
             },
         )?;
@@ -7724,6 +8425,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -7780,6 +8482,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -7831,6 +8534,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -7883,6 +8587,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -7934,6 +8639,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -7983,6 +8689,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -8037,6 +8744,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -8095,6 +8803,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -8164,6 +8873,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
             &[],
@@ -8235,6 +8945,7 @@ mod tests {
                     active: true,
                     entered_filesystems: Vec::new(),
                 }),
+                pull_requests: None,
                 now: now(),
             },
         )?;

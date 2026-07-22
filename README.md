@@ -366,6 +366,12 @@ cargo_lock_timeout_minutes = 30
 # Requires cargo-sweep; omit to use only the built-in Cargo sweeps.
 cargo_sweep_max_size = "50GB"
 
+[cleanup.pull_requests]
+# Optional GitHub lifecycle signal for whole-worktree retention. Requires an
+# authenticated `gh` CLI and cleanup.check_in_use = true.
+provider = "github"
+merged_grace_days = 1
+
 [pressure]
 # Optional hysteresis controller. Routine TTL cleanup still runs above this.
 enter_free_space = "100GiB"
@@ -393,6 +399,21 @@ directory-name component.
 delete root or explicitly configured generated directory name. Build caches
 (`.next`, `.turbo`, and `target`) otherwise use a tighter built-in window; other
 names use `generated_days`.
+
+When `[cleanup.pull_requests]` is enabled, `worktree-gc` batches GitHub PR
+queries by retained head-branch metadata through the authenticated `gh` CLI,
+then requires an exact PR head-OID match. This finds squash- and rebase-merged
+PRs without granting branch names deletion authority. An exact-head open pull
+request retains its worktree even after the ordinary age window. A clean,
+attached, non-current exact-head worktree becomes routine-removal eligible
+after its pull request has been merged for `merged_grace_days`. The manifest
+records the repository, PR number and URL, PR head name and OID, merge time,
+observation time, and evidence completeness. Incomplete GitHub or
+process-ownership evidence keeps the worktree. Execution freshly revalidates
+Git identity, source status, PR state, ownership, and protections before `git
+worktree remove`; it never uses `--force` and never deletes the local branch.
+The equivalent one-off cleanup flag is `--github-merged-pr-grace-days DAYS`,
+together with `--check-in-use`.
 
 The Cargo lock timeout applies to each generated `target` directory. A
 contended target is deferred to a later run, recorded under
