@@ -469,7 +469,11 @@ boundary. A `target/` candidate additionally requires the dry-run manifest's
 Cargo lock timeout and existing Cargo profile locks. Its guarded ownership
 snapshot is taken immediately before waiting for those locks, which are then
 held across the final identity, measurement, source, and pressure
-revalidation, quarantine, and deletion.
+revalidation, quarantine, and deletion. While those locks are held, process
+ownership is matched to the exact `target/` candidate: a process using a
+sibling generated tree does not pin this target. Generated trees without an
+equivalent toolchain lock retain the conservative worktree-wide ownership
+guard.
 
 Each scheduled run writes the normal per-repository manifests and a structured
 aggregate manifest. Aggregate manifests are retained for the configured
