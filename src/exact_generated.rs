@@ -364,7 +364,7 @@ fn execute_approved_generated_with_ownership(
     };
     validate_result_path(&result_path, &worktree, &git_common_dir, &quarantine)?;
     let approval_digest = format!("{APPROVAL_DIGEST_PREFIX}{actual_digest}");
-    let ownership_paths = vec![worktree.clone(), active_path.to_path_buf()];
+    let ownership_paths = exact_ownership_paths(&worktree, active_path, &decision.name);
     validate_current_ownership(
         &ownership_paths,
         ownership_override,
@@ -428,6 +428,7 @@ fn execute_approved_generated_with_ownership(
                     recovered_quarantine,
                     pressure_target_bytes,
                     recheck_ownership: true,
+                    ownership_paths: &ownership_paths,
                     ownership_override,
                     measurement_override,
                     manifest_path,
@@ -450,6 +451,7 @@ fn execute_approved_generated_with_ownership(
                 recovered_quarantine,
                 pressure_target_bytes,
                 recheck_ownership: true,
+                ownership_paths: &ownership_paths,
                 ownership_override,
                 measurement_override,
                 manifest_path,
@@ -951,6 +953,22 @@ fn measurements_match(approved: &GeneratedDirMeasurement, live: &GeneratedDirMea
         && approved.metrics == live.metrics
 }
 
+fn exact_ownership_paths(
+    worktree: &Path,
+    active_path: &Path,
+    candidate_name: &str,
+) -> Vec<PathBuf> {
+    if candidate_name == "target" {
+        // Cargo profile locks serialize target writers. With those locks held,
+        // ownership elsewhere in the worktree does not make this target live.
+        vec![active_path.to_path_buf()]
+    } else {
+        // Other generated trees do not have an equivalent toolchain lock, so
+        // retain the conservative worktree-wide ownership boundary.
+        vec![worktree.to_path_buf(), active_path.to_path_buf()]
+    }
+}
+
 #[derive(Clone, Copy)]
 struct OwnershipRefusalContext<'a> {
     manifest_path: &'a Path,
@@ -974,12 +992,19 @@ fn validate_current_ownership(
             let (owned_paths, complete) = capture();
             let mut observations = owned_paths
                 .into_iter()
-                .map(|path| ProcessOwnershipObservation {
-                    pid: None,
-                    command: None,
-                    evidence_kind: ProcessOwnershipEvidenceKind::TestOverride,
-                    observed_path: path.clone(),
-                    matched_path: path,
+                .filter_map(|observed_path| {
+                    let matched_path = paths
+                        .iter()
+                        .filter(|path| observed_path.starts_with(path))
+                        .max_by_key(|path| path.components().count())?
+                        .clone();
+                    Some(ProcessOwnershipObservation {
+                        pid: None,
+                        command: None,
+                        evidence_kind: ProcessOwnershipEvidenceKind::TestOverride,
+                        observed_path,
+                        matched_path,
+                    })
                 })
                 .collect::<Vec<_>>();
             observations.sort_by(|left, right| left.matched_path.cmp(&right.matched_path));
@@ -1110,6 +1135,7 @@ struct CandidateExecution<'a> {
     recovered_quarantine: bool,
     pressure_target_bytes: Option<u64>,
     recheck_ownership: bool,
+    ownership_paths: &'a [PathBuf],
     ownership_override: Option<&'a dyn Fn() -> (HashSet<PathBuf>, bool)>,
     measurement_override: Option<&'a GeneratedDirMeasurement>,
     manifest_path: &'a Path,
@@ -1159,7 +1185,7 @@ impl CandidateExecution<'_> {
         }
         if self.recheck_ownership {
             validate_current_ownership(
-                &[self.worktree.to_path_buf(), active_path.to_path_buf()],
+                self.ownership_paths,
                 self.ownership_override,
                 OwnershipRefusalContext {
                     manifest_path: self.manifest_path,
@@ -1922,6 +1948,49 @@ mod tests {
         fixture.execute()?;
 
         assert!(!fixture.candidate.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn target_execution_ignores_ownership_outside_the_exact_candidate() -> Result<()> {
+        let fixture = fixture_for_name(false, "target")?;
+        fs::write(fixture.candidate.join("debug/.cargo-lock"), "")?;
+        let worktree_owned_path = fixture.repo.join("tracked.txt");
+        assert!(worktree_owned_path.is_file());
+
+        execute_approved_generated_with_ownership(
+            &fixture.manifest,
+            &fixture.digest,
+            &fixture.candidate,
+            None,
+            Some(&|| (HashSet::from([worktree_owned_path.clone()]), true)),
+            Some(&fixture.measurement),
+        )?;
+
+        assert!(!fixture.candidate.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn non_target_execution_retains_worktree_wide_ownership_guard() -> Result<()> {
+        let fixture = fixture(false)?;
+        let worktree_owned_path = fixture.repo.join("tracked.txt");
+        assert!(worktree_owned_path.is_file());
+
+        let error = execute_approved_generated_with_ownership(
+            &fixture.manifest,
+            &fixture.digest,
+            &fixture.candidate,
+            None,
+            Some(&|| (HashSet::from([worktree_owned_path.clone()]), true)),
+            Some(&fixture.measurement),
+        )
+        .expect_err("non-target generated cleanup must retain worktree-wide ownership");
+
+        assert!(error
+            .to_string()
+            .contains("current process ownership exists"));
+        assert!(fixture.candidate.is_dir());
         Ok(())
     }
 
