@@ -158,7 +158,10 @@ recovery operation. The controller therefore has three ordered cleanup tiers:
    project-local `node_modules`, and equivalent trees when complete ownership
    evidence finds no current owner. The source worktree may be recent or dirty.
 3. **Conservative worktree cleanup.** Remove the worktree only after separate
-   source-safety, reachability, inactivity, and protection checks.
+   source-safety, reachability, lifecycle, ownership, and protection checks.
+   Exact-head GitHub PR evidence strengthens this tier: open PRs retain their
+   worktrees, while merged PRs can shorten the cleanup grace period without
+   weakening dirty, detached, current, owned, or protected-source guards.
 
 Current ownership is positive evidence such as open handles, process cwd or
 mapped files, owner locks, a live runtime, or an explicit artifact lease. A

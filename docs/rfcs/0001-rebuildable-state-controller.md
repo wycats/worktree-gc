@@ -29,6 +29,7 @@ state.
 | Scoped source, artifact, runtime, and legacy protections | Not implemented | Build before weakening broad worktree protection |
 | Owner-free coarse cleanup independent of source recency | Exact routine and pressure execution landed; coverage in delivery | Complete supervised activation without weakening broad protections |
 | Granular active Cargo-target pruning | Partially landed | Extend with measured size policy after owner-free coarse cleanup |
+| Exact-head PR lifecycle retention | In delivery | Retain open PR worktrees and reclaim clean merged-PR worktrees after a short grace period |
 | Unattended 100–150 GiB controller | Not active | Gate on supervised cycles and acceptance criteria |
 
 The generated-retention stack is being selectively reconciled against this
@@ -229,8 +230,22 @@ Whole-worktree removal remains governed by source-state evidence:
 - retain dirty or otherwise uncommitted source;
 - retain detached worktrees unless reachability is explicitly preserved;
 - honor source protections and active task ownership;
-- require conservative source inactivity and a fresh Git recheck;
+- treat an exact-head open pull request as positive retention evidence;
+- allow an exact-head merged pull request to replace the ordinary inactivity
+  window only after a short grace period and complete GitHub evidence;
+- require conservative source inactivity when no terminal lifecycle signal is
+  available, plus a fresh Git recheck;
 - preserve the branch or commit independently of artifact policy.
+
+PR association is commit-exact rather than branch-name based. Planning records
+the GitHub repository, PR number, state, PR head OID, merge time, observation
+time, and completeness. A force-pushed, locally advanced, reused, or otherwise
+different branch head does not inherit an older PR's terminal state. Any exact
+open PR wins over merged evidence. GitHub outages, pagination, unknown states,
+or incomplete process ownership retain the worktree. Immediately before
+removal, the controller rechecks the Git common directory, worktree HEAD,
+branch, status digest, PR evidence, process ownership, and protections. Removal
+does not use force and does not delete the local branch.
 
 Artifact cleanup should usually reclaim the expensive part long before a
 worktree reaches this tier.

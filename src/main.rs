@@ -11,11 +11,12 @@ use worktree_gc::{
     list_protections, print_cleanup, print_gateway_storage_report, print_generated_collect,
     print_inventory, print_root_cleanup, print_root_triage, print_triage, remove_protection,
     renew_protection, triage, triage_roots, CleanupOptions, GatewayStorageOptions,
-    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy, SweepLimit,
-    SweepStrategy, SweepTool, TriageOptions, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES,
-    DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT, DEFAULT_GENERATED_DAYS,
-    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
-    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy,
+    PullRequestPolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions,
+    DEFAULT_GATEWAY_EXACT_MAX_ENTRIES, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT,
+    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
+    DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -139,6 +140,14 @@ enum Command {
             help = "Skip wholesale generated dirs owned by running processes; granular Cargo profile resets always require complete ownership evidence"
         )]
         check_in_use: bool,
+
+        #[arg(
+            long,
+            value_name = "DAYS",
+            requires = "check_in_use",
+            help = "Remove clean exact-head GitHub PR worktrees after this many days merged"
+        )]
+        github_merged_pr_grace_days: Option<u64>,
 
         #[command(flatten)]
         generated: GeneratedArgs,
@@ -552,6 +561,26 @@ fn scheduled_pressure_policy(
     }))
 }
 
+fn scheduled_pull_request_policy(
+    cleanup: &config::CleanupConfig,
+) -> Result<Option<PullRequestPolicy>> {
+    let config = &cleanup.pull_requests;
+    if config.provider.is_none() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        cleanup.check_in_use,
+        "cleanup.pull_requests requires cleanup.check_in_use = true"
+    );
+    anyhow::ensure!(
+        config.merged_grace_days > 0,
+        "cleanup.pull_requests.merged_grace_days must be at least 1"
+    );
+    Ok(Some(PullRequestPolicy {
+        merged_grace_days: config.merged_grace_days,
+    }))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let now = SystemTime::now();
@@ -665,6 +694,7 @@ fn main() -> Result<()> {
             generated_days,
             generated_activity_only,
             check_in_use,
+            github_merged_pr_grace_days,
             generated,
         } => {
             let options = CleanupOptions {
@@ -677,6 +707,8 @@ fn main() -> Result<()> {
                 cargo_lock_timeout: None,
                 defer_lock_timeouts: false,
                 pressure: None,
+                pull_requests: github_merged_pr_grace_days
+                    .map(|merged_grace_days| PullRequestPolicy { merged_grace_days }),
                 now,
             };
             if roots.is_empty() {
@@ -737,6 +769,7 @@ fn main() -> Result<()> {
                 )),
                 defer_lock_timeouts: true,
                 pressure: scheduled_pressure_policy(&scheduled.pressure, &scheduled.cleanup)?,
+                pull_requests: scheduled_pull_request_policy(&scheduled.cleanup)?,
                 now,
             };
             let repositories = scheduled_repositories(
@@ -1048,6 +1081,25 @@ mod tests {
             Command::Cleanup { generated, .. } => generated.config(),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn merged_pr_grace_requires_process_ownership_checks() {
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "cleanup",
+            "--github-merged-pr-grace-days",
+            "1",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "cleanup",
+            "--check-in-use",
+            "--github-merged-pr-grace-days",
+            "1",
+        ])
+        .is_ok());
     }
 
     #[test]
@@ -1385,6 +1437,33 @@ owner_free_generated = true
         let mut unsafe_cleanup = cleanup;
         unsafe_cleanup.check_in_use = false;
         assert!(scheduled_pressure_policy(&owner_free, &unsafe_cleanup).is_err());
+    }
+
+    #[test]
+    fn scheduled_pull_request_policy_requires_complete_ownership_and_a_grace_period() -> Result<()>
+    {
+        let mut cleanup: config::CleanupConfig = toml::from_str(
+            r#"
+check_in_use = true
+
+[pull_requests]
+provider = "github"
+merged_grace_days = 1
+"#,
+        )?;
+        assert_eq!(
+            scheduled_pull_request_policy(&cleanup)?,
+            Some(PullRequestPolicy {
+                merged_grace_days: 1,
+            })
+        );
+
+        cleanup.check_in_use = false;
+        assert!(scheduled_pull_request_policy(&cleanup).is_err());
+        cleanup.check_in_use = true;
+        cleanup.pull_requests.merged_grace_days = 0;
+        assert!(scheduled_pull_request_policy(&cleanup).is_err());
+        Ok(())
     }
 
     #[test]
