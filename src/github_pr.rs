@@ -83,7 +83,7 @@ pub(crate) fn observe_pull_requests(
     repo: &Path,
     worktrees: &[WorktreeInfo],
     now: SystemTime,
-) -> BTreeMap<String, PullRequestEvidence> {
+) -> BTreeMap<(String, String), PullRequestEvidence> {
     let observed_at_unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let branch_heads = worktrees
         .iter()
@@ -98,19 +98,14 @@ pub(crate) fn observe_pull_requests(
     if branch_heads.is_empty() {
         return BTreeMap::new();
     }
-    let heads = branch_heads
-        .iter()
-        .map(|(_, head)| head.clone())
-        .collect::<BTreeSet<_>>();
-
     let repositories = match github_repositories(repo) {
         Ok(repositories) => repositories,
         Err(error) => {
-            return heads
+            return branch_heads
                 .into_iter()
-                .map(|head| {
+                .map(|branch_head| {
                     (
-                        head,
+                        branch_head,
                         incomplete_evidence(
                             observed_at_unix,
                             Vec::new(),
@@ -122,18 +117,23 @@ pub(crate) fn observe_pull_requests(
         }
     };
     if repositories.is_empty() {
-        return heads
+        return branch_heads
             .into_iter()
-            .map(|head| (head, PullRequestEvidence::not_applicable(observed_at_unix)))
+            .map(|branch_head| {
+                (
+                    branch_head,
+                    PullRequestEvidence::not_applicable(observed_at_unix),
+                )
+            })
             .collect();
     }
 
-    let mut accumulators = heads
+    let mut accumulators = branch_heads
         .iter()
         .cloned()
-        .map(|head| {
+        .map(|branch_head| {
             (
-                head,
+                branch_head,
                 EvidenceAccumulator {
                     complete: true,
                     ..EvidenceAccumulator::default()
@@ -146,23 +146,24 @@ pub(crate) fn observe_pull_requests(
         for batch in branch_heads.chunks(BRANCHES_PER_QUERY) {
             match query_pull_requests_for_branches(repository, batch) {
                 Ok(observations) => {
-                    for (head, observation) in observations {
+                    for (branch_head, observation) in observations {
                         let accumulator = accumulators
-                            .get_mut(&head)
-                            .expect("queried head must have an accumulator");
+                            .get_mut(&branch_head)
+                            .expect("queried branch head must have an accumulator");
                         accumulator.complete &= observation.complete;
                         accumulator.pull_requests.extend(observation.pull_requests);
                         accumulator.errors.extend(observation.errors);
                     }
                 }
                 Err(error) => {
-                    for (_, head) in batch {
+                    for branch_head in batch {
                         let accumulator = accumulators
-                            .get_mut(head)
-                            .expect("queried head must have an accumulator");
+                            .get_mut(branch_head)
+                            .expect("queried branch head must have an accumulator");
                         accumulator.complete = false;
                         accumulator.errors.push(format!(
-                            "failed to query {repository} for {head}: {error:#}"
+                            "failed to query {repository} for {} at {}: {error:#}",
+                            branch_head.0, branch_head.1
                         ));
                     }
                 }
@@ -172,7 +173,7 @@ pub(crate) fn observe_pull_requests(
 
     accumulators
         .into_iter()
-        .map(|(head, mut accumulator)| {
+        .map(|(branch_head, mut accumulator)| {
             accumulator.pull_requests.sort_by(|left, right| {
                 (&left.repository, left.number, left.state as u8).cmp(&(
                     &right.repository,
@@ -185,7 +186,7 @@ pub(crate) fn observe_pull_requests(
             accumulator.errors.dedup();
             let lifecycle = classify_lifecycle(accumulator.complete, &accumulator.pull_requests);
             (
-                head,
+                branch_head,
                 PullRequestEvidence {
                     provider: "github".to_string(),
                     observed_at_unix,
@@ -291,7 +292,7 @@ struct QueryObservation {
 fn query_pull_requests_for_branches(
     repository: &str,
     branch_heads: &[(String, String)],
-) -> Result<BTreeMap<String, QueryObservation>> {
+) -> Result<BTreeMap<(String, String), QueryObservation>> {
     let query = build_query(repository, branch_heads)?;
     let output = Command::new("gh")
         .args(["api", "graphql", "-f"])
@@ -332,7 +333,7 @@ fn parse_query_response(
     repository: &str,
     branch_heads: &[(String, String)],
     output: &[u8],
-) -> Result<BTreeMap<String, QueryObservation>> {
+) -> Result<BTreeMap<(String, String), QueryObservation>> {
     let value: Value =
         serde_json::from_slice(output).context("failed to parse gh GraphQL output")?;
     if let Some(errors) = value.get("errors") {
@@ -386,7 +387,7 @@ fn parse_query_response(
                 }
             }
             Ok((
-                head.clone(),
+                (branch.clone(), head.clone()),
                 QueryObservation {
                     complete: !has_next_page && errors.is_empty(),
                     pull_requests: records,
@@ -510,12 +511,13 @@ mod tests {
                 }
             }
         });
+        let key = (branch.clone(), head.clone());
         let parsed = parse_query_response(
             "acme/repo",
-            &[(branch, head.clone())],
+            std::slice::from_ref(&key),
             &serde_json::to_vec(&fixture)?,
         )?;
-        let observation = &parsed[&head];
+        let observation = &parsed[&key];
         assert!(observation.complete);
         assert_eq!(observation.pull_requests.len(), 1);
         assert_eq!(observation.pull_requests[0].number, 12);
@@ -536,12 +538,13 @@ mod tests {
                 }
             }
         });
+        let key = (branch.clone(), head.clone());
         let parsed = parse_query_response(
             "acme/repo",
-            &[(branch, head.clone())],
+            std::slice::from_ref(&key),
             &serde_json::to_vec(&fixture)?,
         )?;
-        assert!(!parsed[&head].complete);
+        assert!(!parsed[&key].complete);
         Ok(())
     }
 

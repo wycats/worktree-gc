@@ -3588,7 +3588,7 @@ fn plan_worktree_cleanup_with_pull_requests(
     protections: &[ProtectionLease],
     pressure: Option<&PressurePolicy>,
     pull_request_policy: Option<&PullRequestPolicy>,
-    pull_request_evidence: &BTreeMap<String, PullRequestEvidence>,
+    pull_request_evidence: &BTreeMap<(String, String), PullRequestEvidence>,
     ownership_evidence_complete: bool,
     owned_worktrees: &HashSet<PathBuf>,
 ) -> Result<Vec<WorktreeDecision>> {
@@ -3610,11 +3610,8 @@ fn plan_worktree_cleanup_with_pull_requests(
                 .last_commit_unix
                 .and_then(|unix| age_days(now, unix));
             let pull_request = pull_request_policy.and_then(|_| {
-                worktree
-                    .head
-                    .as_ref()
-                    .and_then(|head| pull_request_evidence.get(head))
-                    .cloned()
+                let key = (worktree.branch.clone()?, worktree.head.clone()?);
+                pull_request_evidence.get(&key).cloned()
             });
             let (action, reason, removal_trigger) = if let Some(lease) = &protection {
                 (
@@ -3657,7 +3654,7 @@ fn plan_worktree_cleanup_with_pull_requests(
             } else if pull_request_policy.is_some() && pull_request.is_none() {
                 (
                     WorktreeAction::Keep,
-                    "GitHub pull-request evidence is missing for the exact worktree head"
+                    "GitHub pull-request evidence is missing for the exact worktree branch and head"
                         .to_string(),
                     None,
                 )
@@ -4156,7 +4153,12 @@ fn revalidate_pull_request_removal(
         std::slice::from_ref(&live_worktree),
         now,
     );
-    let fresh_evidence = live_worktree.head.as_ref().and_then(|head| fresh.get(head));
+    let fresh_evidence = live_worktree.branch.as_ref().and_then(|branch| {
+        live_worktree
+            .head
+            .as_ref()
+            .and_then(|head| fresh.get(&(branch.clone(), head.clone())))
+    });
     let evidence_matches = fresh_evidence.is_some_and(|evidence| match decision.removal_trigger {
         Some(WorktreeRemovalTrigger::MergedPullRequest) => {
             merged_pull_request_evidence_matches(planned_evidence, evidence, policy, now)
@@ -6865,7 +6867,11 @@ mod tests {
             .head
             .clone()
             .context("fixture worktree has no head")?;
-        let evidence = BTreeMap::from([(head, evidence)]);
+        let branch = worktree
+            .branch
+            .clone()
+            .context("fixture worktree has no branch")?;
+        let evidence = BTreeMap::from([((branch, head), evidence)]);
         let owned_worktrees = owned
             .then(|| worktree.path.clone())
             .into_iter()
@@ -6917,6 +6923,64 @@ mod tests {
     }
 
     #[test]
+    fn merged_pr_evidence_does_not_cross_between_branches_at_the_same_head() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let merged_path = repo.with_file_name("merged-pr-branch-a");
+        let unrelated_path = repo.with_file_name("merged-pr-branch-b");
+        add_worktree(&repo, &merged_path, "merged-pr-branch-a")?;
+        add_worktree(&repo, &unrelated_path, "merged-pr-branch-b")?;
+        let report = audit(Some(&repo), 7, now())?;
+        let merged = report
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fs::canonicalize(&merged_path).unwrap())
+            .context("missing merged branch worktree")?;
+        let unrelated = report
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fs::canonicalize(&unrelated_path).unwrap())
+            .context("missing unrelated branch worktree")?;
+        assert_eq!(merged.head, unrelated.head);
+
+        let head = merged.head.clone().context("missing head")?;
+        let branch = merged.branch.clone().context("missing branch")?;
+        let mut evidence = pull_request_evidence(
+            &head,
+            PullRequestState::Merged,
+            Some(1_800_000_000 - 2 * 86_400),
+        );
+        evidence.pull_requests[0].head_ref_name = branch.clone();
+        let decisions = plan_worktree_cleanup_with_pull_requests(
+            &[merged.clone(), unrelated.clone()],
+            10_000,
+            now(),
+            &[],
+            None,
+            Some(&PullRequestPolicy {
+                merged_grace_days: 1,
+            }),
+            &BTreeMap::from([((branch, head), evidence)]),
+            true,
+            &HashSet::new(),
+        )?;
+
+        let merged_decision = decisions
+            .iter()
+            .find(|decision| decision.path == merged.path)
+            .context("missing merged branch decision")?;
+        assert_eq!(merged_decision.action, WorktreeAction::Remove);
+        let unrelated_decision = decisions
+            .iter()
+            .find(|decision| decision.path == unrelated.path)
+            .context("missing unrelated branch decision")?;
+        assert_eq!(unrelated_decision.action, WorktreeAction::Keep);
+        assert!(unrelated_decision
+            .reason
+            .contains("evidence is missing for the exact worktree branch and head"));
+        Ok(())
+    }
+
+    #[test]
     fn open_pull_request_overrides_ordinary_stale_removal() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let worktree_path = repo.with_file_name("open-pr");
@@ -6933,6 +6997,7 @@ mod tests {
             None,
         );
         let head = worktree.head.clone().context("missing head")?;
+        let branch = worktree.branch.clone().context("missing branch")?;
         let decisions = plan_worktree_cleanup_with_pull_requests(
             std::slice::from_ref(worktree),
             0,
@@ -6942,7 +7007,7 @@ mod tests {
             Some(&PullRequestPolicy {
                 merged_grace_days: 1,
             }),
-            &BTreeMap::from([(head, evidence)]),
+            &BTreeMap::from([((branch, head), evidence)]),
             true,
             &HashSet::new(),
         )?;
