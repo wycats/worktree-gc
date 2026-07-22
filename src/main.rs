@@ -145,6 +145,7 @@ enum Command {
             long,
             value_name = "DAYS",
             requires = "check_in_use",
+            value_parser = clap::value_parser!(u64).range(1..),
             help = "Remove clean exact-head GitHub PR worktrees after this many days merged"
         )]
         github_merged_pr_grace_days: Option<u64>,
@@ -1100,6 +1101,14 @@ mod tests {
             "1",
         ])
         .is_ok());
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "cleanup",
+            "--check-in-use",
+            "--github-merged-pr-grace-days",
+            "0",
+        ])
+        .is_err());
     }
 
     #[test]
