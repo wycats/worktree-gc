@@ -237,15 +237,17 @@ Whole-worktree removal remains governed by source-state evidence:
   available, plus a fresh Git recheck;
 - preserve the branch or commit independently of artifact policy.
 
-PR association is commit-exact rather than branch-name based. Planning records
-the GitHub repository, PR number, state, PR head OID, merge time, observation
-time, and completeness. A force-pushed, locally advanced, reused, or otherwise
-different branch head does not inherit an older PR's terminal state. Any exact
-open PR wins over merged evidence. GitHub outages, pagination, unknown states,
-or incomplete process ownership retain the worktree. Immediately before
-removal, the controller rechecks the Git common directory, worktree HEAD,
-branch, status digest, PR evidence, process ownership, and protections. Removal
-does not use force and does not delete the local branch.
+PR association uses retained PR head-branch metadata for discovery and an exact
+head-OID match for authority. This preserves squash- and rebase-merge evidence
+without letting a branch-name match authorize removal. Planning records the
+GitHub repository, PR number, state, PR head name and OID, merge time,
+observation time, and completeness. A force-pushed, locally advanced, reused,
+or otherwise different branch head does not inherit an older PR's terminal
+state. Any exact open PR wins over merged evidence. GitHub outages, pagination,
+unknown states, or incomplete process ownership retain the worktree.
+Immediately before removal, the controller rechecks the Git common directory,
+worktree HEAD, branch, status digest, PR evidence, process ownership, and
+protections. Removal does not use force and does not delete the local branch.
 
 Artifact cleanup should usually reclaim the expensive part long before a
 worktree reaches this tier.

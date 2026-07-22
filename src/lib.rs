@@ -4057,7 +4057,10 @@ fn execute_worktree_removals(
         {
             continue;
         }
-        if manifest.pull_requests.is_some() && !revalidate_pull_request_removal(manifest, decision)?
+        if pull_request_revalidation_required(
+            manifest.pull_requests.as_ref(),
+            decision.removal_trigger,
+        ) && !revalidate_pull_request_removal(manifest, decision)?
         {
             continue;
         }
@@ -4089,20 +4092,27 @@ fn execute_worktree_removals(
     Ok(())
 }
 
+fn pull_request_revalidation_required(
+    policy: Option<&PullRequestPolicy>,
+    trigger: Option<WorktreeRemovalTrigger>,
+) -> bool {
+    policy.is_some() && trigger.is_some()
+}
+
 fn revalidate_pull_request_removal(
     manifest: &CleanupManifest,
     decision: &WorktreeDecision,
 ) -> Result<bool> {
     let Some(policy) = manifest.pull_requests.as_ref() else {
         eprintln!(
-            "  keeping {} because merged-PR removal has no manifest policy",
+            "  keeping {} because PR-policy removal has no manifest policy",
             decision.path.display()
         );
         return Ok(false);
     };
     let Some(planned_evidence) = decision.pull_request.as_ref() else {
         eprintln!(
-            "  keeping {} because merged-PR removal has no planned owner evidence",
+            "  keeping {} because PR-policy removal has no planned pull-request evidence",
             decision.path.display()
         );
         return Ok(false);
@@ -6836,6 +6846,7 @@ mod tests {
                 number: 42,
                 url: "https://github.com/acme/repo/pull/42".to_string(),
                 state,
+                head_ref_name: "fixture-branch".to_string(),
                 head_oid: head.to_string(),
                 merged_at_unix,
             }],
@@ -7067,6 +7078,26 @@ mod tests {
         incomplete.complete = false;
         incomplete.lifecycle = PullRequestLifecycle::Incomplete;
         assert!(!age_pull_request_evidence_matches(&planned, &incomplete));
+    }
+
+    #[test]
+    fn pr_policy_revalidation_does_not_capture_untriggered_removals() {
+        let policy = PullRequestPolicy {
+            merged_grace_days: 1,
+        };
+        assert!(!pull_request_revalidation_required(Some(&policy), None));
+        assert!(!pull_request_revalidation_required(
+            None,
+            Some(WorktreeRemovalTrigger::Age)
+        ));
+        assert!(pull_request_revalidation_required(
+            Some(&policy),
+            Some(WorktreeRemovalTrigger::Age)
+        ));
+        assert!(pull_request_revalidation_required(
+            Some(&policy),
+            Some(WorktreeRemovalTrigger::MergedPullRequest)
+        ));
     }
 
     #[test]

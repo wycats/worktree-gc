@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-const ASSOCIATED_PULL_REQUEST_LIMIT: usize = 20;
-const COMMITS_PER_QUERY: usize = 25;
+const PULL_REQUESTS_PER_BRANCH_LIMIT: usize = 20;
+const BRANCHES_PER_QUERY: usize = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PullRequestPolicy {
@@ -42,6 +42,7 @@ pub struct PullRequestRecord {
     pub number: u64,
     pub url: String,
     pub state: PullRequestState,
+    pub head_ref_name: String,
     pub head_oid: String,
     pub merged_at_unix: Option<i64>,
 }
@@ -84,7 +85,7 @@ pub(crate) fn observe_pull_requests(
     now: SystemTime,
 ) -> BTreeMap<String, PullRequestEvidence> {
     let observed_at_unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let heads = worktrees
+    let branch_heads = worktrees
         .iter()
         .filter(|worktree| {
             worktree.exists
@@ -92,11 +93,15 @@ pub(crate) fn observe_pull_requests(
                 && !worktree.detached
                 && worktree.branch.is_some()
         })
-        .filter_map(|worktree| worktree.head.clone())
+        .filter_map(|worktree| Some((worktree.branch.clone()?, worktree.head.clone()?)))
         .collect::<BTreeSet<_>>();
-    if heads.is_empty() {
+    if branch_heads.is_empty() {
         return BTreeMap::new();
     }
+    let heads = branch_heads
+        .iter()
+        .map(|(_, head)| head.clone())
+        .collect::<BTreeSet<_>>();
 
     let repositories = match github_repositories(repo) {
         Ok(repositories) => repositories,
@@ -136,10 +141,10 @@ pub(crate) fn observe_pull_requests(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let heads = heads.into_iter().collect::<Vec<_>>();
+    let branch_heads = branch_heads.into_iter().collect::<Vec<_>>();
     for repository in &repositories {
-        for batch in heads.chunks(COMMITS_PER_QUERY) {
-            match query_associated_pull_requests(repository, batch) {
+        for batch in branch_heads.chunks(BRANCHES_PER_QUERY) {
+            match query_pull_requests_for_branches(repository, batch) {
                 Ok(observations) => {
                     for (head, observation) in observations {
                         let accumulator = accumulators
@@ -151,7 +156,7 @@ pub(crate) fn observe_pull_requests(
                     }
                 }
                 Err(error) => {
-                    for head in batch {
+                    for (_, head) in batch {
                         let accumulator = accumulators
                             .get_mut(head)
                             .expect("queried head must have an accumulator");
@@ -283,11 +288,11 @@ struct QueryObservation {
     errors: Vec<String>,
 }
 
-fn query_associated_pull_requests(
+fn query_pull_requests_for_branches(
     repository: &str,
-    heads: &[String],
+    branch_heads: &[(String, String)],
 ) -> Result<BTreeMap<String, QueryObservation>> {
-    let query = build_query(repository, heads)?;
+    let query = build_query(repository, branch_heads)?;
     let output = Command::new("gh")
         .args(["api", "graphql", "-f"])
         .arg(format!("query={query}"))
@@ -298,10 +303,10 @@ fn query_associated_pull_requests(
     if !output.status.success() {
         bail!("gh api graphql failed: {}", bounded_error(&output.stderr));
     }
-    parse_query_response(repository, heads, &output.stdout)
+    parse_query_response(repository, branch_heads, &output.stdout)
 }
 
-fn build_query(repository: &str, heads: &[String]) -> Result<String> {
+fn build_query(repository: &str, branch_heads: &[(String, String)]) -> Result<String> {
     let (owner, name) = repository
         .split_once('/')
         .context("GitHub repository must be owner/name")?;
@@ -310,13 +315,13 @@ fn build_query(repository: &str, heads: &[String]) -> Result<String> {
         serde_json::to_string(owner)?,
         serde_json::to_string(name)?
     );
-    for (index, head) in heads.iter().enumerate() {
+    for (index, (branch, head)) in branch_heads.iter().enumerate() {
         if !matches!(head.len(), 40 | 64) || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("invalid Git object id {head:?}");
         }
         query.push_str(&format!(
-            " c{index}: object(oid: {}) {{ ... on Commit {{ associatedPullRequests(first: {ASSOCIATED_PULL_REQUEST_LIMIT}) {{ pageInfo {{ hasNextPage }} nodes {{ number url state mergedAt headRefOid }} }} }} }}",
-            serde_json::to_string(head)?
+            " c{index}: pullRequests(first: {PULL_REQUESTS_PER_BRANCH_LIMIT}, headRefName: {}, states: [OPEN, MERGED, CLOSED], orderBy: {{ field: UPDATED_AT, direction: DESC }}) {{ pageInfo {{ hasNextPage }} nodes {{ number url state mergedAt headRefName headRefOid }} }}",
+            serde_json::to_string(branch)?
         ));
     }
     query.push_str(" } }");
@@ -325,7 +330,7 @@ fn build_query(repository: &str, heads: &[String]) -> Result<String> {
 
 fn parse_query_response(
     repository: &str,
-    heads: &[String],
+    branch_heads: &[(String, String)],
     output: &[u8],
 ) -> Result<BTreeMap<String, QueryObservation>> {
     let value: Value =
@@ -340,26 +345,13 @@ fn parse_query_response(
         bail!("GitHub repository {repository} was not found");
     }
 
-    heads
+    branch_heads
         .iter()
         .enumerate()
-        .map(|(index, head)| {
-            let object = repository_value
+        .map(|(index, (branch, head))| {
+            let connection = repository_value
                 .get(format!("c{index}"))
-                .context("GitHub GraphQL response omitted commit alias")?;
-            if object.is_null() {
-                return Ok((
-                    head.clone(),
-                    QueryObservation {
-                        complete: true,
-                        pull_requests: Vec::new(),
-                        errors: Vec::new(),
-                    },
-                ));
-            }
-            let connection = object
-                .get("associatedPullRequests")
-                .context("GitHub commit omitted associatedPullRequests")?;
+                .context("GitHub GraphQL response omitted branch alias")?;
             let has_next_page = connection
                 .pointer("/pageInfo/hasNextPage")
                 .and_then(Value::as_bool)
@@ -371,8 +363,18 @@ fn parse_query_response(
             let mut records = Vec::new();
             let mut errors = Vec::new();
             for node in nodes {
+                let Some(node_branch) = node.get("headRefName").and_then(Value::as_str) else {
+                    errors.push("pull request omitted headRefName".to_string());
+                    continue;
+                };
+                if node_branch != branch {
+                    errors.push(format!(
+                        "branch-filtered query for {branch:?} returned {node_branch:?}"
+                    ));
+                    continue;
+                }
                 let Some(node_head) = node.get("headRefOid").and_then(Value::as_str) else {
-                    errors.push("associated PR omitted headRefOid".to_string());
+                    errors.push("pull request omitted headRefOid".to_string());
                     continue;
                 };
                 if !node_head.eq_ignore_ascii_case(head) {
@@ -430,6 +432,11 @@ fn parse_record(repository: &str, value: &Value) -> Result<PullRequestRecord> {
             .context("associated PR omitted URL")?
             .to_string(),
         state,
+        head_ref_name: value
+            .get("headRefName")
+            .and_then(Value::as_str)
+            .context("associated PR omitted headRefName")?
+            .to_string(),
         head_oid: value
             .get("headRefOid")
             .and_then(Value::as_str)
@@ -473,38 +480,39 @@ mod tests {
 
     #[test]
     fn query_parser_keeps_only_exact_head_pull_requests() -> Result<()> {
+        let branch = "wycats/feature".to_string();
         let head = "a".repeat(40);
         let other = "b".repeat(40);
         let fixture = json!({
             "data": {
                 "repository": {
                     "c0": {
-                        "associatedPullRequests": {
-                            "pageInfo": { "hasNextPage": false },
-                            "nodes": [
-                                {
-                                    "number": 12,
-                                    "url": "https://github.com/acme/repo/pull/12",
-                                    "state": "MERGED",
-                                    "mergedAt": "2026-07-20T12:00:00Z",
-                                    "headRefOid": head,
-                                },
-                                {
-                                    "number": 11,
-                                    "url": "https://github.com/acme/repo/pull/11",
-                                    "state": "MERGED",
-                                    "mergedAt": "2026-07-19T12:00:00Z",
-                                    "headRefOid": other,
-                                }
-                            ]
-                        }
+                        "pageInfo": { "hasNextPage": false },
+                        "nodes": [
+                            {
+                                "number": 12,
+                                "url": "https://github.com/acme/repo/pull/12",
+                                "state": "MERGED",
+                                "mergedAt": "2026-07-20T12:00:00Z",
+                                "headRefName": branch,
+                                "headRefOid": head,
+                            },
+                            {
+                                "number": 11,
+                                "url": "https://github.com/acme/repo/pull/11",
+                                "state": "MERGED",
+                                "mergedAt": "2026-07-19T12:00:00Z",
+                                "headRefName": branch,
+                                "headRefOid": other,
+                            }
+                        ]
                     }
                 }
             }
         });
         let parsed = parse_query_response(
             "acme/repo",
-            std::slice::from_ref(&head),
+            &[(branch, head.clone())],
             &serde_json::to_vec(&fixture)?,
         )?;
         let observation = &parsed[&head];
@@ -516,25 +524,38 @@ mod tests {
 
     #[test]
     fn query_parser_fails_closed_on_pagination() -> Result<()> {
+        let branch = "wycats/feature".to_string();
         let head = "a".repeat(40);
         let fixture = json!({
             "data": {
                 "repository": {
                     "c0": {
-                        "associatedPullRequests": {
-                            "pageInfo": { "hasNextPage": true },
-                            "nodes": []
-                        }
+                        "pageInfo": { "hasNextPage": true },
+                        "nodes": []
                     }
                 }
             }
         });
         let parsed = parse_query_response(
             "acme/repo",
-            std::slice::from_ref(&head),
+            &[(branch, head.clone())],
             &serde_json::to_vec(&fixture)?,
         )?;
         assert!(!parsed[&head].complete);
+        Ok(())
+    }
+
+    #[test]
+    fn query_uses_retained_pr_head_metadata_instead_of_commit_association() -> Result<()> {
+        let query = build_query(
+            "acme/repo",
+            &[("wycats/feature".to_string(), "a".repeat(40))],
+        )?;
+        assert!(query.contains("pullRequests(first: 20"));
+        assert!(query.contains("headRefName: \"wycats/feature\""));
+        assert!(query.contains("headRefOid"));
+        assert!(!query.contains("associatedPullRequests"));
+        assert!(!query.contains("object(oid:"));
         Ok(())
     }
 
@@ -546,6 +567,7 @@ mod tests {
                 number: 1,
                 url: "https://github.com/acme/repo/pull/1".to_string(),
                 state: PullRequestState::Merged,
+                head_ref_name: "wycats/feature".to_string(),
                 head_oid: "a".repeat(40),
                 merged_at_unix: Some(1),
             },
@@ -554,6 +576,7 @@ mod tests {
                 number: 2,
                 url: "https://github.com/acme/repo/pull/2".to_string(),
                 state: PullRequestState::Open,
+                head_ref_name: "wycats/feature".to_string(),
                 head_oid: "a".repeat(40),
                 merged_at_unix: None,
             },
