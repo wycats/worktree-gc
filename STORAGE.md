@@ -140,11 +140,49 @@ for coverage diagnosis but are explicitly non-additive because requested roots
 can discover the same repository or linked worktree.
 
 These domains remain owner-report-only: `~/.cache/local-sandbox`,
-`~/.codex/sessions`, and VS Code/Gateway storage. Generic inventory may expose
-their physical size but cannot infer liveness, pin/export state, eligibility,
-or deletion authority. Parallels is explicitly excluded from this controller.
-Any other large inventory domain remains unclassified until a repository or
-owner adapter gives it a recovery contract.
+`~/.codex/sessions` plus `~/.codex/archived_sessions`, and VS Code/Gateway
+storage. The `collect codex-sessions` adapter correlates Codex's task index
+with plain and natively compressed task files, reports compression
+configuration and marker health, and APFS-measures the physical store without
+reading transcript contents. It grants no archive, retention, compression, or
+deletion authority; Codex's native task-store compression remains the recovery
+mechanism.
+
+Generic inventory may expose these domains' physical size but cannot infer
+liveness, pin/export state, eligibility, or deletion authority. Parallels is
+explicitly excluded from this controller. Any other large inventory domain
+remains unclassified until a repository or owner adapter gives it a recovery
+contract.
+
+### Codex task-store adapter
+
+Codex owns task identity, lineage, archive state, resumption, retention, and
+compression. Filesystem age cannot reproduce that authority. The report-only
+adapter therefore reads the owner index from `state_5.sqlite` and correlates
+each indexed task with one physical `.jsonl` or `.jsonl.zst` file under the
+expected live or archived root. The transcript payload is never opened.
+
+Compression changes the physical filename while an index may retain the
+logical `.jsonl` spelling. The adapter accepts that exact owner-known pair but
+fails closed when both spellings exist, neither exists, the path changes
+roots, identity is missing from the filename, or a symlink/noncanonical path
+intervenes. Unindexed files and indexed tasks with no physical file remain
+explicit correlation failures.
+
+The report records:
+
+- explicitly configured `local_thread_store_compression` state;
+- compression-marker presence, type, size, modification time, and age;
+- temporary compression artifacts;
+- live and archived counts and physical-byte currencies;
+- plain and compressed counts and metrics;
+- age buckets derived from owner-index activity timestamps;
+- bounded traversal, correlation, and APFS-measurement completeness.
+
+This is health and coverage evidence, not an eligibility reconstruction.
+Worktree-gc does not decide which tasks are safe to compress, mutate Codex
+configuration, restart the application, alter archive state, or expose a
+session cleanup command.
 
 ## Source and rebuildable-state policy
 

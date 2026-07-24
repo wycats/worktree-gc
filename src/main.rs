@@ -6,13 +6,14 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories, cleanup_roots, collect_generated,
-    discover_repositories, execute_approved_generated, gateway_storage_report, inventory,
-    list_protections, print_cleanup, print_gateway_storage_report, print_generated_collect,
-    print_inventory, print_root_cleanup, print_root_triage, print_triage, remove_protection,
-    renew_protection, triage, triage_roots, CleanupOptions, GatewayStorageOptions,
-    GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions, PressurePolicy,
-    PullRequestPolicy, SweepLimit, SweepStrategy, SweepTool, TriageOptions,
+    add_protection, cleanup, cleanup_repositories, cleanup_roots, collect_codex_sessions,
+    collect_generated, discover_repositories, execute_approved_generated, gateway_storage_report,
+    inventory, list_protections, print_cleanup, print_codex_sessions_collect,
+    print_gateway_storage_report, print_generated_collect, print_inventory, print_root_cleanup,
+    print_root_triage, print_triage, remove_protection, renew_protection, triage, triage_roots,
+    CleanupOptions, CodexSessionCollectOptions, GatewayStorageOptions, GeneratedCollectOptions,
+    GeneratedDirConfig, InventoryOptions, PressurePolicy, PullRequestPolicy, SweepLimit,
+    SweepStrategy, SweepTool, TriageOptions, DEFAULT_CODEX_SESSION_MAX_ENTRIES,
     DEFAULT_GATEWAY_EXACT_MAX_ENTRIES, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT,
     DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
     DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
@@ -222,6 +223,25 @@ enum CollectorCommand {
             help = "Maximum entries to APFS-measure across all generated roots"
         )]
         max_entries: u64,
+    },
+    /// Report Codex task-store compression and physical-storage health
+    CodexSessions {
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Codex home to inspect (defaults to CODEX_HOME or ~/.codex)"
+        )]
+        codex_home: Option<PathBuf>,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_CODEX_SESSION_MAX_ENTRIES,
+            help = "Maximum session-store entries to discover and APFS-measure"
+        )]
+        max_entries: u64,
+
+        #[arg(long, help = "Write the complete local report as JSON")]
+        json: bool,
     },
 }
 
@@ -663,6 +683,23 @@ fn main() -> Result<()> {
                         now,
                     })?;
                     print_generated_collect(&run);
+                }
+                CollectorCommand::CodexSessions {
+                    codex_home,
+                    max_entries,
+                    json,
+                } => {
+                    let run = collect_codex_sessions(CodexSessionCollectOptions {
+                        codex_home,
+                        max_entries,
+                        now,
+                    })?;
+                    if json {
+                        serde_json::to_writer_pretty(std::io::stdout().lock(), &run.manifest)?;
+                        println!();
+                    } else {
+                        print_codex_sessions_collect(&run);
+                    }
                 }
             }
         }
@@ -1232,6 +1269,40 @@ mod tests {
             "--execute",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn codex_session_collector_has_only_report_options() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "collect",
+            "codex-sessions",
+            "--codex-home",
+            "/tmp/codex",
+            "--max-entries",
+            "99",
+            "--json",
+        ])
+        .expect("Codex session collector CLI should parse");
+        match cli.command {
+            Command::Collect {
+                command:
+                    CollectorCommand::CodexSessions {
+                        codex_home,
+                        max_entries,
+                        json,
+                    },
+            } => {
+                assert_eq!(codex_home, Some(PathBuf::from("/tmp/codex")));
+                assert_eq!(max_entries, 99);
+                assert!(json);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            Cli::try_parse_from(["worktree-gc", "collect", "codex-sessions", "--execute",])
+                .is_err()
+        );
     }
 
     #[test]

@@ -309,6 +309,35 @@ explicitly non-additive coverage totals. This command has no execution
 surface: deletion still requires a fresh cleanup manifest and the exact
 manifest/digest-bound executor.
 
+### Codex task-store compression health
+
+`collect codex-sessions` keeps Codex's task store visible in the machine
+coverage ledger without taking lifecycle authority away from Codex:
+
+```sh
+worktree-gc collect codex-sessions
+worktree-gc collect codex-sessions --json
+worktree-gc collect codex-sessions --codex-home ~/.codex --max-entries 20000
+```
+
+The collector reads only task-index metadata, filenames, file metadata, the
+explicit `local_thread_store_compression` config value, and the compression
+marker. It never reads JSONL or Zstandard transcript contents. Indexed
+`.jsonl` task paths are correlated with either their plain file or Codex's
+native `.jsonl.zst` representation, with duplicate spellings failing closed.
+
+The local manifest separates live and archived tasks, plain and compressed
+counts and physical-byte currencies, activity-age buckets, index/filesystem
+correlation errors, compression-marker age, and temporary artifacts. Missing
+or ambiguous files, symlinks, incomplete bounded traversal, malformed config,
+or incomplete APFS evidence make the report incomplete.
+
+This collector has no execution surface. It does not edit Codex configuration,
+restart Codex, compress or decompress tasks, change archive state, or delete
+files. Native Codex compression remains the recovery mechanism; this command
+only explains whether that owner-managed mechanism is configured and what
+physical state is present.
+
 ## Expiring protections
 
 Use an expiring protection when a worktree or cache is intentionally idle but
