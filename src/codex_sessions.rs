@@ -415,7 +415,8 @@ fn build_plan(
     unindexed_files.sort();
 
     let paths = disk_paths.iter().cloned().collect::<Vec<_>>();
-    let (measurements, measurement_errors) = measure_session_files(&paths, max_entries);
+    let measurement_budget = max_entries.saturating_sub(discovery.visited_entries);
+    let (measurements, measurement_errors) = measure_session_files(&paths, measurement_budget);
     errors.extend(measurement_errors);
     let mut observations = Vec::with_capacity(valid_rows.len());
     for (row, path, format) in valid_rows {
@@ -968,7 +969,11 @@ fn discover_session_files(
 fn is_temporary_artifact(path: &Path) -> bool {
     path.file_name()
         .and_then(OsStr::to_str)
-        .is_some_and(|name| name.ends_with(".tmp") || name.contains(".tmp."))
+        .is_some_and(|name| {
+            name.ends_with(".tmp")
+                || name.contains(".tmp.")
+                || name.starts_with(".rollout-compress-")
+        })
 }
 
 fn inspect_compression_configuration(
@@ -1187,27 +1192,68 @@ fn read_compression_setting_from_file(
 }
 
 fn inspect_compression_marker(path: &Path, now_unix: u64) -> CodexCompressionMarker {
+    let Some(parent) = path.parent() else {
+        return incomplete_compression_marker("compression marker has no parent directory");
+    };
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            match parent.canonicalize() {
+                Ok(canonical) if canonical == parent => {}
+                Ok(_) => {
+                    return incomplete_compression_marker(format!(
+                        "compression marker parent is noncanonical: {}",
+                        parent.display()
+                    ))
+                }
+                Err(error) => {
+                    return incomplete_compression_marker(format!(
+                        "resolve compression marker parent {}: {error}",
+                        parent.display()
+                    ))
+                }
+            }
+        }
+        Ok(_) => {
+            return incomplete_compression_marker(format!(
+                "compression marker parent is not a regular non-symlink directory: {}",
+                parent.display()
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return absent_compression_marker();
+        }
+        Err(error) => {
+            return incomplete_compression_marker(format!(
+                "inspect compression marker parent {}: {error}",
+                parent.display()
+            ))
+        }
+    }
     match fs::symlink_metadata(path) {
         Ok(metadata) => compression_marker_from_metadata(&metadata, metadata.modified(), now_unix),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CodexCompressionMarker {
-            present: false,
-            regular_file: false,
-            size_bytes: None,
-            modified_at_unix: None,
-            age_seconds: None,
-            error: None,
-        },
-        Err(error) => CodexCompressionMarker {
-            present: false,
-            regular_file: false,
-            size_bytes: None,
-            modified_at_unix: None,
-            age_seconds: None,
-            error: Some(format!(
-                "inspect compression marker {}: {error}",
-                path.display()
-            )),
-        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => absent_compression_marker(),
+        Err(error) => incomplete_compression_marker(format!(
+            "inspect compression marker {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn absent_compression_marker() -> CodexCompressionMarker {
+    CodexCompressionMarker {
+        present: false,
+        regular_file: false,
+        size_bytes: None,
+        modified_at_unix: None,
+        age_seconds: None,
+        error: None,
+    }
+}
+
+fn incomplete_compression_marker(error: impl Into<String>) -> CodexCompressionMarker {
+    CodexCompressionMarker {
+        error: Some(error.into()),
+        ..absent_compression_marker()
     }
 }
 
@@ -1659,12 +1705,13 @@ mod tests {
         fs::write(live.join("2026/07/13/live.jsonl"), b"live").unwrap();
         fs::write(archived.join("archived.jsonl.zst"), b"archived").unwrap();
         fs::write(archived.join("rollout.tmp"), b"partial").unwrap();
+        fs::write(archived.join(".rollout-compress-interrupted"), b"partial").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&archived, live.join("linked")).unwrap();
 
         let discovery = discover_session_files(&live, &archived, 100).unwrap();
         assert_eq!(discovery.files.len(), 2);
-        assert_eq!(discovery.temporary_artifacts.len(), 1);
+        assert_eq!(discovery.temporary_artifacts.len(), 2);
         #[cfg(unix)]
         assert!(!discovery.complete);
 
@@ -1699,6 +1746,23 @@ mod tests {
         assert!(!measurements.contains_key(&missing));
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn discovery_and_measurement_share_one_entry_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("sessions");
+        let archived = temp.path().join("archived_sessions");
+        fs::create_dir(&live).unwrap();
+        fs::write(live.join("unindexed.jsonl"), b"rollout").unwrap();
+
+        let (plan, _) = build_plan(Vec::new(), None, &live, &archived, 1, 100).unwrap();
+        assert_eq!(plan.discovery_visited_entries, 1);
+        assert!(plan.errors.iter().any(|error| {
+            error.contains("shared entry budget was exhausted") && error.contains("unindexed.jsonl")
+        }));
+        assert!(!plan.complete);
+        assert!(!plan.unindexed.metrics.private_reclaimable_complete);
     }
 
     #[cfg(unix)]
@@ -1915,6 +1979,23 @@ mod tests {
         assert!(marker.regular_file);
         assert_eq!(marker.modified_at_unix, None);
         assert!(marker.error.unwrap().contains("timestamp unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compression_marker_rejects_a_symlinked_parent_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let external = root.join("external");
+        let linked_parent = root.join(".tmp");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("rollout-compression.lock"), b"lock").unwrap();
+        std::os::unix::fs::symlink(&external, &linked_parent).unwrap();
+
+        let marker =
+            inspect_compression_marker(&linked_parent.join("rollout-compression.lock"), 100);
+        assert!(!marker.regular_file);
+        assert!(marker.error.unwrap().contains("non-symlink directory"));
     }
 
     #[test]
