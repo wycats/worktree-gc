@@ -209,7 +209,7 @@ pub fn collect_codex_sessions(
     let codex_home = options.codex_home.map_or_else(default_codex_home, Ok)?;
     let codex_home = canonical_real_directory(&codex_home, "Codex home")?;
     let sessions_root = canonical_real_directory(&codex_home.join("sessions"), "Codex sessions")?;
-    let archived_sessions_root = canonical_real_directory(
+    let archived_sessions_root = canonical_real_or_absent_directory(
         &codex_home.join("archived_sessions"),
         "Codex archived sessions",
     )?;
@@ -288,17 +288,19 @@ pub fn print_codex_sessions_collect(run: &CodexSessionCollectRun) {
     println!("action: {:?} — {}", plan.action, plan.reason);
     println!("compression: {:?} — {}", health.status, health.reason);
     println!(
-        "live tasks: {} total, {} compressed | {} private | {} allocated",
+        "live tasks: {} total, {} compressed | {} private{} | {} allocated",
         plan.live.count,
         plan.live.compressed_count,
         format_bytes(plan.live.metrics.private_reclaimable_bytes),
+        private_measurement_qualifier(&plan.live.metrics),
         format_bytes(plan.live.metrics.allocated_bytes)
     );
     println!(
-        "archived tasks: {} total, {} compressed | {} private | {} allocated",
+        "archived tasks: {} total, {} compressed | {} private{} | {} allocated",
         plan.archived.count,
         plan.archived.compressed_count,
         format_bytes(plan.archived.metrics.private_reclaimable_bytes),
+        private_measurement_qualifier(&plan.archived.metrics),
         format_bytes(plan.archived.metrics.allocated_bytes)
     );
     println!(
@@ -370,38 +372,15 @@ fn build_plan(
         .iter()
         .map(|(_, path, _)| path.clone())
         .collect::<Vec<_>>();
-    let report = if paths.is_empty() {
-        None
-    } else {
-        Some(inventory(
-            &paths,
-            InventoryOptions {
-                display_depth: 0,
-                top: 1,
-                max_entries,
-                one_filesystem: true,
-            },
-        )?)
-    };
-    let mut measurements = report
-        .as_ref()
-        .into_iter()
-        .flat_map(|report| &report.roots)
-        .map(|root| (root.path.clone(), root))
-        .collect::<BTreeMap<_, _>>();
+    let (mut measurements, measurement_errors) = measure_session_files(&paths, max_entries);
+    errors.extend(measurement_errors);
     let mut observations = Vec::with_capacity(valid_rows.len());
     for (row, path, format) in valid_rows {
         let measurement = measurements.remove(&path);
         let metrics = measurement
             .as_ref()
-            .map(|root| root.metrics.clone())
+            .cloned()
             .unwrap_or_else(incomplete_metrics);
-        if measurement.is_none_or(|root| !root.complete || !root.errors.is_empty()) {
-            errors.push(format!(
-                "bounded inventory did not completely measure thread {}",
-                row.id
-            ));
-        }
         let archived = row.archived == 1;
         let activity = if archived {
             row.archived_at.unwrap_or(row.updated_at)
@@ -704,20 +683,95 @@ fn add_metrics(total: &mut InventoryMetrics, metrics: &InventoryMetrics) {
     total.errors = total.errors.saturating_add(metrics.errors);
 }
 
+fn measure_session_files(
+    paths: &[PathBuf],
+    max_entries: u64,
+) -> (BTreeMap<PathBuf, InventoryMetrics>, Vec<String>) {
+    let mut remaining_entries = max_entries;
+    let mut measurements = BTreeMap::new();
+    let mut errors = Vec::new();
+    for path in paths {
+        if remaining_entries == 0 {
+            errors.push(format!(
+                "bounded inventory did not measure {} because its shared entry budget was exhausted",
+                path.display()
+            ));
+            continue;
+        }
+        let report = inventory(
+            std::slice::from_ref(path),
+            InventoryOptions {
+                display_depth: 0,
+                top: 1,
+                max_entries: remaining_entries,
+                one_filesystem: true,
+            },
+        );
+        match report {
+            Ok(report) => {
+                let Some(root) = report.roots.into_iter().next() else {
+                    remaining_entries = remaining_entries.saturating_sub(1);
+                    errors.push(format!(
+                        "bounded inventory returned no measurement for {}",
+                        path.display()
+                    ));
+                    continue;
+                };
+                remaining_entries = remaining_entries.saturating_sub(root.visited_entries.max(1));
+                if !root.complete || !root.errors.is_empty() {
+                    errors.push(format!(
+                        "bounded inventory did not completely measure {}",
+                        path.display()
+                    ));
+                }
+                measurements.insert(path.clone(), root.metrics);
+            }
+            Err(error) => {
+                // Codex may archive, compress, or delete a rollout after the
+                // index and directory snapshots. Preserve the rest of the
+                // advisory report and make this exact file incomplete.
+                remaining_entries = remaining_entries.saturating_sub(1);
+                errors.push(format!("measure Codex rollout {}: {error}", path.display()));
+            }
+        }
+    }
+    (measurements, errors)
+}
+
 fn discover_session_files(
     sessions_root: &Path,
     archived_sessions_root: &Path,
     max_entries: u64,
 ) -> Result<DiscoveredSessionStore> {
-    let mut queue = VecDeque::from([
-        sessions_root.to_path_buf(),
-        archived_sessions_root.to_path_buf(),
-    ]);
+    let mut queue = VecDeque::from([sessions_root.to_path_buf()]);
     let mut files = Vec::new();
     let mut temporary_artifacts = Vec::new();
     let mut errors = Vec::new();
     let mut visited_entries = 0_u64;
     let mut complete = true;
+    match fs::symlink_metadata(archived_sessions_root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            queue.push_back(archived_sessions_root.to_path_buf());
+        }
+        Ok(_) => {
+            errors.push(format!(
+                "Codex archived sessions is not a non-symlink directory: {}",
+                archived_sessions_root.display()
+            ));
+            complete = false;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Codex does not create this directory until the first task is
+            // archived. Its absence is a complete, empty archived store.
+        }
+        Err(error) => {
+            errors.push(format!(
+                "inspect Codex archived sessions {}: {error}",
+                archived_sessions_root.display()
+            ));
+            complete = false;
+        }
+    }
     while let Some(directory) = queue.pop_front() {
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
@@ -774,6 +828,9 @@ fn discover_session_files(
             }
         }
         if visited_entries >= max_entries {
+            if !queue.is_empty() {
+                complete = false;
+            }
             break;
         }
     }
@@ -947,7 +1004,7 @@ fn query_threads(
         .stdin(Stdio::null())
         .output();
     match output {
-        Ok(output) if output.status.success() => match serde_json::from_slice(&output.stdout) {
+        Ok(output) if output.status.success() => match parse_thread_rows(&output.stdout) {
             Ok(rows) => (rows, Some(sqlite), version, None),
             Err(error) => (
                 Vec::new(),
@@ -974,6 +1031,14 @@ fn query_threads(
     }
 }
 
+fn parse_thread_rows(output: &[u8]) -> serde_json::Result<Vec<ThreadRow>> {
+    if output.iter().all(u8::is_ascii_whitespace) {
+        Ok(Vec::new())
+    } else {
+        serde_json::from_slice(output)
+    }
+}
+
 fn canonical_real_directory(path: &Path, label: &str) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspect {label} {}", path.display()))?;
@@ -984,6 +1049,33 @@ fn canonical_real_directory(path: &Path, label: &str) -> Result<PathBuf> {
     );
     path.canonicalize()
         .with_context(|| format!("resolve {label} {}", path.display()))
+}
+
+fn canonical_real_or_absent_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(path.to_path_buf());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {label} {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "{label} is not a non-symlink directory: {}",
+        path.display()
+    );
+    path.canonicalize()
+        .with_context(|| format!("resolve {label} {}", path.display()))
+}
+
+fn private_measurement_qualifier(metrics: &InventoryMetrics) -> &'static str {
+    if metrics.private_reclaimable_complete {
+        ""
+    } else {
+        " (lower bound)"
+    }
 }
 
 fn find_executable(name: &OsStr) -> Option<PathBuf> {
@@ -1128,6 +1220,24 @@ mod tests {
     }
 
     #[test]
+    fn absent_archived_sessions_directory_is_a_complete_empty_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("sessions");
+        let archived = temp.path().join("archived_sessions");
+        fs::create_dir(&live).unwrap();
+        fs::write(live.join("rollout-live.jsonl"), b"live").unwrap();
+
+        assert_eq!(
+            canonical_real_or_absent_directory(&archived, "Codex archived sessions").unwrap(),
+            archived
+        );
+        let discovery = discover_session_files(&live, &archived, 10).unwrap();
+        assert!(discovery.complete);
+        assert_eq!(discovery.files, vec![live.join("rollout-live.jsonl")]);
+        assert!(discovery.errors.is_empty());
+    }
+
+    #[test]
     fn session_discovery_is_bounded_and_keeps_symlinks_opaque() {
         let temp = tempfile::tempdir().unwrap();
         let live = temp.path().join("sessions");
@@ -1148,6 +1258,50 @@ mod tests {
 
         let discovery = discover_session_files(&live, &archived, 1).unwrap();
         assert!(!discovery.complete);
+    }
+
+    #[test]
+    fn session_discovery_marks_queued_directories_incomplete_at_the_exact_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("sessions");
+        let archived = temp.path().join("archived_sessions");
+        fs::create_dir_all(live.join("queued")).unwrap();
+
+        let discovery = discover_session_files(&live, &archived, 1).unwrap();
+        assert_eq!(discovery.visited_entries, 1);
+        assert!(!discovery.complete);
+        assert!(discovery.files.is_empty());
+    }
+
+    #[test]
+    fn measurement_races_preserve_surviving_metrics_and_record_the_missing_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing.jsonl");
+        let missing = temp.path().join("missing.jsonl");
+        fs::write(&existing, b"existing").unwrap();
+        let existing = existing.canonicalize().unwrap();
+
+        let (measurements, errors) =
+            measure_session_files(&[existing.clone(), missing.clone()], 10);
+        assert!(measurements.contains_key(&existing));
+        assert!(!measurements.contains_key(&missing));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn empty_sqlite_json_output_is_an_empty_thread_index() {
+        assert!(parse_thread_rows(b"").unwrap().is_empty());
+        assert!(parse_thread_rows(b" \n\t").unwrap().is_empty());
+    }
+
+    #[test]
+    fn incomplete_private_measurements_are_labeled_as_lower_bounds() {
+        assert_eq!(private_measurement_qualifier(&metrics(1)), "");
+        assert_eq!(
+            private_measurement_qualifier(&incomplete_metrics()),
+            " (lower bound)"
+        );
     }
 
     #[test]
