@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -225,6 +225,12 @@ struct CompressionConfigInspection {
     selected_profile: Option<String>,
     profile_config_path: Option<PathBuf>,
     discovered_profile_config_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PhysicalFileIdentity {
+    volume: u64,
+    file: u64,
 }
 
 pub fn collect_codex_sessions(
@@ -768,12 +774,31 @@ fn measure_session_files(
     let mut remaining_entries = max_entries;
     let mut measurements = BTreeMap::new();
     let mut errors = Vec::new();
+    let mut measured_files = BTreeSet::new();
     for path in paths {
         if remaining_entries == 0 {
             errors.push(format!(
                 "bounded inventory did not measure {} because its shared entry budget was exhausted",
                 path.display()
             ));
+            continue;
+        }
+        let identity = match fs::symlink_metadata(path) {
+            Ok(metadata) => physical_file_identity(&metadata),
+            Err(error) => {
+                remaining_entries = remaining_entries.saturating_sub(1);
+                errors.push(format!(
+                    "inspect Codex rollout identity {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if identity.is_some_and(|identity| !measured_files.insert(identity)) {
+            remaining_entries = remaining_entries.saturating_sub(1);
+            let mut metrics = empty_metrics();
+            metrics.hardlink_duplicates = 1;
+            measurements.insert(path.clone(), metrics);
             continue;
         }
         let report = inventory(
@@ -814,6 +839,21 @@ fn measure_session_files(
         }
     }
     (measurements, errors)
+}
+
+#[cfg(unix)]
+fn physical_file_identity(metadata: &fs::Metadata) -> Option<PhysicalFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(PhysicalFileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn physical_file_identity(_metadata: &fs::Metadata) -> Option<PhysicalFileIdentity> {
+    None
 }
 
 fn discover_session_files(
@@ -1025,6 +1065,8 @@ fn discover_profile_config_paths(codex_home: &Path) -> (Vec<PathBuf>, Option<Str
 }
 
 fn codex_profile_config_path(codex_home: &Path, profile: &str) -> Result<PathBuf> {
+    // Codex CLI's CONFIG_PROFILE_V2 contract layers this sibling file over
+    // config.toml; legacy in-file profile tables are not the `--profile` input.
     anyhow::ensure!(
         !profile.is_empty()
             && !profile.contains(['/', '\\', '\0'])
@@ -1146,21 +1188,7 @@ fn read_compression_setting_from_file(
 
 fn inspect_compression_marker(path: &Path, now_unix: u64) -> CodexCompressionMarker {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            let modified_at_unix = metadata.modified().ok().map(unix_seconds);
-            CodexCompressionMarker {
-                present: true,
-                regular_file: metadata.is_file() && !metadata.file_type().is_symlink(),
-                size_bytes: Some(metadata.len()),
-                modified_at_unix,
-                age_seconds: modified_at_unix.map(|modified| now_unix.saturating_sub(modified)),
-                error: if metadata.is_file() && !metadata.file_type().is_symlink() {
-                    None
-                } else {
-                    Some("compression marker is not a regular non-symlink file".to_string())
-                },
-            }
-        }
+        Ok(metadata) => compression_marker_from_metadata(&metadata, metadata.modified(), now_unix),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => CodexCompressionMarker {
             present: false,
             regular_file: false,
@@ -1180,6 +1208,37 @@ fn inspect_compression_marker(path: &Path, now_unix: u64) -> CodexCompressionMar
                 path.display()
             )),
         },
+    }
+}
+
+fn compression_marker_from_metadata(
+    metadata: &fs::Metadata,
+    modified: io::Result<SystemTime>,
+    now_unix: u64,
+) -> CodexCompressionMarker {
+    let regular_file = metadata.is_file() && !metadata.file_type().is_symlink();
+    let (modified_at_unix, modified_error) = match modified {
+        Ok(modified) => (Some(unix_seconds(modified)), None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "read compression marker modification time: {error}"
+            )),
+        ),
+    };
+    let type_error =
+        (!regular_file).then(|| "compression marker is not a regular non-symlink file".to_string());
+    let error = [type_error, modified_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    CodexCompressionMarker {
+        present: true,
+        regular_file,
+        size_bytes: Some(metadata.len()),
+        modified_at_unix,
+        age_seconds: modified_at_unix.map(|modified| now_unix.saturating_sub(modified)),
+        error: (!error.is_empty()).then(|| error.join("; ")),
     }
 }
 
@@ -1228,7 +1287,11 @@ fn query_threads(
     Option<String>,
     Option<String>,
 ) {
-    let Some(sqlite) = find_executable(OsStr::new("sqlite3")) else {
+    let database = match canonical_state_database(database) {
+        Ok(database) => database,
+        Err(error) => return (Vec::new(), None, None, Some(error)),
+    };
+    let Some(sqlite) = resolve_executable(OsStr::new("sqlite3")) else {
         return (
             Vec::new(),
             None,
@@ -1236,30 +1299,18 @@ fn query_threads(
             Some("sqlite3 is not available on PATH".into()),
         );
     };
-    let sqlite = sqlite.canonicalize().unwrap_or(sqlite);
-    let version = Command::new(&sqlite)
+    let version = sqlite_command(&sqlite)
         .arg("--version")
         .stdin(Stdio::null())
         .output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    if !database.is_file() {
-        return (
-            Vec::new(),
-            Some(sqlite),
-            version,
-            Some(format!(
-                "Codex state database is missing: {}",
-                database.display()
-            )),
-        );
-    }
     let query = "SELECT id, rollout_path, created_at, updated_at, archived, archived_at \
                  FROM threads ORDER BY id";
-    let output = Command::new(&sqlite)
+    let output = sqlite_command(&sqlite)
         .args(["-readonly", "-json"])
-        .arg(database)
+        .arg(&database)
         .arg(query)
         .stdin(Stdio::null())
         .output();
@@ -1289,6 +1340,43 @@ fn query_threads(
             Some(format!("launch sqlite3: {error}")),
         ),
     }
+}
+
+fn canonical_state_database(path: &Path) -> std::result::Result<PathBuf, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect Codex state database {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Codex state database is not a regular non-symlink file: {}",
+            path.display()
+        ));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("resolve Codex state database {}: {error}", path.display()))?;
+    if canonical != path {
+        return Err(format!(
+            "Codex state database is noncanonical: {}",
+            path.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn sqlite_command(sqlite: &Path) -> Command {
+    let mut command = Command::new(sqlite);
+    command.arg("-init").arg(sqlite_empty_init_path());
+    command
+}
+
+#[cfg(windows)]
+fn sqlite_empty_init_path() -> &'static Path {
+    Path::new("NUL")
+}
+
+#[cfg(not(windows))]
+fn sqlite_empty_init_path() -> &'static Path {
+    Path::new("/dev/null")
 }
 
 fn parse_thread_rows(output: &[u8]) -> serde_json::Result<Vec<ThreadRow>> {
@@ -1338,10 +1426,58 @@ fn private_measurement_qualifier(metrics: &InventoryMetrics) -> &'static str {
     }
 }
 
-fn find_executable(name: &OsStr) -> Option<PathBuf> {
-    env::split_paths(&env::var_os("PATH")?)
-        .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+fn resolve_executable(name: &OsStr) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    resolve_executable_in_path(name, &path)
+}
+
+fn resolve_executable_in_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    for directory in env::split_paths(path) {
+        for candidate in executable_candidates(&directory, name) {
+            if is_platform_executable(&candidate) {
+                return candidate.canonicalize().ok();
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn executable_candidates(directory: &Path, name: &OsStr) -> Vec<PathBuf> {
+    let name = Path::new(name);
+    if name.extension().is_some() {
+        return vec![directory.join(name)];
+    }
+    let extensions = env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    env::split_paths(&extensions)
+        .map(|extension| {
+            let extension = extension.to_string_lossy();
+            directory.join(format!("{}{}", name.to_string_lossy(), extension))
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn executable_candidates(directory: &Path, name: &OsStr) -> Vec<PathBuf> {
+    vec![directory.join(name)]
+}
+
+#[cfg(unix)]
+fn is_platform_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn is_platform_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_platform_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn default_codex_home() -> Result<PathBuf> {
@@ -1565,6 +1701,26 @@ mod tests {
         assert!(errors[0].contains(&missing.display().to_string()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn session_measurements_deduplicate_hard_linked_rollouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.jsonl");
+        let second = temp.path().join("second.jsonl");
+        fs::write(&first, vec![0_u8; 4096]).unwrap();
+        fs::hard_link(&first, &second).unwrap();
+        let first = first.canonicalize().unwrap();
+        let second = second.canonicalize().unwrap();
+
+        let (measurements, errors) = measure_session_files(&[first.clone(), second.clone()], 10);
+        assert!(errors.is_empty());
+        assert_eq!(measurements[&first].files, 1);
+        assert!(measurements[&first].allocated_bytes >= 4096);
+        assert_eq!(measurements[&second].files, 0);
+        assert_eq!(measurements[&second].allocated_bytes, 0);
+        assert_eq!(measurements[&second].hardlink_duplicates, 1);
+    }
+
     #[test]
     fn empty_sqlite_json_output_is_an_empty_thread_index() {
         assert!(parse_thread_rows(b"").unwrap().is_empty());
@@ -1688,6 +1844,77 @@ mod tests {
         assert!(inspect_compression_configuration(&root, &base, Some("../other")).is_err());
         let inspection = inspect_compression_configuration(&root, &base, Some("missing")).unwrap();
         assert!(inspection.error.unwrap().contains("missing.config.toml"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_database_must_be_a_canonical_regular_non_symlink_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let real = root.join("real.sqlite");
+        let linked = root.join("state_5.sqlite");
+        fs::write(&real, b"database").unwrap();
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+        assert!(canonical_state_database(&linked)
+            .unwrap_err()
+            .contains("non-symlink"));
+        assert_eq!(
+            canonical_state_database(&real).unwrap(),
+            real.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn sqlite_commands_disable_user_startup_files() {
+        let command = sqlite_command(Path::new("sqlite3"));
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![OsStr::new("-init"), sqlite_empty_init_path().as_os_str()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_resolution_skips_non_executable_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let blocked = first.join("sqlite3");
+        let executable = second.join("sqlite3");
+        fs::write(&blocked, b"not executable").unwrap();
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = env::join_paths([first, second]).unwrap();
+
+        assert_eq!(
+            resolve_executable_in_path(OsStr::new("sqlite3"), &path),
+            Some(executable.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn compression_marker_timestamp_errors_are_incomplete_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("marker");
+        fs::write(&marker, b"lock").unwrap();
+        let metadata = fs::symlink_metadata(&marker).unwrap();
+
+        let marker = compression_marker_from_metadata(
+            &metadata,
+            Err(io::Error::other("timestamp unavailable")),
+            100,
+        );
+        assert!(marker.present);
+        assert!(marker.regular_file);
+        assert_eq!(marker.modified_at_unix, None);
+        assert!(marker.error.unwrap().contains("timestamp unavailable"));
     }
 
     #[test]
