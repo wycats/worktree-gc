@@ -12,13 +12,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CODEX_SESSION_MANIFEST_VERSION: u64 = 2;
+const CODEX_SESSION_MANIFEST_VERSION: u64 = 3;
 const TOP_SESSION_LIMIT: usize = 30;
 pub const DEFAULT_CODEX_SESSION_MAX_ENTRIES: u64 = 20_000;
 
 #[derive(Debug, Clone)]
 pub struct CodexSessionCollectOptions {
     pub codex_home: Option<PathBuf>,
+    pub profile: Option<String>,
     pub max_entries: u64,
     pub now: SystemTime,
 }
@@ -27,6 +28,7 @@ impl Default for CodexSessionCollectOptions {
     fn default() -> Self {
         Self {
             codex_home: None,
+            profile: None,
             max_entries: DEFAULT_CODEX_SESSION_MAX_ENTRIES,
             now: SystemTime::now(),
         }
@@ -59,6 +61,9 @@ pub struct CodexSessionIdentity {
     pub archived_sessions_root: PathBuf,
     pub state_database: PathBuf,
     pub config_path: PathBuf,
+    pub selected_profile: Option<String>,
+    pub profile_config_path: Option<PathBuf>,
+    pub discovered_profile_config_paths: Vec<PathBuf>,
     pub compression_marker_path: PathBuf,
     pub sqlite_executable: Option<PathBuf>,
     pub sqlite_version: Option<String>,
@@ -120,12 +125,23 @@ pub struct CodexSessionPlan {
     pub discovery_visited_entries: u64,
     pub live: CodexSessionSummary,
     pub archived: CodexSessionSummary,
+    pub unindexed: CodexUnindexedSummary,
     pub format_summaries: Vec<CodexSessionFormatSummary>,
     pub age_buckets: Vec<CodexSessionAgeBucket>,
     pub largest_sessions: Vec<CodexSessionObservation>,
     pub missing_files: Vec<PathBuf>,
     pub unindexed_files: Vec<PathBuf>,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CodexUnindexedSummary {
+    pub count: u64,
+    pub live_count: u64,
+    pub archived_count: u64,
+    pub plain_count: u64,
+    pub compressed_count: u64,
+    pub metrics: InventoryMetrics,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -202,13 +218,23 @@ struct DiscoveredSessionStore {
     errors: Vec<String>,
 }
 
+#[derive(Debug)]
+struct CompressionConfigInspection {
+    configured_enabled: Option<bool>,
+    error: Option<String>,
+    selected_profile: Option<String>,
+    profile_config_path: Option<PathBuf>,
+    discovered_profile_config_paths: Vec<PathBuf>,
+}
+
 pub fn collect_codex_sessions(
     options: CodexSessionCollectOptions,
 ) -> Result<CodexSessionCollectRun> {
     anyhow::ensure!(options.max_entries > 0, "max_entries must be at least 1");
     let codex_home = options.codex_home.map_or_else(default_codex_home, Ok)?;
     let codex_home = canonical_real_directory(&codex_home, "Codex home")?;
-    let sessions_root = canonical_real_directory(&codex_home.join("sessions"), "Codex sessions")?;
+    let sessions_root =
+        canonical_real_or_absent_directory(&codex_home.join("sessions"), "Codex sessions")?;
     let archived_sessions_root = canonical_real_or_absent_directory(
         &codex_home.join("archived_sessions"),
         "Codex archived sessions",
@@ -217,12 +243,17 @@ pub fn collect_codex_sessions(
     let config_path = codex_home.join("config.toml");
     let compression_marker_path = codex_home.join(".tmp/rollout-compression.lock");
     let (rows, sqlite_executable, sqlite_version, state_error) = query_threads(&state_database);
+    let config =
+        inspect_compression_configuration(&codex_home, &config_path, options.profile.as_deref())?;
     let identity = CodexSessionIdentity {
         codex_home,
         sessions_root: sessions_root.clone(),
         archived_sessions_root: archived_sessions_root.clone(),
         state_database,
         config_path: config_path.clone(),
+        selected_profile: config.selected_profile,
+        profile_config_path: config.profile_config_path,
+        discovered_profile_config_paths: config.discovered_profile_config_paths,
         compression_marker_path: compression_marker_path.clone(),
         sqlite_executable,
         sqlite_version,
@@ -237,11 +268,10 @@ pub fn collect_codex_sessions(
         options.max_entries,
         now_unix,
     )?;
-    let (configured_enabled, config_error) = read_compression_setting(&config_path);
     let marker = inspect_compression_marker(&compression_marker_path, now_unix);
     let compression_health = compression_health(
-        configured_enabled,
-        config_error,
+        config.configured_enabled,
+        config.error,
         marker,
         temporary_artifacts,
         plan.complete,
@@ -302,6 +332,16 @@ pub fn print_codex_sessions_collect(run: &CodexSessionCollectRun) {
         format_bytes(plan.archived.metrics.private_reclaimable_bytes),
         private_measurement_qualifier(&plan.archived.metrics),
         format_bytes(plan.archived.metrics.allocated_bytes)
+    );
+    println!(
+        "unindexed rollouts: {} total ({} live, {} archived), {} compressed | {} private{} | {} allocated",
+        plan.unindexed.count,
+        plan.unindexed.live_count,
+        plan.unindexed.archived_count,
+        plan.unindexed.compressed_count,
+        format_bytes(plan.unindexed.metrics.private_reclaimable_bytes),
+        private_measurement_qualifier(&plan.unindexed.metrics),
+        format_bytes(plan.unindexed.metrics.allocated_bytes)
     );
     println!(
         "correlation: {} missing files | {} unindexed files | {} temporary artifacts | {} errors",
@@ -368,17 +408,13 @@ fn build_plan(
         .collect::<Vec<_>>();
     unindexed_files.sort();
 
-    let paths = valid_rows
-        .iter()
-        .map(|(_, path, _)| path.clone())
-        .collect::<Vec<_>>();
-    let (mut measurements, measurement_errors) = measure_session_files(&paths, max_entries);
+    let paths = disk_paths.iter().cloned().collect::<Vec<_>>();
+    let (measurements, measurement_errors) = measure_session_files(&paths, max_entries);
     errors.extend(measurement_errors);
     let mut observations = Vec::with_capacity(valid_rows.len());
     for (row, path, format) in valid_rows {
-        let measurement = measurements.remove(&path);
-        let metrics = measurement
-            .as_ref()
+        let metrics = measurements
+            .get(&path)
             .cloned()
             .unwrap_or_else(incomplete_metrics);
         let archived = row.archived == 1;
@@ -399,6 +435,12 @@ fn build_plan(
             metrics,
         });
     }
+    let unindexed = summarize_unindexed(
+        &unindexed_files,
+        &measurements,
+        sessions_root,
+        archived_sessions_root,
+    );
     let live = summarize(
         observations
             .iter()
@@ -452,6 +494,7 @@ fn build_plan(
             discovery_visited_entries: discovery.visited_entries,
             live,
             archived,
+            unindexed,
             format_summaries,
             age_buckets,
             largest_sessions,
@@ -588,6 +631,41 @@ fn summarize<'a>(
         }
         summary
     })
+}
+
+fn summarize_unindexed(
+    paths: &[PathBuf],
+    measurements: &BTreeMap<PathBuf, InventoryMetrics>,
+    sessions_root: &Path,
+    archived_sessions_root: &Path,
+) -> CodexUnindexedSummary {
+    let mut summary = CodexUnindexedSummary {
+        metrics: empty_metrics(),
+        ..CodexUnindexedSummary::default()
+    };
+    for path in paths {
+        summary.count = summary.count.saturating_add(1);
+        if path.starts_with(archived_sessions_root) {
+            summary.archived_count = summary.archived_count.saturating_add(1);
+        } else if path.starts_with(sessions_root) {
+            summary.live_count = summary.live_count.saturating_add(1);
+        }
+        match session_file_format(path) {
+            Some(CodexSessionFileFormat::Jsonl) => {
+                summary.plain_count = summary.plain_count.saturating_add(1);
+            }
+            Some(CodexSessionFileFormat::JsonlZstd) => {
+                summary.compressed_count = summary.compressed_count.saturating_add(1);
+            }
+            None => {}
+        }
+        let metrics = measurements
+            .get(path)
+            .cloned()
+            .unwrap_or_else(incomplete_metrics);
+        add_metrics(&mut summary.metrics, &metrics);
+    }
+    summary
 }
 
 fn empty_summary() -> CodexSessionSummary {
@@ -743,33 +821,35 @@ fn discover_session_files(
     archived_sessions_root: &Path,
     max_entries: u64,
 ) -> Result<DiscoveredSessionStore> {
-    let mut queue = VecDeque::from([sessions_root.to_path_buf()]);
+    let mut queue = VecDeque::new();
     let mut files = Vec::new();
     let mut temporary_artifacts = Vec::new();
     let mut errors = Vec::new();
     let mut visited_entries = 0_u64;
     let mut complete = true;
-    match fs::symlink_metadata(archived_sessions_root) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            queue.push_back(archived_sessions_root.to_path_buf());
-        }
-        Ok(_) => {
-            errors.push(format!(
-                "Codex archived sessions is not a non-symlink directory: {}",
-                archived_sessions_root.display()
-            ));
-            complete = false;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Codex does not create this directory until the first task is
-            // archived. Its absence is a complete, empty archived store.
-        }
-        Err(error) => {
-            errors.push(format!(
-                "inspect Codex archived sessions {}: {error}",
-                archived_sessions_root.display()
-            ));
-            complete = false;
+    for (root, label) in [
+        (sessions_root, "Codex sessions"),
+        (archived_sessions_root, "Codex archived sessions"),
+    ] {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                queue.push_back(root.to_path_buf());
+            }
+            Ok(_) => {
+                errors.push(format!(
+                    "{label} is not a non-symlink directory: {}",
+                    root.display()
+                ));
+                complete = false;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Codex creates each store lazily. Absence is a complete,
+                // empty physical root for a fresh installation.
+            }
+            Err(error) => {
+                errors.push(format!("inspect {label} {}: {error}", root.display()));
+                complete = false;
+            }
         }
     }
     while let Some(directory) = queue.pop_front() {
@@ -851,10 +931,179 @@ fn is_temporary_artifact(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".tmp") || name.contains(".tmp."))
 }
 
-fn read_compression_setting(config_path: &Path) -> (Option<bool>, Option<String>) {
+fn inspect_compression_configuration(
+    codex_home: &Path,
+    config_path: &Path,
+    profile: Option<&str>,
+) -> Result<CompressionConfigInspection> {
+    let (discovered_profile_config_paths, profile_discovery_error) =
+        discover_profile_config_paths(codex_home);
+    let selected_profile = profile.map(str::to_owned);
+    let profile_config_path = profile
+        .map(|profile| codex_profile_config_path(codex_home, profile))
+        .transpose()?;
+    let (configured_enabled, config_read_error) =
+        read_compression_setting(config_path, profile_config_path.as_deref());
+    let selection_error = if profile.is_none() && !discovered_profile_config_paths.is_empty() {
+        Some(format!(
+                "Codex profile selection is unknown while {} profile config file(s) exist; pass --profile NAME to inspect the effective layered configuration",
+                discovered_profile_config_paths.len()
+            ))
+    } else {
+        None
+    };
+    let error = [profile_discovery_error, config_read_error, selection_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok(CompressionConfigInspection {
+        configured_enabled,
+        error: (!error.is_empty()).then(|| error.join("; ")),
+        selected_profile,
+        profile_config_path,
+        discovered_profile_config_paths,
+    })
+}
+
+fn discover_profile_config_paths(codex_home: &Path) -> (Vec<PathBuf>, Option<String>) {
+    let entries = match fs::read_dir(codex_home) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "discover Codex profile configs in {}: {error}",
+                    codex_home.display()
+                )),
+            )
+        }
+    };
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!("read Codex profile config entry: {error}"));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".config.toml"))
+        {
+            continue;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                match path.canonicalize() {
+                    Ok(resolved) if resolved == path => paths.push(path),
+                    Ok(_) => errors.push(format!(
+                        "Codex profile config is noncanonical: {}",
+                        path.display()
+                    )),
+                    Err(error) => errors.push(format!(
+                        "resolve Codex profile config {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+            Ok(_) => errors.push(format!(
+                "Codex profile config is not a regular non-symlink file: {}",
+                path.display()
+            )),
+            Err(error) => errors.push(format!(
+                "inspect Codex profile config {}: {error}",
+                path.display()
+            )),
+        }
+    }
+    paths.sort();
+    (paths, (!errors.is_empty()).then(|| errors.join("; ")))
+}
+
+fn codex_profile_config_path(codex_home: &Path, profile: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !profile.is_empty()
+            && !profile.contains(['/', '\\', '\0'])
+            && !matches!(profile, "." | ".."),
+        "Codex profile must be one literal non-empty name"
+    );
+    Ok(codex_home.join(format!("{profile}.config.toml")))
+}
+
+fn read_compression_setting(
+    config_path: &Path,
+    profile_config_path: Option<&Path>,
+) -> (Option<bool>, Option<String>) {
+    let (base, base_error) = read_compression_setting_from_file(config_path, false);
+    if base_error.is_some() {
+        return (None, base_error);
+    }
+    let Some(profile_config_path) = profile_config_path else {
+        return (base, None);
+    };
+    let (profile, profile_error) = read_compression_setting_from_file(profile_config_path, true);
+    if profile_error.is_some() {
+        (None, profile_error)
+    } else {
+        (profile.or(base), None)
+    }
+}
+
+fn read_compression_setting_from_file(
+    config_path: &Path,
+    required: bool,
+) -> (Option<bool>, Option<String>) {
+    let metadata = match fs::symlink_metadata(config_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => {
+            return (None, None);
+        }
+        Err(error) => {
+            return (
+                None,
+                Some(format!(
+                    "inspect Codex config {}: {error}",
+                    config_path.display()
+                )),
+            )
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return (
+            None,
+            Some(format!(
+                "Codex config is not a regular non-symlink file: {}",
+                config_path.display()
+            )),
+        );
+    }
+    match config_path.canonicalize() {
+        Ok(resolved) if resolved == config_path => {}
+        Ok(_) => {
+            return (
+                None,
+                Some(format!(
+                    "Codex config is noncanonical: {}",
+                    config_path.display()
+                )),
+            )
+        }
+        Err(error) => {
+            return (
+                None,
+                Some(format!(
+                    "resolve Codex config {}: {error}",
+                    config_path.display()
+                )),
+            )
+        }
+    }
     let text = match fs::read_to_string(config_path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (None, None),
         Err(error) => {
             return (
                 None,
@@ -867,7 +1116,15 @@ fn read_compression_setting(config_path: &Path) -> (Option<bool>, Option<String>
     };
     let config = match toml::from_str::<toml::Value>(&text) {
         Ok(config) => config,
-        Err(error) => return (None, Some(format!("parse Codex config: {error}"))),
+        Err(error) => {
+            return (
+                None,
+                Some(format!(
+                    "parse Codex config {}: {error}",
+                    config_path.display()
+                )),
+            )
+        }
     };
     match config
         .get("features")
@@ -878,7 +1135,10 @@ fn read_compression_setting(config_path: &Path) -> (Option<bool>, Option<String>
             Some(value) => (Some(value), None),
             None => (
                 None,
-                Some("Codex feature local_thread_store_compression is not a boolean".to_string()),
+                Some(format!(
+                    "Codex feature local_thread_store_compression is not a boolean in {}",
+                    config_path.display()
+                )),
             ),
         },
     }
@@ -1238,6 +1498,22 @@ mod tests {
     }
 
     #[test]
+    fn absent_live_and_archived_session_directories_are_a_complete_empty_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("sessions");
+        let archived = temp.path().join("archived_sessions");
+
+        assert_eq!(
+            canonical_real_or_absent_directory(&live, "Codex sessions").unwrap(),
+            live
+        );
+        let discovery = discover_session_files(&live, &archived, 10).unwrap();
+        assert!(discovery.complete);
+        assert!(discovery.files.is_empty());
+        assert!(discovery.errors.is_empty());
+    }
+
+    #[test]
     fn session_discovery_is_bounded_and_keeps_symlinks_opaque() {
         let temp = tempfile::tempdir().unwrap();
         let live = temp.path().join("sessions");
@@ -1305,27 +1581,113 @@ mod tests {
     }
 
     #[test]
+    fn unindexed_rollouts_have_separate_live_archived_and_physical_totals() {
+        let root = PathBuf::from("/codex");
+        let live_root = root.join("sessions");
+        let archived_root = root.join("archived_sessions");
+        let live = live_root.join("live.jsonl");
+        let archived = archived_root.join("archived.jsonl.zst");
+        let measurements =
+            BTreeMap::from([(live.clone(), metrics(10)), (archived.clone(), metrics(20))]);
+
+        let summary =
+            summarize_unindexed(&[live, archived], &measurements, &live_root, &archived_root);
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.live_count, 1);
+        assert_eq!(summary.archived_count, 1);
+        assert_eq!(summary.plain_count, 1);
+        assert_eq!(summary.compressed_count, 1);
+        assert_eq!(summary.metrics.private_reclaimable_bytes, 30);
+        assert!(summary.metrics.private_reclaimable_complete);
+    }
+
+    #[test]
+    fn missing_unindexed_measurements_make_the_physical_total_a_lower_bound() {
+        let live_root = PathBuf::from("/codex/sessions");
+        let archived_root = PathBuf::from("/codex/archived_sessions");
+        let missing = live_root.join("missing.jsonl");
+
+        let summary = summarize_unindexed(&[missing], &BTreeMap::new(), &live_root, &archived_root);
+        assert_eq!(summary.count, 1);
+        assert!(!summary.metrics.private_reclaimable_complete);
+    }
+
+    #[test]
     fn compression_setting_distinguishes_enabled_absent_and_invalid_values() {
         let temp = tempfile::tempdir().unwrap();
-        let config = temp.path().join("config.toml");
+        let config = temp.path().canonicalize().unwrap().join("config.toml");
         fs::write(
             &config,
             "[features]\nlocal_thread_store_compression = true\n",
         )
         .unwrap();
-        assert_eq!(read_compression_setting(&config), (Some(true), None));
+        assert_eq!(read_compression_setting(&config, None), (Some(true), None));
 
         fs::write(&config, "[features]\nmemories = true\n").unwrap();
-        assert_eq!(read_compression_setting(&config), (None, None));
+        assert_eq!(read_compression_setting(&config, None), (None, None));
 
         fs::write(
             &config,
             "[features]\nlocal_thread_store_compression = \"yes\"\n",
         )
         .unwrap();
-        let (enabled, error) = read_compression_setting(&config);
+        let (enabled, error) = read_compression_setting(&config, None);
         assert_eq!(enabled, None);
         assert!(error.unwrap().contains("not a boolean"));
+    }
+
+    #[test]
+    fn selected_profile_layers_over_base_compression_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let base = root.join("config.toml");
+        let profile = root.join("large-context.config.toml");
+        fs::write(&base, "[features]\nlocal_thread_store_compression = true\n").unwrap();
+        fs::write(
+            &profile,
+            "[features]\nlocal_thread_store_compression = false\n",
+        )
+        .unwrap();
+
+        let inspection =
+            inspect_compression_configuration(&root, &base, Some("large-context")).unwrap();
+        assert_eq!(inspection.configured_enabled, Some(false));
+        assert_eq!(
+            inspection.selected_profile.as_deref(),
+            Some("large-context")
+        );
+        assert_eq!(inspection.profile_config_path.as_ref(), Some(&profile));
+        assert_eq!(inspection.discovered_profile_config_paths, vec![profile]);
+        assert_eq!(inspection.error, None);
+    }
+
+    #[test]
+    fn unselected_profile_files_make_configuration_evidence_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let base = root.join("config.toml");
+        let profile = root.join("large-context.config.toml");
+        fs::write(&base, "[features]\nlocal_thread_store_compression = true\n").unwrap();
+        fs::write(&profile, "[features]\nmemories = true\n").unwrap();
+
+        let inspection = inspect_compression_configuration(&root, &base, None).unwrap();
+        assert_eq!(inspection.configured_enabled, Some(true));
+        assert!(inspection
+            .error
+            .unwrap()
+            .contains("profile selection is unknown"));
+    }
+
+    #[test]
+    fn selected_profiles_reject_traversal_and_missing_layer_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let base = root.join("config.toml");
+        fs::write(&base, "[features]\nmemories = true\n").unwrap();
+
+        assert!(inspect_compression_configuration(&root, &base, Some("../other")).is_err());
+        let inspection = inspect_compression_configuration(&root, &base, Some("missing")).unwrap();
+        assert!(inspection.error.unwrap().contains("missing.config.toml"));
     }
 
     #[test]

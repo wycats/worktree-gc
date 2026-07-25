@@ -171,10 +171,12 @@ explicit correlation failures.
 
 The report records:
 
-- explicitly configured `local_thread_store_compression` state;
+- explicitly configured `local_thread_store_compression` state from the base
+  config plus an explicitly selected `--profile` layer;
 - compression-marker presence, type, size, modification time, and age;
 - temporary compression artifacts;
 - live and archived counts and physical-byte currencies;
+- separately labeled physical metrics for unindexed rollout files;
 - plain and compressed counts and metrics;
 - age buckets derived from owner-index activity timestamps;
 - bounded traversal, correlation, and APFS-measurement completeness.

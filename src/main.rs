@@ -235,6 +235,13 @@ enum CollectorCommand {
 
         #[arg(
             long,
+            value_name = "NAME",
+            help = "Layer $CODEX_HOME/NAME.config.toml over the base config"
+        )]
+        profile: Option<String>,
+
+        #[arg(
+            long,
             default_value_t = DEFAULT_CODEX_SESSION_MAX_ENTRIES,
             help = "Maximum session-store entries to discover and APFS-measure"
         )]
@@ -686,11 +693,13 @@ fn main() -> Result<()> {
                 }
                 CollectorCommand::CodexSessions {
                     codex_home,
+                    profile,
                     max_entries,
                     json,
                 } => {
                     let run = collect_codex_sessions(CodexSessionCollectOptions {
                         codex_home,
+                        profile,
                         max_entries,
                         now,
                     })?;
@@ -1279,6 +1288,8 @@ mod tests {
             "codex-sessions",
             "--codex-home",
             "/tmp/codex",
+            "--profile",
+            "large-context",
             "--max-entries",
             "99",
             "--json",
@@ -1289,11 +1300,13 @@ mod tests {
                 command:
                     CollectorCommand::CodexSessions {
                         codex_home,
+                        profile,
                         max_entries,
                         json,
                     },
             } => {
                 assert_eq!(codex_home, Some(PathBuf::from("/tmp/codex")));
+                assert_eq!(profile.as_deref(), Some("large-context"));
                 assert_eq!(max_entries, 99);
                 assert!(json);
             }
