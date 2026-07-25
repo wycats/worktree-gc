@@ -1,5 +1,6 @@
 mod cargo_incremental;
 mod cargo_profiles;
+mod codex_sessions;
 mod exact_generated;
 mod gateway_storage;
 mod generated;
@@ -32,6 +33,10 @@ use walkdir::WalkDir;
 
 pub use cargo_incremental::{SweepCandidateAction, SweepCandidateDecision};
 pub use cargo_profiles::CargoProfileCandidateDecision;
+pub use codex_sessions::{
+    collect_codex_sessions, print_codex_sessions_collect, CodexSessionCollectManifest,
+    CodexSessionCollectOptions, CodexSessionCollectRun, DEFAULT_CODEX_SESSION_MAX_ENTRIES,
+};
 pub use exact_generated::{
     execute_approved_generated, ApprovedGeneratedExecutionRefusal,
     ApprovedGeneratedExecutionResult, ApprovedGeneratedExecutionRun,
