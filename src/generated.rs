@@ -1278,6 +1278,7 @@ mod tests {
             ignored: true,
             has_tracked_files: false,
             mtime_unix: None,
+            mtime_nanos: None,
             mtime: None,
             effective_days: 3,
             in_use: false,
