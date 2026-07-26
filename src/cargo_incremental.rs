@@ -1243,7 +1243,11 @@ mod tests {
                 |_| action_tx.send(()).unwrap(),
             )
         });
-        observed_rx.recv_timeout(Duration::from_secs(5))?;
+        // The full suite intentionally runs many filesystem-heavy tests in
+        // parallel. Keep this assertion bounded without treating executor
+        // scheduling delay as a lock-coordination failure.
+        let coordination_timeout = Duration::from_secs(60);
+        observed_rx.recv_timeout(coordination_timeout)?;
         let cross = profile(&target, "aarch64-unknown-linux-musl/debug")?;
         let cross_lock = OpenOptions::new()
             .read(true)
@@ -1260,7 +1264,7 @@ mod tests {
         ));
 
         drop(cross_lock);
-        action_rx.recv_timeout(Duration::from_secs(5))?;
+        action_rx.recv_timeout(coordination_timeout)?;
         handle.join().expect("lock coordination thread panicked")?;
         Ok(())
     }

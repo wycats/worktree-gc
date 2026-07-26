@@ -311,7 +311,7 @@ fn execute_approved_generated_with_ownership(
         "Git state and candidate are on different filesystems"
     );
     validate_candidate_lexical_boundary(candidate, decision, &worktree)?;
-    validate_git_generated_boundary(&worktree, candidate)?;
+    crate::validate_git_generated_boundary(&worktree, candidate)?;
     let quarantine = quarantine_path(&git_common_dir, candidate, &actual_digest)?;
     let candidate_exists = candidate.try_exists()?;
     let quarantine_exists = quarantine.try_exists()?;
@@ -327,6 +327,18 @@ fn execute_approved_generated_with_ownership(
     } else {
         candidate
     };
+    let mount_points = crate::system_mount_points()?;
+    crate::revalidate_generated_candidate_boundary(crate::GeneratedCandidateBoundary {
+        worktree: &worktree,
+        active_path,
+        approved_candidate: candidate,
+        candidate_name: &decision.name,
+        identity,
+        measurement: approved_measurement,
+        quarantined: recovered_quarantine,
+        mount_points: Some(&mount_points),
+    })?;
+    ensure_single_filesystem_tree(active_path, &identity.filesystem, &mount_points)?;
     let source_before = source_identity(&worktree)?;
     let source_without_candidate_before = source_identity_excluding(&worktree, candidate)?;
     anyhow::ensure!(
@@ -347,8 +359,6 @@ fn execute_approved_generated_with_ownership(
         }
     }
 
-    let live_identity = generated_dir_identity(active_path)?;
-    validate_live_identity(identity, &live_identity, recovered_quarantine)?;
     let live_measurement = match measurement_override {
         Some(measurement) => measurement.clone(),
         None => measure_exact_candidate(active_path)?,
@@ -643,29 +653,6 @@ fn validate_candidate_lexical_boundary(
     Ok(())
 }
 
-fn validate_git_generated_boundary(worktree: &Path, candidate: &Path) -> Result<()> {
-    let relative = candidate.strip_prefix(worktree)?;
-    let relative = relative
-        .to_str()
-        .context("candidate relative path is not valid UTF-8")?
-        .replace(std::path::MAIN_SEPARATOR, "/");
-    let mut literal_pathspec = std::ffi::OsString::from(":(top,literal)");
-    literal_pathspec.push(relative);
-    let tracked = Command::new("git")
-        .args(["ls-files", "-z", "--"])
-        .arg(literal_pathspec)
-        .current_dir(worktree)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("failed to run git ls-files in {}", worktree.display()))?;
-    anyhow::ensure!(tracked.status.success(), "git ls-files failed");
-    anyhow::ensure!(
-        tracked.stdout.is_empty(),
-        "candidate now contains tracked content"
-    );
-    Ok(())
-}
-
 fn canonical_existing_directory(path: &Path, label: &str) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {label} path {}", path.display()))?;
@@ -795,120 +782,13 @@ fn measure_exact_candidate(path: &Path) -> Result<GeneratedDirMeasurement> {
     Ok(measurement)
 }
 
-fn ensure_single_filesystem_tree(path: &Path, expected_filesystem: &str) -> Result<()> {
-    ensure_no_nested_mount_points(path)?;
+fn ensure_single_filesystem_tree(
+    path: &Path,
+    expected_filesystem: &str,
+    mount_points: &[PathBuf],
+) -> Result<()> {
+    crate::ensure_single_filesystem_tree(path, expected_filesystem, Some(mount_points))?;
     ensure_single_filesystem_tree_with(path, expected_filesystem, crate::filesystem_key)
-}
-
-fn ensure_no_nested_mount_points(path: &Path) -> Result<()> {
-    ensure_no_nested_mount_points_with(path, &system_mount_points()?)
-}
-
-fn ensure_no_nested_mount_points_with(path: &Path, mount_points: &[PathBuf]) -> Result<()> {
-    let path = fs::canonicalize(path)
-        .with_context(|| format!("failed to canonicalize candidate {}", path.display()))?;
-    for mount_point in mount_points {
-        if mount_point == &path {
-            bail!(
-                "candidate root is a mount point at {}",
-                mount_point.display()
-            );
-        }
-        if mount_point.starts_with(&path) {
-            bail!(
-                "candidate contains a nested mount point at {}",
-                mount_point.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn system_mount_points() -> Result<Vec<PathBuf>> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
-    anyhow::ensure!(count >= 0, "failed to enumerate mounted filesystems");
-    let capacity = usize::try_from(count)?.saturating_add(16);
-    let mut mounts = (0..capacity)
-        .map(|_| unsafe { std::mem::zeroed::<libc::statfs>() })
-        .collect::<Vec<_>>();
-    let buffer_size = i32::try_from(
-        mounts
-            .len()
-            .saturating_mul(std::mem::size_of::<libc::statfs>()),
-    )?;
-    let written = unsafe { libc::getfsstat(mounts.as_mut_ptr(), buffer_size, libc::MNT_NOWAIT) };
-    anyhow::ensure!(written >= 0, "failed to read mounted filesystems");
-    let written = usize::try_from(written)?;
-    anyhow::ensure!(
-        written < mounts.len(),
-        "mounted filesystem table changed during enumeration"
-    );
-    mounts.truncate(written);
-
-    mounts
-        .into_iter()
-        .map(|mount| {
-            let raw = unsafe {
-                std::slice::from_raw_parts(
-                    mount.f_mntonname.as_ptr().cast::<u8>(),
-                    mount.f_mntonname.len(),
-                )
-            };
-            let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
-            let path = PathBuf::from(std::ffi::OsStr::from_bytes(&raw[..end]));
-            fs::canonicalize(&path)
-                .with_context(|| format!("failed to canonicalize mount point {}", path.display()))
-        })
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn system_mount_points() -> Result<Vec<PathBuf>> {
-    use std::os::unix::ffi::OsStringExt;
-
-    let mountinfo = fs::read("/proc/self/mountinfo").context("failed to read Linux mount table")?;
-    mountinfo
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let field = line
-                .split(|byte| *byte == b' ')
-                .nth(4)
-                .context("invalid Linux mount table entry")?;
-            let mut decoded = Vec::with_capacity(field.len());
-            let mut index = 0;
-            while index < field.len() {
-                if field[index] == b'\\' && index + 3 < field.len() {
-                    let octal = &field[index + 1..index + 4];
-                    if octal.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
-                        decoded.push(
-                            (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'),
-                        );
-                        index += 4;
-                        continue;
-                    }
-                }
-                decoded.push(field[index]);
-                index += 1;
-            }
-            let path = PathBuf::from(std::ffi::OsString::from_vec(decoded));
-            fs::canonicalize(&path)
-                .with_context(|| format!("failed to canonicalize mount point {}", path.display()))
-        })
-        .collect()
-}
-
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn system_mount_points() -> Result<Vec<PathBuf>> {
-    bail!("exact generated execution cannot verify mount boundaries on this Unix platform")
-}
-
-#[cfg(not(unix))]
-fn system_mount_points() -> Result<Vec<PathBuf>> {
-    Ok(Vec::new())
 }
 
 fn ensure_single_filesystem_tree_with(
@@ -942,6 +822,27 @@ fn ensure_single_filesystem_tree_with(
             expected_filesystem,
             actual_filesystem
         );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn ensure_no_nested_mount_points_with(path: &Path, mount_points: &[PathBuf]) -> Result<()> {
+    let path = fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize candidate {}", path.display()))?;
+    for mount_point in mount_points {
+        if mount_point == &path {
+            bail!(
+                "candidate root is a mount point at {}",
+                mount_point.display()
+            );
+        }
+        if mount_point.starts_with(&path) {
+            bail!(
+                "candidate contains a nested mount point at {}",
+                mount_point.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1163,13 +1064,20 @@ impl CandidateExecution<'_> {
         } else {
             self.candidate
         };
-        let live_identity = generated_dir_identity(active_path)?;
-        validate_live_identity(
-            self.approved_identity,
-            &live_identity,
-            self.recovered_quarantine,
-        )?;
-        ensure_single_filesystem_tree(active_path, &self.approved_identity.filesystem)?;
+        revalidate_deletion_boundary(crate::GeneratedCandidateBoundary {
+            worktree: self.worktree,
+            active_path,
+            approved_candidate: self.candidate,
+            candidate_name: self
+                .candidate
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("candidate name is not valid UTF-8")?,
+            identity: self.approved_identity,
+            measurement: self.approved_measurement,
+            quarantined: self.recovered_quarantine,
+            mount_points: None,
+        })?;
         let live_measurement = match self.measurement_override {
             Some(measurement) => measurement.clone(),
             None => measure_exact_candidate(active_path)?,
@@ -1257,6 +1165,38 @@ impl CandidateExecution<'_> {
         remove_empty_quarantine_ancestors(self.quarantine)?;
         Ok((live_measurement, result_file))
     }
+}
+
+fn revalidate_deletion_boundary(boundary: crate::GeneratedCandidateBoundary<'_>) -> Result<()> {
+    revalidate_deletion_boundary_with(boundary, crate::system_mount_points)
+}
+
+fn revalidate_deletion_boundary_with(
+    boundary: crate::GeneratedCandidateBoundary<'_>,
+    capture_mount_points: impl FnOnce() -> Result<Vec<PathBuf>>,
+) -> Result<()> {
+    let crate::GeneratedCandidateBoundary {
+        worktree,
+        active_path,
+        approved_candidate,
+        candidate_name,
+        identity,
+        measurement,
+        quarantined,
+        ..
+    } = boundary;
+    let mount_points = capture_mount_points()?;
+    crate::revalidate_generated_candidate_boundary(crate::GeneratedCandidateBoundary {
+        worktree,
+        active_path,
+        approved_candidate,
+        candidate_name,
+        identity,
+        measurement,
+        quarantined,
+        mount_points: Some(&mount_points),
+    })?;
+    ensure_single_filesystem_tree(active_path, &identity.filesystem, &mount_points)
 }
 
 fn remove_empty_quarantine_ancestors(quarantine: &Path) -> Result<()> {
@@ -1875,6 +1815,39 @@ mod tests {
             .to_string()
             .contains("candidate root is a mount point"));
         assert!(root.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn deletion_boundary_recaptures_mounts_after_waiting_for_authority() -> Result<()> {
+        let fixture = fixture(false)?;
+        let identity = generated_dir_identity(&fixture.candidate)?;
+        let captures = std::cell::Cell::new(0);
+        let error = revalidate_deletion_boundary_with(
+            crate::GeneratedCandidateBoundary {
+                worktree: &fixture.repo,
+                active_path: &fixture.candidate,
+                approved_candidate: &fixture.candidate,
+                candidate_name: ".next",
+                identity: &identity,
+                measurement: &fixture.measurement,
+                quarantined: false,
+                mount_points: None,
+            },
+            || {
+                captures.set(captures.get() + 1);
+                Ok(vec![fixture.candidate.clone()])
+            },
+        )
+        .expect_err("a mount introduced before the deletion boundary must fail closed");
+        assert_eq!(captures.get(), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("candidate root is a mount point"),
+            "{error:#}"
+        );
+        assert!(fixture.candidate.is_dir());
         Ok(())
     }
 

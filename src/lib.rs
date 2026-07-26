@@ -19,14 +19,14 @@ use cargo_profiles::{execute_cargo_profile_reset, plan_cargo_profile_sweep};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use walkdir::WalkDir;
@@ -96,6 +96,8 @@ const GENERATED_MTIME_SAMPLE_DEPTH: usize = 6;
 // of concurrent filesystem walks.
 const GENERATED_MEASUREMENT_MAX_ENTRIES: u64 = 2_000_000;
 const GENERATED_MEASUREMENT_MAX_ENTRIES_PER_CANDIDATE: u64 = 250_000;
+const PRESSURE_EPOCH_MAX_CANDIDATES: usize = 25;
+const PRESSURE_EPOCH_MAX_DURATION: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct TriageOptions {
@@ -194,6 +196,49 @@ pub struct RootCleanupManifest {
     pub roots: Vec<PathBuf>,
     pub pressure: Option<PressureRunDecision>,
     pub repositories: Vec<CleanupRun>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_metrics: Option<ExecutionMetrics>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ExecutionMetrics {
+    pub planning_millis: u64,
+    pub measurement_millis: u64,
+    pub ownership_snapshots: u64,
+    pub ownership_snapshot_millis: u64,
+    pub ownership_backends: BTreeMap<String, u64>,
+    pub ownership_epochs: Vec<OwnershipEpochEvidence>,
+    pub ownership_incomplete_epochs: u64,
+    pub mount_snapshot_millis: u64,
+    pub candidate_refusals: Vec<CandidateExecutionRefusal>,
+    pub repository_refreshes: u64,
+    pub repository_refresh_millis: u64,
+    pub pressure_epochs: u64,
+    pub candidate_revalidations: u64,
+    pub candidate_revalidation_millis: u64,
+    pub generated_deletions: u64,
+    pub deletion_millis: u64,
+    pub realized_reclaim_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure_stopped_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OwnershipEpochEvidence {
+    pub phase: String,
+    pub observed_at_unix: u64,
+    pub backend: String,
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub observations: Vec<ProcessOwnershipObservation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateExecutionRefusal {
+    pub candidate: PathBuf,
+    pub worktree: PathBuf,
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,6 +302,7 @@ pub struct GeneratedDirInfo {
     pub ignored: bool,
     pub has_tracked_files: bool,
     pub mtime_unix: Option<i64>,
+    pub mtime_nanos: Option<u32>,
     pub mtime: Option<String>,
     pub effective_days: u64,
     pub in_use: bool,
@@ -326,6 +372,7 @@ pub struct GeneratedDirDecision {
     pub name: String,
     pub mtime: Option<String>,
     pub mtime_unix: Option<i64>,
+    pub mtime_nanos: Option<u32>,
     pub effective_days: u64,
     pub in_use: bool,
     pub ownership_evidence_complete: bool,
@@ -899,6 +946,7 @@ fn plan_cleanup_with_protections_in_roots(
             name: dir.name.clone(),
             mtime: dir.mtime.clone(),
             mtime_unix: dir.mtime_unix,
+            mtime_nanos: dir.mtime_nanos,
             effective_days: dir.effective_days,
             in_use: dir.in_use,
             ownership_evidence_complete: dir.ownership_evidence_complete,
@@ -962,11 +1010,21 @@ fn measure_cleanup_runs_matching(
     max_entries: u64,
     only_path: Option<&Path>,
 ) -> Result<()> {
-    if let Some(path) = only_path {
+    let only_paths = only_path.map(|path| HashSet::from([path.to_path_buf()]));
+    measure_cleanup_runs_matching_paths(runs, max_entries, only_paths.as_ref())
+}
+
+fn measure_cleanup_runs_matching_paths(
+    runs: &mut [CleanupRun],
+    max_entries: u64,
+    only_paths: Option<&HashSet<PathBuf>>,
+) -> Result<()> {
+    if let Some(paths) = only_paths {
         for run in runs.iter_mut() {
             for decision in &mut run.manifest.generated_dirs {
-                if decision.path == path
-                    || fs::canonicalize(&decision.path).is_ok_and(|candidate| candidate == path)
+                if paths.contains(&decision.path)
+                    || fs::canonicalize(&decision.path)
+                        .is_ok_and(|candidate| paths.contains(&candidate))
                 {
                     decision.identity = None;
                     decision.measurement = None;
@@ -1030,7 +1088,7 @@ fn measure_cleanup_runs_matching(
                     });
                 }
             };
-            if only_path.is_some_and(|path| canonical != path) {
+            if only_paths.is_some_and(|paths| !paths.contains(&canonical)) {
                 continue;
             }
             let canonical_worktree =
@@ -1141,6 +1199,32 @@ fn measure_cleanup_runs_matching(
     Ok(())
 }
 
+fn refresh_generated_candidates_after_sweeps(
+    repository: &mut CleanupRun,
+    paths: &HashSet<PathBuf>,
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    measure_cleanup_runs_matching_paths(
+        std::slice::from_mut(repository),
+        GENERATED_MEASUREMENT_MAX_ENTRIES,
+        Some(paths),
+    )?;
+    for decision in &mut repository.manifest.generated_dirs {
+        if paths.contains(&decision.path) && decision.path.exists() {
+            let (mtime_unix, mtime_nanos) =
+                exact_sampled_mtime(&decision.path, GENERATED_MTIME_SAMPLE_DEPTH)?;
+            decision.mtime_unix = Some(mtime_unix);
+            decision.mtime_nanos = Some(mtime_nanos);
+            decision.mtime = Some(format_unix_time(mtime_unix));
+        }
+    }
+    repository.manifest_path =
+        write_manifest(&repository.manifest.git_common_dir, &repository.manifest)?;
+    Ok(())
+}
+
 pub fn triage_roots(roots: &[PathBuf], options: TriageOptions) -> Result<RootTriageReport> {
     let roots = canonicalize_roots(roots)?;
     let repositories = discover_repositories(&roots)?;
@@ -1210,10 +1294,132 @@ pub fn cleanup_roots(roots: &[PathBuf], options: CleanupOptions) -> Result<RootC
     cleanup_repositories(&roots, &repositories, options)
 }
 
+#[derive(Debug)]
+struct ExecutionOwnershipSnapshot {
+    handles: OpenHandleSnapshot,
+    evidence: ProcessOwnershipEvidence,
+}
+
+fn capture_execution_open_handles(
+    paths: &[PathBuf],
+    phase: &str,
+    metrics: &mut ExecutionMetrics,
+) -> ExecutionOwnershipSnapshot {
+    let started = Instant::now();
+    let evidence = process_ownership_evidence_for_paths(paths);
+    record_execution_ownership(phase, evidence, started.elapsed(), metrics)
+}
+
+fn record_execution_ownership(
+    phase: &str,
+    evidence: ProcessOwnershipEvidence,
+    elapsed: Duration,
+    metrics: &mut ExecutionMetrics,
+) -> ExecutionOwnershipSnapshot {
+    metrics.ownership_snapshots = metrics.ownership_snapshots.saturating_add(1);
+    metrics.ownership_snapshot_millis = metrics
+        .ownership_snapshot_millis
+        .saturating_add(duration_millis(elapsed));
+    *metrics
+        .ownership_backends
+        .entry(evidence.backend.clone())
+        .or_default() += 1;
+    metrics.ownership_epochs.push(OwnershipEpochEvidence {
+        phase: phase.to_string(),
+        observed_at_unix: evidence.observed_at_unix,
+        backend: evidence.backend.clone(),
+        complete: evidence.complete,
+        error: evidence.error.clone(),
+        observations: evidence.observations.clone(),
+    });
+    let handles = if evidence.complete {
+        OpenHandleSnapshot::Available(
+            evidence
+                .observations
+                .iter()
+                .map(|observation| observation.observed_path.clone())
+                .collect(),
+        )
+    } else {
+        OpenHandleSnapshot::Indeterminate
+    };
+    ExecutionOwnershipSnapshot { handles, evidence }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn repository_has_routine_actions(repository: &CleanupRun) -> bool {
+    let manifest = &repository.manifest;
+    (manifest.metadata_prune_enabled && !manifest.prune_output.trim().is_empty())
+        || manifest.worktrees.iter().any(|decision| {
+            decision.action == WorktreeAction::Remove
+                && decision.cleanup_class == CleanupClass::Routine
+        })
+        || manifest.generated_dirs.iter().any(|decision| {
+            (decision.action == GeneratedDirAction::Delete
+                && decision.cleanup_class == CleanupClass::Routine)
+                || decision.sweeps.iter().any(SweepDecision::has_work)
+        })
+}
+
+fn repository_routine_ownership_paths(repository: &CleanupRun) -> Vec<PathBuf> {
+    let manifest = &repository.manifest;
+    let mut paths = vec![manifest.current_worktree.clone()];
+    paths.extend(
+        manifest
+            .worktrees
+            .iter()
+            .map(|decision| decision.path.clone()),
+    );
+    paths.extend(
+        manifest
+            .generated_dirs
+            .iter()
+            .flat_map(|decision| [decision.worktree_path.clone(), decision.path.clone()]),
+    );
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn repository_worktree_ownership_paths(repository: &CleanupRun) -> Vec<PathBuf> {
+    let mut paths = repository
+        .manifest
+        .worktrees
+        .iter()
+        .map(|decision| decision.path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 pub fn cleanup_repositories(
     roots: &[PathBuf],
     repositories: &[PathBuf],
+    options: CleanupOptions,
+) -> Result<RootCleanupRun> {
+    cleanup_repositories_with_capture(
+        roots,
+        repositories,
+        options,
+        &capture_execution_open_handles,
+        &write_root_manifest,
+    )
+}
+
+fn cleanup_repositories_with_capture(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
     mut options: CleanupOptions,
+    capture_open_handles: &dyn Fn(
+        &[PathBuf],
+        &str,
+        &mut ExecutionMetrics,
+    ) -> ExecutionOwnershipSnapshot,
+    write_root: &dyn Fn(&RootCleanupManifest) -> Result<PathBuf>,
 ) -> Result<RootCleanupRun> {
     let roots = canonicalize_roots(roots)?;
     let pressure = if let Some(policy) = options.pressure.as_mut() {
@@ -1240,7 +1446,20 @@ pub fn cleanup_repositories(
         CleanupMode::DryRun
     };
     let protections = active_protections(options.now)?;
-    let open_handles = options.check_in_use.then(capture_open_handle_snapshot);
+    let mut execution_metrics = options.execute.then(ExecutionMetrics::default);
+    let mut initial_ownership_paths = roots.clone();
+    initial_ownership_paths.extend(repositories.iter().cloned());
+    initial_ownership_paths.sort();
+    initial_ownership_paths.dedup();
+    let mut dry_run_metrics = ExecutionMetrics::default();
+    let initial_execution_snapshot = options.check_in_use.then(|| {
+        let metrics = execution_metrics.as_mut().unwrap_or(&mut dry_run_metrics);
+        capture_open_handles(&initial_ownership_paths, "initial_plan", metrics)
+    });
+    let open_handles = initial_execution_snapshot
+        .as_ref()
+        .map(|snapshot| &snapshot.handles);
+    let planning_started = Instant::now();
     let mut repositories = repositories
         .par_iter()
         .map(|repo| {
@@ -1248,12 +1467,19 @@ pub fn cleanup_repositories(
                 Some(repo),
                 options.clone(),
                 &protections,
-                open_handles.as_ref(),
+                open_handles,
                 Some(&roots),
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    if let Some(metrics) = execution_metrics.as_mut() {
+        metrics.planning_millis = duration_millis(planning_started.elapsed());
+    }
+    let measurement_started = Instant::now();
     measure_cleanup_runs(&mut repositories, GENERATED_MEASUREMENT_MAX_ENTRIES)?;
+    if let Some(metrics) = execution_metrics.as_mut() {
+        metrics.measurement_millis = duration_millis(measurement_started.elapsed());
+    }
     let mut manifest = RootCleanupManifest {
         manifest_version: MANIFEST_VERSION,
         mode,
@@ -1261,34 +1487,131 @@ pub fn cleanup_repositories(
         roots: roots.clone(),
         pressure,
         repositories,
+        execution_metrics: execution_metrics.clone(),
     };
-    let manifest_path = write_root_manifest(&manifest)?;
+    let manifest_path = write_root(&manifest)?;
 
     if options.execute {
         for index in 0..manifest.repositories.len() {
+            if !repository_has_routine_actions(&manifest.repositories[index]) {
+                continue;
+            }
             let repo_root = manifest.repositories[index].manifest.repo_root.clone();
             let mut refreshed_options = options.clone();
             refreshed_options.now = SystemTime::now();
             let refreshed_protections = active_protections(refreshed_options.now)?;
-            let refreshed_open_handles = refreshed_options
-                .check_in_use
-                .then(capture_open_handle_snapshot);
+            let refreshed_open_handles = open_handles;
+            execution_metrics
+                .as_mut()
+                .context("execute mode has no execution metrics")?
+                .repository_refreshes += 1;
+            let refresh_started = Instant::now();
             let mut refreshed = plan_cleanup_with_protections_in_roots(
                 Some(&repo_root),
                 refreshed_options,
                 &refreshed_protections,
-                refreshed_open_handles.as_ref(),
+                refreshed_open_handles,
                 Some(&roots),
             )?;
             carry_generated_measurements(&manifest.repositories[index], &mut refreshed)?;
+            let refresh_millis = duration_millis(refresh_started.elapsed());
+            let metrics = execution_metrics
+                .as_mut()
+                .context("execute mode has no execution metrics")?;
+            metrics.repository_refresh_millis = metrics
+                .repository_refresh_millis
+                .saturating_add(refresh_millis);
             refreshed.manifest_path =
                 write_manifest(&refreshed.manifest.git_common_dir, &refreshed.manifest)?;
             manifest.repositories[index] = refreshed;
-            write_root_manifest(&manifest)?;
-            execute_cleanup_manifest(
+            manifest.execution_metrics = execution_metrics.clone();
+            write_root(&manifest)?;
+            let routine_generated_paths = manifest.repositories[index]
+                .manifest
+                .generated_dirs
+                .iter()
+                .filter(|decision| {
+                    decision.action == GeneratedDirAction::Delete
+                        && decision.cleanup_class == CleanupClass::Routine
+                        && decision.path.exists()
+                })
+                .map(|decision| (decision.worktree_path.clone(), decision.path.clone()))
+                .collect::<Vec<_>>();
+            let pressure_sweep_paths = manifest.repositories[index]
+                .manifest
+                .generated_dirs
+                .iter()
+                .filter(|decision| {
+                    decision.action == GeneratedDirAction::Delete
+                        && decision.cleanup_class == CleanupClass::Pressure
+                        && decision.path.exists()
+                        && decision.sweeps.iter().any(SweepDecision::has_work)
+                })
+                .map(|decision| decision.path.clone())
+                .collect::<HashSet<_>>();
+            let routine_observation_paths =
+                routine_execution_observation_paths(&manifest.repositories[index].manifest)?;
+            let available_before = observe_free_space(&routine_observation_paths)?;
+            let execution_ownership = if options.check_in_use {
+                Some(capture_open_handles(
+                    &repository_routine_ownership_paths(&manifest.repositories[index]),
+                    &format!("routine_execute:{}", repo_root.display()),
+                    execution_metrics
+                        .as_mut()
+                        .context("execute mode has no execution metrics")?,
+                ))
+            } else {
+                None
+            };
+            let execution_open_handles = execution_ownership
+                .as_ref()
+                .map(|snapshot| &snapshot.handles);
+            manifest.execution_metrics = execution_metrics.clone();
+            write_root(&manifest)?;
+            let execution_started = Instant::now();
+            execute_cleanup_manifest_with_snapshot(
                 &manifest.repositories[index].manifest,
                 ExecutionPass::Routine,
+                execution_open_handles,
             )?;
+            refresh_generated_candidates_after_sweeps(
+                &mut manifest.repositories[index],
+                &pressure_sweep_paths,
+            )?;
+            let available_after = observe_free_space(&routine_observation_paths)?;
+            for worktree in routine_generated_paths
+                .iter()
+                .filter(|(_, path)| !path.exists())
+                .map(|(worktree, _)| worktree)
+                .collect::<HashSet<_>>()
+            {
+                if worktree.exists() {
+                    refresh_planned_worktree_source(
+                        &mut manifest.repositories[index].manifest,
+                        worktree,
+                    )?;
+                }
+            }
+            let metrics = execution_metrics
+                .as_mut()
+                .context("execute mode has no execution metrics")?;
+            metrics.deletion_millis = metrics
+                .deletion_millis
+                .saturating_add(duration_millis(execution_started.elapsed()));
+            metrics.generated_deletions = metrics.generated_deletions.saturating_add(
+                u64::try_from(
+                    routine_generated_paths
+                        .iter()
+                        .filter(|(_, path)| !path.exists())
+                        .count(),
+                )
+                .unwrap_or(u64::MAX),
+            );
+            metrics.realized_reclaim_bytes = metrics
+                .realized_reclaim_bytes
+                .saturating_add(realized_reclaim(&available_before, &available_after));
+            manifest.execution_metrics = execution_metrics.clone();
+            write_root(&manifest)?;
         }
 
         if options
@@ -1297,24 +1620,302 @@ pub fn cleanup_repositories(
             .is_some_and(|pressure| pressure.active)
         {
             let mut satisfied_filesystems = HashSet::new();
-            for rank in 0..=4 {
-                for (index, path) in pressure_generated_candidate_order(&manifest, rank) {
-                    if !path.exists()
-                        || !root_pressure_should_continue(
-                            &manifest,
-                            &path,
-                            &mut satisfied_filesystems,
-                        )?
-                    {
-                        continue;
+            'pressure: for rank in 0..=4 {
+                let mut candidates =
+                    VecDeque::from(pressure_generated_candidate_order(&manifest, rank));
+                while !candidates.is_empty() {
+                    if let Err(failure) = filter_pressure_candidates(
+                        &mut candidates,
+                        &satisfied_filesystems,
+                        filesystem_key,
+                    ) {
+                        let reason = format!(
+                            "pressure candidate filesystem lookup failed for {}: {:#}",
+                            failure.path.display(),
+                            failure.error
+                        );
+                        let worktree = manifest.repositories[failure.repository_index]
+                            .manifest
+                            .generated_dirs
+                            .iter()
+                            .find(|decision| decision.path == failure.path)
+                            .map(|decision| decision.worktree_path.clone())
+                            .unwrap_or_else(|| failure.path.clone());
+                        let metrics = execution_metrics
+                            .as_mut()
+                            .context("execute mode has no execution metrics")?;
+                        metrics.candidate_refusals.push(CandidateExecutionRefusal {
+                            candidate: failure.path,
+                            worktree,
+                            reason: reason.clone(),
+                        });
+                        metrics.pressure_stopped_reason = Some(reason.clone());
+                        manifest.execution_metrics = execution_metrics.clone();
+                        write_root(&manifest)?;
+                        bail!("{reason}");
                     }
-                    refresh_and_execute_repository(
-                        &mut manifest,
-                        index,
-                        &options,
-                        ExecutionPass::PressureGenerated(rank),
-                        Some(&path),
-                    )?;
+                    if candidates.is_empty() {
+                        break;
+                    }
+                    let epoch = next_pressure_epoch(&candidates);
+                    let metrics = execution_metrics
+                        .as_mut()
+                        .context("execute mode has no execution metrics")?;
+                    metrics.pressure_epochs = metrics.pressure_epochs.saturating_add(1);
+                    let epoch_started = Instant::now();
+                    let epoch_deadline = epoch_started
+                        .checked_add(PRESSURE_EPOCH_MAX_DURATION)
+                        .context("pressure ownership epoch deadline overflowed")?;
+                    let epoch_ownership_paths = pressure_epoch_ownership_paths(&manifest, &epoch);
+                    let epoch_snapshot = if options.check_in_use {
+                        Some(capture_open_handles(
+                            &epoch_ownership_paths,
+                            &format!("pressure_epoch:{}", metrics.pressure_epochs),
+                            metrics,
+                        ))
+                    } else {
+                        None
+                    };
+                    if epoch_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| !snapshot.evidence.complete)
+                    {
+                        record_incomplete_pressure_epoch(&manifest, &epoch, metrics);
+                        manifest.execution_metrics = execution_metrics.clone();
+                        write_root(&manifest)?;
+                        break 'pressure;
+                    }
+                    let mount_snapshot_started = Instant::now();
+                    let epoch_mount_points = match system_mount_points() {
+                        Ok(mount_points) => mount_points,
+                        Err(error) => {
+                            metrics.mount_snapshot_millis = metrics
+                                .mount_snapshot_millis
+                                .saturating_add(duration_millis(mount_snapshot_started.elapsed()));
+                            let reason = format!(
+                                "pressure mount-boundary snapshot was incomplete: {error:#}"
+                            );
+                            metrics.pressure_stopped_reason = Some(reason.clone());
+                            for (index, path) in &epoch {
+                                let worktree = manifest.repositories[*index]
+                                    .manifest
+                                    .generated_dirs
+                                    .iter()
+                                    .find(|decision| decision.path == *path)
+                                    .map(|decision| decision.worktree_path.clone())
+                                    .unwrap_or_else(|| path.clone());
+                                metrics.candidate_refusals.push(CandidateExecutionRefusal {
+                                    candidate: path.clone(),
+                                    worktree,
+                                    reason: reason.clone(),
+                                });
+                            }
+                            manifest.execution_metrics = execution_metrics.clone();
+                            write_root(&manifest)?;
+                            break 'pressure;
+                        }
+                    };
+                    metrics.mount_snapshot_millis = metrics
+                        .mount_snapshot_millis
+                        .saturating_add(duration_millis(mount_snapshot_started.elapsed()));
+
+                    let worktree_revalidation_started = Instant::now();
+                    let refusal_count_before = execution_metrics
+                        .as_ref()
+                        .context("execute mode has no execution metrics")?
+                        .candidate_refusals
+                        .len();
+                    let valid_worktrees = revalidate_pressure_epoch_worktrees(
+                        &manifest,
+                        &epoch,
+                        execution_metrics
+                            .as_mut()
+                            .context("execute mode has no execution metrics")?,
+                    );
+                    let worktree_revalidation_millis =
+                        duration_millis(worktree_revalidation_started.elapsed());
+                    let worktree_refusal_added = {
+                        let metrics = execution_metrics
+                            .as_mut()
+                            .context("execute mode has no execution metrics")?;
+                        metrics.candidate_revalidation_millis = metrics
+                            .candidate_revalidation_millis
+                            .saturating_add(worktree_revalidation_millis);
+                        metrics.candidate_refusals.len() > refusal_count_before
+                    };
+                    if worktree_refusal_added {
+                        manifest.execution_metrics = execution_metrics.clone();
+                        write_root(&manifest)?;
+                    }
+                    if pressure_epoch_expired(epoch_started) {
+                        let metrics = execution_metrics
+                            .as_mut()
+                            .context("execute mode has no execution metrics")?;
+                        metrics.pressure_stopped_reason = Some(
+                            "pressure ownership epoch expired before candidate execution"
+                                .to_string(),
+                        );
+                        manifest.execution_metrics = execution_metrics.clone();
+                        write_root(&manifest)?;
+                        break 'pressure;
+                    }
+
+                    for (attempted, (index, path)) in epoch.into_iter().enumerate() {
+                        if attempted > 0 && pressure_epoch_expired(epoch_started) {
+                            break;
+                        }
+                        let Some((front_index, front_path)) = candidates.front() else {
+                            break;
+                        };
+                        if *front_index != index || *front_path != path {
+                            bail!("pressure execution queue lost deterministic ordering");
+                        }
+                        candidates.pop_front();
+                        if !path.exists()
+                            || !root_pressure_should_continue(
+                                &manifest,
+                                &path,
+                                &mut satisfied_filesystems,
+                            )?
+                        {
+                            continue;
+                        }
+                        let Some(decision) = manifest.repositories[index]
+                            .manifest
+                            .generated_dirs
+                            .iter()
+                            .find(|decision| decision.path == path)
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        if !valid_worktrees.contains(&(index, decision.worktree_path.clone())) {
+                            continue;
+                        }
+                        {
+                            let metrics = execution_metrics
+                                .as_mut()
+                                .context("execute mode has no execution metrics")?;
+                            metrics.candidate_revalidations =
+                                metrics.candidate_revalidations.saturating_add(1);
+                        }
+                        let candidate_revalidation_started = Instant::now();
+                        if let Err(error) = revalidate_generated_candidate(
+                            &decision,
+                            epoch_snapshot.as_ref().map(|snapshot| &snapshot.handles),
+                            Some(&epoch_mount_points),
+                        ) {
+                            {
+                                let metrics = execution_metrics
+                                    .as_mut()
+                                    .context("execute mode has no execution metrics")?;
+                                metrics.candidate_revalidation_millis =
+                                    metrics.candidate_revalidation_millis.saturating_add(
+                                        duration_millis(candidate_revalidation_started.elapsed()),
+                                    );
+                            }
+                            let refusal = CandidateExecutionRefusal {
+                                candidate: decision.path.clone(),
+                                worktree: decision.worktree_path.clone(),
+                                reason: format!("{error:#}"),
+                            };
+                            persist_candidate_refusal(
+                                &mut manifest,
+                                &mut execution_metrics,
+                                refusal,
+                                write_root,
+                            )?;
+                            continue;
+                        }
+                        {
+                            let metrics = execution_metrics
+                                .as_mut()
+                                .context("execute mode has no execution metrics")?;
+                            metrics.candidate_revalidation_millis =
+                                metrics.candidate_revalidation_millis.saturating_add(
+                                    duration_millis(candidate_revalidation_started.elapsed()),
+                                );
+                        }
+                        let existed_before = path.exists();
+                        let observation_path = decision.worktree_path.clone();
+                        let available_before = fs4::available_space(&observation_path)?;
+                        let source_before = source_status_excluding_candidate(
+                            &decision.worktree_path,
+                            &decision.path,
+                        )?;
+                        let deletion_started = Instant::now();
+                        execute_cleanup_manifest_matching_with_snapshot(
+                            &manifest.repositories[index].manifest,
+                            ExecutionPass::PressureGenerated(rank),
+                            Some(&path),
+                            epoch_snapshot.as_ref().map(|snapshot| &snapshot.handles),
+                            Some(epoch_deadline),
+                        )?;
+                        {
+                            let metrics = execution_metrics
+                                .as_mut()
+                                .context("execute mode has no execution metrics")?;
+                            metrics.deletion_millis = metrics
+                                .deletion_millis
+                                .saturating_add(duration_millis(deletion_started.elapsed()));
+                        }
+                        if existed_before && !path.exists() {
+                            let metrics = execution_metrics
+                                .as_mut()
+                                .context("execute mode has no execution metrics")?;
+                            metrics.generated_deletions =
+                                metrics.generated_deletions.saturating_add(1);
+                            let available_after = fs4::available_space(&observation_path)?;
+                            metrics.realized_reclaim_bytes = metrics
+                                .realized_reclaim_bytes
+                                .saturating_add(available_after.saturating_sub(available_before));
+                            let source_after = source_status_excluding_candidate(
+                                &decision.worktree_path,
+                                &decision.path,
+                            )?;
+                            anyhow::ensure!(
+                                source_after == source_before,
+                                "worktree source changed while deleting {}",
+                                decision.path.display()
+                            );
+                            refresh_planned_worktree_source(
+                                &mut manifest.repositories[index].manifest,
+                                &decision.worktree_path,
+                            )?;
+                            let _ = root_pressure_should_continue(
+                                &manifest,
+                                &observation_path,
+                                &mut satisfied_filesystems,
+                            )?;
+                        } else if existed_before {
+                            let reason = if Instant::now() >= epoch_deadline {
+                                "ownership epoch expired before deletion".to_string()
+                            } else {
+                                revalidate_generated_candidate(
+                                    &decision,
+                                    epoch_snapshot.as_ref().map(|snapshot| &snapshot.handles),
+                                    Some(&epoch_mount_points),
+                                )
+                                .err()
+                                .map(|error| format!("{error:#}"))
+                                .unwrap_or_else(|| {
+                                    "candidate remained after guarded deletion".to_string()
+                                })
+                            };
+                            persist_candidate_refusal(
+                                &mut manifest,
+                                &mut execution_metrics,
+                                CandidateExecutionRefusal {
+                                    candidate: decision.path.clone(),
+                                    worktree: decision.worktree_path.clone(),
+                                    reason,
+                                },
+                                write_root,
+                            )?;
+                        }
+                    }
+                    manifest.execution_metrics = execution_metrics.clone();
+                    write_root(&manifest)?;
                 }
             }
             for index in pressure_worktree_repository_order(&manifest) {
@@ -1325,12 +1926,46 @@ pub fn cleanup_repositories(
                 )? {
                     continue;
                 }
+                let pressure_worktree_paths =
+                    repository_worktree_ownership_paths(&manifest.repositories[index]);
+                let worktree_snapshot = if options.check_in_use {
+                    let metrics = execution_metrics
+                        .as_mut()
+                        .context("execute mode has no execution metrics")?;
+                    Some(capture_open_handles(
+                        &pressure_worktree_paths,
+                        &format!(
+                            "pressure_worktrees:{}",
+                            manifest.repositories[index].manifest.repo_root.display()
+                        ),
+                        metrics,
+                    ))
+                } else {
+                    None
+                };
+                if worktree_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.evidence.complete)
+                {
+                    let metrics = execution_metrics
+                        .as_mut()
+                        .context("execute mode has no execution metrics")?;
+                    metrics.ownership_incomplete_epochs =
+                        metrics.ownership_incomplete_epochs.saturating_add(1);
+                    metrics.pressure_stopped_reason =
+                        Some("pressure worktree ownership evidence was incomplete".to_string());
+                    break;
+                }
                 refresh_and_execute_repository(
                     &mut manifest,
                     index,
                     &options,
                     ExecutionPass::PressureWorktrees,
                     None,
+                    worktree_snapshot.as_ref().map(|snapshot| &snapshot.handles),
+                    execution_metrics
+                        .as_mut()
+                        .context("execute mode has no execution metrics")?,
                 )?;
             }
         }
@@ -1348,8 +1983,9 @@ pub fn cleanup_repositories(
         let final_observations = observe_free_space(&final_paths)?;
         if let Some(pressure) = &mut manifest.pressure {
             pressure.final_observations = Some(final_observations);
-            write_root_manifest(&manifest)?;
         }
+        manifest.execution_metrics = execution_metrics.clone();
+        write_root(&manifest)?;
     }
 
     Ok(RootCleanupRun {
@@ -1410,6 +2046,68 @@ fn observe_free_space(paths: &[PathBuf]) -> Result<Vec<PressureObservation>> {
     Ok(observations)
 }
 
+fn routine_execution_observation_paths(manifest: &CleanupManifest) -> Result<Vec<PathBuf>> {
+    let mut action_paths = Vec::new();
+    if manifest.metadata_prune_enabled
+        || manifest
+            .generated_dirs
+            .iter()
+            .any(|decision| decision.sweeps.iter().any(SweepDecision::has_work))
+    {
+        action_paths.push(manifest.current_worktree.clone());
+    }
+    action_paths.extend(
+        manifest
+            .generated_dirs
+            .iter()
+            .filter(|decision| {
+                decision.action == GeneratedDirAction::Delete
+                    && decision.cleanup_class == CleanupClass::Routine
+            })
+            .map(|decision| decision.worktree_path.clone()),
+    );
+    action_paths.extend(
+        manifest
+            .worktrees
+            .iter()
+            .filter(|decision| {
+                decision.action == WorktreeAction::Remove
+                    && decision.cleanup_class == CleanupClass::Routine
+            })
+            .map(|decision| {
+                decision
+                    .path
+                    .parent()
+                    .unwrap_or(&decision.path)
+                    .to_path_buf()
+            }),
+    );
+    let mut observation_paths = action_paths
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    observation_paths.sort();
+    observation_paths.dedup();
+    Ok(observation_paths)
+}
+
+fn realized_reclaim(before: &[PressureObservation], after: &[PressureObservation]) -> u64 {
+    let before = before
+        .iter()
+        .map(|observation| (&observation.filesystem, observation.available_bytes))
+        .collect::<BTreeMap<_, _>>();
+    after
+        .iter()
+        .filter_map(|observation| {
+            before.get(&observation.filesystem).map(|available_before| {
+                observation
+                    .available_bytes
+                    .saturating_sub(*available_before)
+            })
+        })
+        .fold(0, u64::saturating_add)
+}
+
 fn pressure_observation_paths(
     roots: &[PathBuf],
     repositories: &[PathBuf],
@@ -1441,20 +2139,25 @@ fn refresh_and_execute_repository(
     options: &CleanupOptions,
     pass: ExecutionPass,
     only_generated_path: Option<&Path>,
+    open_handles: Option<&OpenHandleSnapshot>,
+    metrics: &mut ExecutionMetrics,
 ) -> Result<()> {
     let repo_root = manifest.repositories[index].manifest.repo_root.clone();
     let mut refreshed_options = options.clone();
     refreshed_options.now = SystemTime::now();
     let refreshed_protections = active_protections(refreshed_options.now)?;
-    let refreshed_open_handles = refreshed_options
-        .check_in_use
-        .then(capture_open_handle_snapshot);
+    anyhow::ensure!(
+        !refreshed_options.check_in_use || open_handles.is_some(),
+        "execution refresh requires a supplied ownership snapshot"
+    );
+    metrics.repository_refreshes = metrics.repository_refreshes.saturating_add(1);
+    let refresh_started = Instant::now();
     let roots = manifest.roots.clone();
     let mut refreshed = plan_cleanup_with_protections_in_roots(
         Some(&repo_root),
         refreshed_options,
         &refreshed_protections,
-        refreshed_open_handles.as_ref(),
+        open_handles,
         Some(&roots),
     )?;
     carry_generated_measurements(&manifest.repositories[index], &mut refreshed)?;
@@ -1465,15 +2168,246 @@ fn refresh_and_execute_repository(
             Some(path),
         )?;
     }
+    metrics.repository_refresh_millis = metrics
+        .repository_refresh_millis
+        .saturating_add(duration_millis(refresh_started.elapsed()));
     refreshed.manifest_path =
         write_manifest(&refreshed.manifest.git_common_dir, &refreshed.manifest)?;
     manifest.repositories[index] = refreshed;
     write_root_manifest(manifest)?;
-    execute_cleanup_manifest_matching(
+    execute_cleanup_manifest_matching_with_snapshot(
         &manifest.repositories[index].manifest,
         pass,
         only_generated_path,
+        open_handles,
+        None,
     )
+}
+
+fn pressure_epoch_ownership_paths(
+    manifest: &RootCleanupManifest,
+    epoch: &[(usize, PathBuf)],
+) -> Vec<PathBuf> {
+    let mut paths = epoch
+        .iter()
+        .flat_map(|(index, path)| {
+            let worktree = manifest.repositories[*index]
+                .manifest
+                .generated_dirs
+                .iter()
+                .find(|decision| decision.path == *path)
+                .map(|decision| decision.worktree_path.clone());
+            worktree.into_iter().chain(std::iter::once(path.clone()))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn next_pressure_epoch(candidates: &VecDeque<(usize, PathBuf)>) -> Vec<(usize, PathBuf)> {
+    candidates
+        .iter()
+        .take(PRESSURE_EPOCH_MAX_CANDIDATES)
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug)]
+struct PressureQueueFilesystemFailure {
+    repository_index: usize,
+    path: PathBuf,
+    error: anyhow::Error,
+}
+
+fn filter_pressure_candidates(
+    candidates: &mut VecDeque<(usize, PathBuf)>,
+    satisfied_filesystems: &HashSet<String>,
+    filesystem_for: impl Fn(&Path) -> Result<String>,
+) -> std::result::Result<(), PressureQueueFilesystemFailure> {
+    let mut retained = VecDeque::with_capacity(candidates.len());
+    while let Some((repository_index, path)) = candidates.pop_front() {
+        if !path.exists() {
+            continue;
+        }
+        let filesystem = filesystem_for(&path).map_err(|error| PressureQueueFilesystemFailure {
+            repository_index,
+            path: path.clone(),
+            error,
+        })?;
+        if !satisfied_filesystems.contains(&filesystem) {
+            retained.push_back((repository_index, path));
+        }
+    }
+    *candidates = retained;
+    Ok(())
+}
+
+fn pressure_epoch_expired(started: Instant) -> bool {
+    started.elapsed() >= PRESSURE_EPOCH_MAX_DURATION
+}
+
+fn revalidate_before_ownership_deadline(
+    deadline: Option<Instant>,
+    revalidate: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Ok(false);
+    }
+    revalidate()?;
+    Ok(deadline.is_none_or(|deadline| Instant::now() < deadline))
+}
+
+fn record_incomplete_pressure_epoch(
+    manifest: &RootCleanupManifest,
+    epoch: &[(usize, PathBuf)],
+    metrics: &mut ExecutionMetrics,
+) {
+    metrics.ownership_incomplete_epochs = metrics.ownership_incomplete_epochs.saturating_add(1);
+    for (index, path) in epoch {
+        let worktree = manifest.repositories[*index]
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == *path)
+            .map(|decision| decision.worktree_path.clone())
+            .unwrap_or_else(|| path.clone());
+        metrics.candidate_refusals.push(CandidateExecutionRefusal {
+            candidate: path.clone(),
+            worktree,
+            reason: "pressure ownership epoch was incomplete".to_string(),
+        });
+    }
+    metrics.pressure_stopped_reason = Some("pressure ownership epoch was incomplete".to_string());
+}
+
+fn persist_candidate_refusal(
+    manifest: &mut RootCleanupManifest,
+    execution_metrics: &mut Option<ExecutionMetrics>,
+    refusal: CandidateExecutionRefusal,
+    write_root: &dyn Fn(&RootCleanupManifest) -> Result<PathBuf>,
+) -> Result<()> {
+    execution_metrics
+        .as_mut()
+        .context("execute mode has no execution metrics")?
+        .candidate_refusals
+        .push(refusal);
+    manifest.execution_metrics = execution_metrics.clone();
+    write_root(manifest)?;
+    Ok(())
+}
+
+fn revalidate_pressure_epoch_worktrees(
+    manifest: &RootCleanupManifest,
+    epoch: &[(usize, PathBuf)],
+    metrics: &mut ExecutionMetrics,
+) -> HashSet<(usize, PathBuf)> {
+    pressure_epoch_worktree_groups(manifest, epoch)
+        .into_iter()
+        .filter(|(index, worktree)| {
+            let repository = &manifest.repositories[*index].manifest;
+            match revalidate_pressure_worktree(repository, worktree) {
+                Ok(()) => true,
+                Err(error) => {
+                    metrics.candidate_refusals.push(CandidateExecutionRefusal {
+                        candidate: worktree.clone(),
+                        worktree: worktree.clone(),
+                        reason: format!("worktree epoch revalidation failed: {error:#}"),
+                    });
+                    false
+                }
+            }
+        })
+        .collect()
+}
+
+fn pressure_epoch_worktree_groups(
+    manifest: &RootCleanupManifest,
+    epoch: &[(usize, PathBuf)],
+) -> HashSet<(usize, PathBuf)> {
+    epoch
+        .iter()
+        .filter_map(|(index, path)| {
+            manifest.repositories[*index]
+                .manifest
+                .generated_dirs
+                .iter()
+                .find(|decision| decision.path == *path)
+                .map(|decision| (*index, decision.worktree_path.clone()))
+        })
+        .collect()
+}
+
+fn revalidate_pressure_worktree(manifest: &CleanupManifest, worktree: &Path) -> Result<()> {
+    let canonical_worktree = fs::canonicalize(worktree)
+        .with_context(|| format!("failed to resolve worktree {}", worktree.display()))?;
+    anyhow::ensure!(
+        canonical_worktree == worktree,
+        "worktree canonical identity changed"
+    );
+    let context = repo_context(Some(worktree))?;
+    anyhow::ensure!(
+        context.git_common_dir == manifest.git_common_dir,
+        "Git common-directory identity changed"
+    );
+    let planned = manifest
+        .worktrees
+        .iter()
+        .find(|decision| decision.path == worktree)
+        .with_context(|| {
+            format!(
+                "manifest has no worktree identity for {}",
+                worktree.display()
+            )
+        })?;
+    let head = live_worktree_head(worktree)?;
+    let source = dirty_status(worktree)?;
+    anyhow::ensure!(
+        planned.head == head
+            && planned.dirty_count == Some(source.dirty_count)
+            && planned.status_sha256.as_deref() == Some(source.status_sha256.as_str()),
+        "worktree head or source status changed"
+    );
+    Ok(())
+}
+
+fn refresh_planned_worktree_source(manifest: &mut CleanupManifest, worktree: &Path) -> Result<()> {
+    let head = live_worktree_head(worktree)?;
+    let source = dirty_status(worktree)?;
+    let planned = manifest
+        .worktrees
+        .iter_mut()
+        .find(|decision| decision.path == worktree)
+        .with_context(|| {
+            format!(
+                "manifest has no worktree identity for {}",
+                worktree.display()
+            )
+        })?;
+    planned.head = head;
+    planned.dirty_count = Some(source.dirty_count);
+    planned.status_sha256 = Some(source.status_sha256);
+    Ok(())
+}
+
+fn live_worktree_head(worktree: &Path) -> Result<Option<String>> {
+    let canonical = fs::canonicalize(worktree)
+        .with_context(|| format!("failed to resolve worktree {}", worktree.display()))?;
+    parse_worktree_list(&git_output(
+        &canonical,
+        ["worktree", "list", "--porcelain"],
+    )?)
+    .into_iter()
+    .find_map(|entry| {
+        let entry_path = fs::canonicalize(&entry.path).ok()?;
+        (entry_path == canonical).then_some(entry.head)
+    })
+    .with_context(|| {
+        format!(
+            "live worktree list no longer contains {}",
+            canonical.display()
+        )
+    })
 }
 
 fn carry_generated_measurements(previous: &CleanupRun, refreshed: &mut CleanupRun) -> Result<()> {
@@ -1546,15 +2480,26 @@ fn pressure_generated_candidate_order(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, decision)| {
         let measurement = decision.measurement.as_ref();
+        let measurement_complete = measurement.is_some_and(|measurement| {
+            measurement.complete
+                && measurement.metrics.private_reclaimable_complete
+                && measurement.metrics.errors == 0
+        });
+        let private_per_entry = measurement
+            .map(|measurement| {
+                measurement
+                    .metrics
+                    .private_reclaimable_bytes
+                    .checked_div(measurement.visited_entries.max(1))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         (
+            u8::from(!measurement_complete),
+            std::cmp::Reverse(private_per_entry),
             std::cmp::Reverse(
                 measurement
                     .map(|measurement| measurement.metrics.private_reclaimable_bytes)
-                    .unwrap_or_default(),
-            ),
-            std::cmp::Reverse(
-                measurement
-                    .map(|measurement| measurement.metrics.allocated_bytes)
                     .unwrap_or_default(),
             ),
             decision.mtime_unix.unwrap_or(i64::MAX),
@@ -1641,16 +2586,50 @@ fn execute_cleanup_manifest(manifest: &CleanupManifest, pass: ExecutionPass) -> 
     execute_cleanup_manifest_matching(manifest, pass, None)
 }
 
+fn execute_cleanup_manifest_with_snapshot(
+    manifest: &CleanupManifest,
+    pass: ExecutionPass,
+    open_handles: Option<&OpenHandleSnapshot>,
+) -> Result<()> {
+    if pass != ExecutionPass::Routine {
+        return execute_cleanup(manifest, pass, None, open_handles, None);
+    }
+    execute_planned_metadata_prune(manifest)?;
+    execute_cleanup(manifest, pass, None, open_handles, None)
+}
+
 fn execute_cleanup_manifest_matching(
     manifest: &CleanupManifest,
     pass: ExecutionPass,
     only_generated_path: Option<&Path>,
 ) -> Result<()> {
+    execute_cleanup_manifest_matching_with_snapshot(manifest, pass, only_generated_path, None, None)
+}
+
+fn execute_cleanup_manifest_matching_with_snapshot(
+    manifest: &CleanupManifest,
+    pass: ExecutionPass,
+    only_generated_path: Option<&Path>,
+    open_handles: Option<&OpenHandleSnapshot>,
+    ownership_deadline: Option<Instant>,
+) -> Result<()> {
     if pass != ExecutionPass::Routine {
-        return execute_cleanup(manifest, pass, only_generated_path);
+        return execute_cleanup(
+            manifest,
+            pass,
+            only_generated_path,
+            open_handles,
+            ownership_deadline,
+        );
     }
     execute_planned_metadata_prune(manifest)?;
-    execute_cleanup(manifest, pass, only_generated_path)
+    execute_cleanup(
+        manifest,
+        pass,
+        only_generated_path,
+        open_handles,
+        ownership_deadline,
+    )
 }
 
 fn execute_planned_metadata_prune(manifest: &CleanupManifest) -> Result<()> {
@@ -2163,6 +3142,26 @@ pub fn print_root_cleanup(run: &RootCleanupRun) {
             }
         }
     }
+    if let Some(metrics) = &run.manifest.execution_metrics {
+        let control_plane_millis = metrics
+            .planning_millis
+            .saturating_add(metrics.measurement_millis)
+            .saturating_add(metrics.ownership_snapshot_millis)
+            .saturating_add(metrics.mount_snapshot_millis)
+            .saturating_add(metrics.repository_refresh_millis)
+            .saturating_add(metrics.candidate_revalidation_millis);
+        println!(
+            "execution metrics: {} ownership snapshots across {} pressure epochs; {} repository refreshes; {} candidate revalidations; {} generated deletions; {} control-plane ms; {} deletion ms; {} realized",
+            metrics.ownership_snapshots,
+            metrics.pressure_epochs,
+            metrics.repository_refreshes,
+            metrics.candidate_revalidations,
+            metrics.generated_deletions,
+            control_plane_millis,
+            metrics.deletion_millis,
+            format_bytes(metrics.realized_reclaim_bytes)
+        );
+    }
     for repository in &run.manifest.repositories {
         println!();
         println!("=== {} ===", repository.manifest.repo_root.display());
@@ -2584,7 +3583,14 @@ fn scan_generated_dirs_for_worktree(
         let has_tracked_files = tracked_paths
             .iter()
             .any(|tracked| path_is_under(tracked, &relative_key));
-        let mtime_unix = sampled_mtime_unix(&candidate.path, GENERATED_MTIME_SAMPLE_DEPTH);
+        let sampled_mtime = sampled_mtime(&candidate.path, GENERATED_MTIME_SAMPLE_DEPTH);
+        let mtime_unix = sampled_mtime.and_then(system_time_to_unix);
+        let mtime_nanos = sampled_mtime.and_then(|modified| {
+            modified
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.subsec_nanos())
+        });
         let dir_recent = mtime_unix
             .and_then(|unix| age_days(policy.now, unix))
             .is_some_and(|days| days < effective_days);
@@ -2804,6 +3810,7 @@ fn scan_generated_dirs_for_worktree(
             ignored,
             has_tracked_files,
             mtime_unix,
+            mtime_nanos,
             mtime: mtime_unix.map(format_unix_time),
             effective_days,
             in_use,
@@ -2916,8 +3923,8 @@ fn plan_sweep_decisions(
 // direct child is added or removed, so an actively-written build cache
 // (e.g. .next/server/app during a dev session) can look stale from the
 // top-level stat alone.
-fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
-    let mut newest = None;
+fn sampled_mtime(path: &Path, depth: usize) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
 
     for entry in WalkDir::new(path)
         .follow_links(false)
@@ -2928,12 +3935,37 @@ fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
         let modified = entry
             .metadata()
             .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(system_time_to_unix);
-        newest = max_time(newest, modified);
+            .and_then(|metadata| metadata.modified().ok());
+        newest = match (newest, modified) {
+            (Some(current), Some(modified)) => Some(current.max(modified)),
+            (None, modified) => modified,
+            (current, None) => current,
+        };
     }
 
     newest
+}
+
+fn exact_sampled_mtime(path: &Path, depth: usize) -> Result<(i64, u32)> {
+    let mut newest = None;
+    for entry in WalkDir::new(path).follow_links(false).max_depth(depth) {
+        let entry = entry
+            .with_context(|| format!("failed to inspect activity beneath {}", path.display()))?;
+        let modified = entry
+            .metadata()
+            .with_context(|| format!("failed to read metadata for {}", entry.path().display()))?
+            .modified()
+            .with_context(|| format!("failed to read mtime for {}", entry.path().display()))?;
+        newest = Some(newest.map_or(modified, |current: SystemTime| current.max(modified)));
+    }
+    let modified = newest.context("generated candidate activity scan returned no entries")?;
+    let duration = modified
+        .duration_since(UNIX_EPOCH)
+        .context("generated candidate activity predates the Unix epoch")?;
+    Ok((
+        i64::try_from(duration.as_secs()).context("generated candidate mtime exceeds i64")?,
+        duration.subsec_nanos(),
+    ))
 }
 
 // Best-effort open-handle probe. On macOS, planning captures process cwd/root
@@ -2943,34 +3975,45 @@ fn sampled_mtime_unix(path: &Path, depth: usize) -> Option<i64> {
 // budget exhaustion fails closed without cascading into a second global scan.
 // Every generated candidate is matched against the captured
 // paths in memory, avoiding repeated directory walks while observing ownership
-// at any depth beneath a candidate. Every execution pass takes fresh evidence
-// and rechecks each candidate before mutation. If no shared snapshot is
-// supplied, callers capture one fresh recursive global snapshot rather than
-// falling back to a descendant-blind path-scoped probe. If the ownership
-// backend is unavailable, an explicitly requested check keeps every candidate
-// rather than degrading to mtime-only deletion authority.
+// at any depth beneath a candidate. Root execution supplies one fresh snapshot
+// per routine repository or bounded pressure epoch, while exact candidate
+// guards are still revalidated immediately before mutation. If no shared
+// snapshot is supplied, callers capture one fresh recursive global snapshot
+// rather than falling back to a descendant-blind path-scoped probe. If the
+// ownership backend is unavailable, an explicitly requested check keeps every
+// candidate rather than degrading to mtime-only deletion authority.
 #[cfg(target_os = "macos")]
 pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
+    capture_open_handle_snapshot_with_backend().0
+}
+
+#[cfg(target_os = "macos")]
+fn capture_open_handle_snapshot_with_backend() -> (OpenHandleSnapshot, &'static str) {
     match macos_open_handles::capture() {
-        Ok(paths) => OpenHandleSnapshot::Available(paths),
+        Ok(paths) => (OpenHandleSnapshot::Available(paths), "macos_libproc"),
         Err(error) if macos_open_handles::is_resource_limit(&error) => {
             eprintln!(
                 "warning: native macOS open-handle snapshot exceeded its resource budget ({error}); keeping all generated paths protected"
             );
-            OpenHandleSnapshot::Indeterminate
+            (OpenHandleSnapshot::Indeterminate, "macos_libproc")
         }
         Err(error) => {
             eprintln!(
                 "warning: native macOS open-handle snapshot failed ({error}); falling back to one global lsof snapshot"
             );
-            capture_lsof_open_handle_snapshot()
+            (capture_lsof_open_handle_snapshot(), "lsof_global")
         }
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
-    capture_lsof_open_handle_snapshot()
+    capture_open_handle_snapshot_with_backend().0
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn capture_open_handle_snapshot_with_backend() -> (OpenHandleSnapshot, &'static str) {
+    (capture_lsof_open_handle_snapshot(), "lsof_global")
 }
 
 #[cfg(unix)]
@@ -3344,7 +4387,12 @@ fn lsof_probe_error(success: bool, status_code: Option<i32>, stderr: &[u8]) -> O
 
 #[cfg(not(unix))]
 pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
-    OpenHandleSnapshot::Unavailable
+    capture_open_handle_snapshot_with_backend().0
+}
+
+#[cfg(not(unix))]
+fn capture_open_handle_snapshot_with_backend() -> (OpenHandleSnapshot, &'static str) {
+    (OpenHandleSnapshot::Unavailable, "unsupported")
 }
 
 #[cfg(not(unix))]
@@ -3806,6 +4854,25 @@ fn sort_generated_deletions(
 ) {
     generated_deletions.sort_by_key(|decision| {
         let measurement = decision.measurement.as_ref();
+        let measurement_incomplete = pass != ExecutionPass::Routine
+            && !measurement.is_some_and(|measurement| {
+                measurement.complete
+                    && measurement.metrics.private_reclaimable_complete
+                    && measurement.metrics.errors == 0
+            });
+        let pressure_private_per_entry = if pass == ExecutionPass::Routine {
+            0
+        } else {
+            measurement
+                .map(|measurement| {
+                    measurement
+                        .metrics
+                        .private_reclaimable_bytes
+                        .checked_div(measurement.visited_entries.max(1))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
         let pressure_private = if pass == ExecutionPass::Routine {
             0
         } else {
@@ -3813,17 +4880,11 @@ fn sort_generated_deletions(
                 .map(|measurement| measurement.metrics.private_reclaimable_bytes)
                 .unwrap_or_default()
         };
-        let pressure_allocated = if pass == ExecutionPass::Routine {
-            0
-        } else {
-            measurement
-                .map(|measurement| measurement.metrics.allocated_bytes)
-                .unwrap_or_default()
-        };
         (
             generated_rebuild_rank(&decision.name),
+            u8::from(measurement_incomplete),
+            std::cmp::Reverse(pressure_private_per_entry),
             std::cmp::Reverse(pressure_private),
-            std::cmp::Reverse(pressure_allocated),
             decision.mtime_unix.unwrap_or(i64::MAX),
             decision.path.clone(),
         )
@@ -3834,6 +4895,8 @@ fn execute_cleanup(
     manifest: &CleanupManifest,
     pass: ExecutionPass,
     only_generated_path: Option<&Path>,
+    open_handles: Option<&OpenHandleSnapshot>,
+    ownership_deadline: Option<Instant>,
 ) -> Result<()> {
     let mut worktree_removals = manifest
         .worktrees
@@ -3889,13 +4952,21 @@ fn execute_cleanup(
         manifest.generated_at.replace([':', '.'], "-"),
         std::process::id()
     );
-    let execution_open_handles = manifest.check_in_use.then(capture_open_handle_snapshot);
+    let captured_open_handles;
+    let execution_open_handles = if open_handles.is_some() {
+        open_handles
+    } else if manifest.check_in_use {
+        captured_open_handles = capture_open_handle_snapshot();
+        Some(&captured_open_handles)
+    } else {
+        None
+    };
     let execution_open_generated_dirs = if manifest.check_in_use {
         dirs_with_open_handles(
             generated_deletions
                 .iter()
                 .map(|decision| decision.path.as_path()),
-            execution_open_handles.as_ref(),
+            execution_open_handles,
         )
     } else {
         HashSet::new()
@@ -3908,7 +4979,7 @@ fn execute_cleanup(
     let execution_owned_worktrees = if manifest.check_in_use {
         dirs_with_open_handles(
             owner_free_worktrees.iter().map(PathBuf::as_path),
-            execution_open_handles.as_ref(),
+            execution_open_handles,
         )
     } else {
         // An owner-free decision must never survive a malformed or stale
@@ -3976,6 +5047,37 @@ fn execute_cleanup(
             remove_generated_directory(
                 decision,
                 manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
+                || {
+                    if pass != ExecutionPass::Routine {
+                        match revalidate_before_ownership_deadline(ownership_deadline, || {
+                            revalidate_generated_candidate(decision, execution_open_handles, None)
+                        }) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                eprintln!(
+                                    "  keeping {} because its ownership epoch expired while waiting for or revalidating deletion authority",
+                                    decision.path.display()
+                                );
+                                return Ok(false);
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "  keeping {} because immediate candidate revalidation failed: {error:#}",
+                                    decision.path.display()
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    } else if ownership_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        eprintln!(
+                            "  keeping {} because its ownership epoch expired while waiting for deletion authority",
+                            decision.path.display()
+                        );
+                        return Ok(false);
+                    }
+                    Ok(true)
+                },
             )
         })? {
             ProtectionGuardOutcome::Protected(lease) => {
@@ -3984,8 +5086,9 @@ fn execute_cleanup(
             }
             ProtectionGuardOutcome::Executed(result) => result,
         };
-        if let Err(error) = result {
-            if manifest.defer_lock_timeouts && is_cargo_lock_timeout(&error) {
+        let removed = match result {
+            Ok(removed) => removed,
+            Err(error) if manifest.defer_lock_timeouts && is_cargo_lock_timeout(&error) => {
                 write_deferred_cargo_action(decision, &run_id, &error)?;
                 eprintln!(
                     "  deferred {} until a later run: {error:#}",
@@ -3993,7 +5096,10 @@ fn execute_cleanup(
                 );
                 continue;
             }
-            return Err(error);
+            Err(error) => return Err(error),
+        };
+        if !removed {
+            continue;
         }
     }
 
@@ -4039,9 +5145,331 @@ fn execute_cleanup(
         pass,
         &worktree_removals,
         &mut satisfied_filesystems,
+        execution_open_handles,
     )?;
 
     Ok(())
+}
+
+fn revalidate_generated_candidate(
+    decision: &GeneratedDirDecision,
+    open_handles: Option<&OpenHandleSnapshot>,
+    mount_points: Option<&[PathBuf]>,
+) -> Result<()> {
+    anyhow::ensure!(
+        decision.action == GeneratedDirAction::Delete
+            && decision.cleanup_class == CleanupClass::Pressure,
+        "candidate is no longer an actionable pressure deletion"
+    );
+    anyhow::ensure!(
+        decision.protection.is_none(),
+        "candidate had an applicable protection at planning time"
+    );
+    if decision.owner_free_pressure {
+        anyhow::ensure!(
+            decision.ownership_evidence_complete,
+            "owner-free candidate lacks complete planned ownership evidence"
+        );
+        anyhow::ensure!(
+            open_handles.is_some(),
+            "owner-free pressure execution requires a supplied ownership epoch snapshot"
+        );
+    }
+    let identity = decision
+        .identity
+        .as_ref()
+        .context("candidate has no planned identity")?;
+    let measurement = decision
+        .measurement
+        .as_ref()
+        .context("candidate has no planned measurement")?;
+    revalidate_generated_candidate_boundary(GeneratedCandidateBoundary {
+        worktree: &decision.worktree_path,
+        active_path: &decision.path,
+        approved_candidate: &decision.path,
+        candidate_name: &decision.name,
+        identity,
+        measurement,
+        quarantined: false,
+        mount_points,
+    })?;
+    let planned_activity = decision
+        .mtime_unix
+        .zip(decision.mtime_nanos)
+        .context("candidate has no complete planned activity sample")?;
+    let current_activity = exact_sampled_mtime(&decision.path, GENERATED_MTIME_SAMPLE_DEPTH)?;
+    anyhow::ensure!(
+        current_activity == planned_activity,
+        "generated directory activity changed after planning"
+    );
+    let worktree = decision.worktree_path.clone();
+    let candidate = decision.path.clone();
+    let ownership_paths = if decision.owner_free_pressure {
+        vec![worktree.clone(), candidate.clone()]
+    } else {
+        vec![candidate.clone()]
+    };
+    if open_handles.is_some() {
+        let owned =
+            dirs_with_open_handles(ownership_paths.iter().map(PathBuf::as_path), open_handles);
+        anyhow::ensure!(
+            owned.is_empty(),
+            "ownership epoch matched candidate or worktree: {}",
+            owned
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+pub(crate) struct GeneratedCandidateBoundary<'a> {
+    pub(crate) worktree: &'a Path,
+    pub(crate) active_path: &'a Path,
+    pub(crate) approved_candidate: &'a Path,
+    pub(crate) candidate_name: &'a str,
+    pub(crate) identity: &'a GeneratedDirIdentity,
+    pub(crate) measurement: &'a GeneratedDirMeasurement,
+    pub(crate) quarantined: bool,
+    pub(crate) mount_points: Option<&'a [PathBuf]>,
+}
+
+pub(crate) fn revalidate_generated_candidate_boundary(
+    boundary: GeneratedCandidateBoundary<'_>,
+) -> Result<()> {
+    let GeneratedCandidateBoundary {
+        worktree,
+        active_path,
+        approved_candidate,
+        candidate_name,
+        identity,
+        measurement,
+        quarantined,
+        mount_points,
+    } = boundary;
+    let canonical_worktree = fs::canonicalize(worktree).with_context(|| {
+        format!(
+            "failed to resolve candidate worktree {}",
+            worktree.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical_worktree == worktree,
+        "candidate worktree canonical identity changed"
+    );
+    let canonical_active = fs::canonicalize(active_path)
+        .with_context(|| format!("failed to resolve candidate {}", active_path.display()))?;
+    if !quarantined {
+        anyhow::ensure!(
+            active_path == approved_candidate
+                && canonical_active == identity.canonical_path
+                && canonical_active.starts_with(&canonical_worktree),
+            "candidate canonical containment changed"
+        );
+        anyhow::ensure!(
+            canonical_active.file_name() == Some(OsStr::new(candidate_name)),
+            "candidate name no longer matches its path"
+        );
+        validate_git_generated_boundary(&canonical_worktree, &canonical_active)?;
+    }
+    anyhow::ensure!(
+        measurement.complete
+            && measurement.metrics.private_reclaimable_complete
+            && measurement.metrics.errors == 0
+            && measurement.visited_entries <= GENERATED_MEASUREMENT_MAX_ENTRIES_PER_CANDIDATE
+            && measurement.filesystem == identity.filesystem,
+        "candidate has no complete physical measurement"
+    );
+    #[cfg(unix)]
+    anyhow::ensure!(
+        identity.device.is_some() && identity.inode.is_some(),
+        "approved Unix candidate identity lacks device/inode"
+    );
+    let live_identity = generated_dir_identity(active_path)?;
+    anyhow::ensure!(
+        identity.filesystem == live_identity.filesystem
+            && identity.device == live_identity.device
+            && identity.inode == live_identity.inode
+            && identity.modified_unix == live_identity.modified_unix
+            && identity.modified_nanos == live_identity.modified_nanos
+            && (quarantined || identity.canonical_path == live_identity.canonical_path),
+        "candidate filesystem identity changed"
+    );
+    ensure_single_filesystem_tree(active_path, &identity.filesystem, mount_points)?;
+    Ok(())
+}
+
+pub(crate) fn validate_git_generated_boundary(worktree: &Path, candidate: &Path) -> Result<()> {
+    let relative = candidate.strip_prefix(worktree).with_context(|| {
+        format!(
+            "candidate {} is outside worktree {}",
+            candidate.display(),
+            worktree.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "candidate path is not a normal worktree descendant"
+    );
+    let relative = relative
+        .to_str()
+        .context("candidate relative path is not valid UTF-8")?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let mut literal_pathspec = OsString::from(":(top,literal)");
+    literal_pathspec.push(relative);
+    let tracked = Command::new("git")
+        .args(["ls-files", "-z", "--"])
+        .arg(literal_pathspec)
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run git ls-files in {}", worktree.display()))?;
+    anyhow::ensure!(
+        tracked.status.success(),
+        "git ls-files failed in {}: {}",
+        worktree.display(),
+        String::from_utf8_lossy(&tracked.stderr).trim()
+    );
+    anyhow::ensure!(
+        tracked.stdout.is_empty(),
+        "candidate now contains tracked content"
+    );
+    Ok(())
+}
+
+pub(crate) fn ensure_single_filesystem_tree(
+    path: &Path,
+    expected_filesystem: &str,
+    mount_points: Option<&[PathBuf]>,
+) -> Result<()> {
+    let captured_mount_points;
+    let mount_points = match mount_points {
+        Some(mount_points) => mount_points,
+        None => {
+            captured_mount_points = system_mount_points()?;
+            &captured_mount_points
+        }
+    };
+    ensure_no_nested_mount_points(path, mount_points)?;
+    let actual_filesystem = filesystem_key(path)?;
+    anyhow::ensure!(
+        actual_filesystem == expected_filesystem,
+        "candidate filesystem changed: expected {}, found {}",
+        expected_filesystem,
+        actual_filesystem
+    );
+    Ok(())
+}
+
+fn ensure_no_nested_mount_points(path: &Path, mount_points: &[PathBuf]) -> Result<()> {
+    let path = fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize candidate {}", path.display()))?;
+    for mount_point in mount_points {
+        if mount_point == &path {
+            bail!(
+                "candidate root is a mount point at {}",
+                mount_point.display()
+            );
+        }
+        if mount_point.starts_with(&path) {
+            bail!(
+                "candidate contains a nested mount point at {}",
+                mount_point.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn system_mount_points() -> Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    anyhow::ensure!(count >= 0, "failed to enumerate mounted filesystems");
+    let capacity = usize::try_from(count)?.saturating_add(16);
+    let mut mounts = (0..capacity)
+        .map(|_| unsafe { std::mem::zeroed::<libc::statfs>() })
+        .collect::<Vec<_>>();
+    let buffer_size = i32::try_from(
+        mounts
+            .len()
+            .saturating_mul(std::mem::size_of::<libc::statfs>()),
+    )?;
+    let written = unsafe { libc::getfsstat(mounts.as_mut_ptr(), buffer_size, libc::MNT_NOWAIT) };
+    anyhow::ensure!(written >= 0, "failed to read mounted filesystems");
+    let written = usize::try_from(written)?;
+    anyhow::ensure!(
+        written < mounts.len(),
+        "mounted filesystem table changed during enumeration"
+    );
+    mounts.truncate(written);
+    mounts
+        .into_iter()
+        .map(|mount| {
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    mount.f_mntonname.as_ptr().cast::<u8>(),
+                    mount.f_mntonname.len(),
+                )
+            };
+            let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(&raw[..end]));
+            fs::canonicalize(&path)
+                .with_context(|| format!("failed to canonicalize mount point {}", path.display()))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn system_mount_points() -> Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mountinfo = fs::read("/proc/self/mountinfo").context("failed to read Linux mount table")?;
+    mountinfo
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let field = line
+                .split(|byte| *byte == b' ')
+                .nth(4)
+                .context("invalid Linux mount table entry")?;
+            let mut decoded = Vec::with_capacity(field.len());
+            let mut index = 0;
+            while index < field.len() {
+                if field[index] == b'\\' && index + 3 < field.len() {
+                    let octal = &field[index + 1..index + 4];
+                    if octal.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+                        decoded.push(
+                            (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'),
+                        );
+                        index += 4;
+                        continue;
+                    }
+                }
+                decoded.push(field[index]);
+                index += 1;
+            }
+            let path = PathBuf::from(std::ffi::OsString::from_vec(decoded));
+            fs::canonicalize(&path)
+                .with_context(|| format!("failed to canonicalize mount point {}", path.display()))
+        })
+        .collect()
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+pub(crate) fn system_mount_points() -> Result<Vec<PathBuf>> {
+    bail!("generated execution cannot verify mount boundaries on this Unix platform")
+}
+
+#[cfg(not(unix))]
+pub(crate) fn system_mount_points() -> Result<Vec<PathBuf>> {
+    Ok(Vec::new())
 }
 
 fn execute_worktree_removals(
@@ -4049,6 +5477,7 @@ fn execute_worktree_removals(
     pass: ExecutionPass,
     worktree_removals: &[&WorktreeDecision],
     satisfied_filesystems: &mut HashSet<String>,
+    open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<()> {
     for (index, decision) in worktree_removals.iter().enumerate() {
         if !decision.path.exists() {
@@ -4062,7 +5491,7 @@ fn execute_worktree_removals(
         if pull_request_revalidation_required(
             manifest.pull_requests.as_ref(),
             decision.removal_trigger,
-        ) && !revalidate_pull_request_removal(manifest, decision)?
+        ) && !revalidate_pull_request_removal(manifest, decision, open_handles)?
         {
             continue;
         }
@@ -4104,6 +5533,7 @@ fn pull_request_revalidation_required(
 fn revalidate_pull_request_removal(
     manifest: &CleanupManifest,
     decision: &WorktreeDecision,
+    open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<bool> {
     let Some(policy) = manifest.pull_requests.as_ref() else {
         eprintln!(
@@ -4181,16 +5611,28 @@ fn revalidate_pull_request_removal(
         return Ok(false);
     }
 
-    let ownership = process_ownership_evidence_for_paths(std::slice::from_ref(&decision.path));
-    if !ownership.complete || !ownership.observations.is_empty() {
+    let owned = dirs_with_open_handles(std::iter::once(decision.path.as_path()), open_handles);
+    if !owned.is_empty() {
         eprintln!(
-            "  keeping {} because fresh ownership evidence is incomplete or active: {}",
-            decision.path.display(),
-            serde_json::to_string(&ownership).unwrap_or_else(|_| "unavailable".to_string())
+            "  keeping {} because the shared execution snapshot is incomplete or has active ownership",
+            decision.path.display()
+        );
+        return Ok(false);
+    }
+    let fresh_ownership =
+        process_ownership_evidence_for_paths(std::slice::from_ref(&decision.path));
+    if !fresh_ownership_allows_removal(&fresh_ownership) {
+        eprintln!(
+            "  keeping {} because ownership evidence captured after PR revalidation is incomplete or active",
+            decision.path.display()
         );
         return Ok(false);
     }
     Ok(true)
+}
+
+fn fresh_ownership_allows_removal(evidence: &ProcessOwnershipEvidence) -> bool {
+    evidence.complete && evidence.observations.is_empty()
 }
 
 fn age_pull_request_evidence_matches(
@@ -4373,31 +5815,39 @@ fn print_execution_protection(path: &Path, lease: &ProtectionMatch) {
 fn remove_generated_directory(
     decision: &GeneratedDirDecision,
     cargo_lock_timeout: Option<Duration>,
-) -> Result<()> {
+    before_remove: impl Fn() -> Result<bool>,
+) -> Result<bool> {
     if !decision.path.exists() {
-        return Ok(());
+        return Ok(false);
     }
 
-    let remove = || fs::remove_dir_all(&decision.path);
+    let remove = || {
+        if !before_remove()? {
+            return Ok(false);
+        }
+        fs::remove_dir_all(&decision.path)
+            .map_err(Into::into)
+            .map(|()| true)
+    };
     if decision.name == "target"
         && cargo_lock_timeout.is_some()
         && cargo_profile_locks_present(&decision.path)?
     {
-        with_cargo_profile_locks_timeout(
+        return with_cargo_profile_locks_timeout(
             &decision.path,
             &decision.worktree_path,
             cargo_lock_timeout,
             |_| remove(),
-        )??;
+        )?;
     } else if decision.name == "target" && cargo_lock_timeout.is_some() {
         eprintln!(
             "  keeping {} because it has no Cargo profile locks to coordinate",
             decision.path.display()
         );
     } else {
-        remove()?;
+        return remove();
     }
-    Ok(())
+    Ok(false)
 }
 
 fn write_deferred_cargo_action(
@@ -5046,7 +6496,7 @@ fn system_time_to_unix(time: SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use tempfile::TempDir;
 
     fn now() -> SystemTime {
@@ -6194,6 +7644,7 @@ mod tests {
             name: "target".to_string(),
             mtime: None,
             mtime_unix: None,
+            mtime_nanos: None,
             effective_days: 3,
             in_use: false,
             ownership_evidence_complete: false,
@@ -6210,13 +7661,14 @@ mod tests {
             reason: "stale target".to_string(),
         };
 
-        let error = remove_generated_directory(&decision, Some(Duration::from_millis(20)))
-            .expect_err("contended target deletion should time out");
+        let error =
+            remove_generated_directory(&decision, Some(Duration::from_millis(20)), || Ok(true))
+                .expect_err("contended target deletion should time out");
         assert!(is_cargo_lock_timeout(&error));
         assert!(decision.path.exists());
 
         held.unlock()?;
-        remove_generated_directory(&decision, Some(Duration::from_secs(1)))?;
+        remove_generated_directory(&decision, Some(Duration::from_secs(1)), || Ok(true))?;
         assert!(!decision.path.exists());
         Ok(())
     }
@@ -6234,6 +7686,7 @@ mod tests {
             name: "target".to_string(),
             mtime: None,
             mtime_unix: None,
+            mtime_nanos: None,
             effective_days: 3,
             in_use: false,
             ownership_evidence_complete: false,
@@ -6250,7 +7703,7 @@ mod tests {
             reason: "stale target".to_string(),
         };
 
-        remove_generated_directory(&decision, Some(Duration::from_millis(20)))?;
+        remove_generated_directory(&decision, Some(Duration::from_millis(20)), || Ok(true))?;
         assert!(decision.path.exists());
         Ok(())
     }
@@ -6608,6 +8061,7 @@ mod tests {
             name: "target".to_string(),
             mtime: None,
             mtime_unix: None,
+            mtime_nanos: None,
             effective_days: 3,
             in_use: false,
             ownership_evidence_complete: false,
@@ -7171,6 +8625,33 @@ mod tests {
     }
 
     #[test]
+    fn post_pr_revalidation_ownership_must_be_complete_and_clear() {
+        let clear = ProcessOwnershipEvidence {
+            observed_at_unix: 1_800_000_000,
+            backend: "fixture".to_string(),
+            complete: true,
+            error: None,
+            observations: Vec::new(),
+        };
+        assert!(fresh_ownership_allows_removal(&clear));
+
+        let mut incomplete = clear.clone();
+        incomplete.complete = false;
+        incomplete.error = Some("fixture incomplete".to_string());
+        assert!(!fresh_ownership_allows_removal(&incomplete));
+
+        let mut active = clear;
+        active.observations.push(ProcessOwnershipObservation {
+            pid: Some(42),
+            command: Some("fixture".to_string()),
+            evidence_kind: ProcessOwnershipEvidenceKind::ProcessCwd,
+            observed_path: PathBuf::from("/worktree"),
+            matched_path: PathBuf::from("/worktree"),
+        });
+        assert!(!fresh_ownership_allows_removal(&active));
+    }
+
+    #[test]
     fn explicit_protection_keeps_a_clean_stale_worktree() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let worktree = repo.with_file_name("protected-stale");
@@ -7235,41 +8716,45 @@ mod tests {
 
     #[test]
     fn pressure_order_enforces_rebuild_classes_across_repositories() {
-        let generated =
-            |repo: &str, name: &str, mtime_unix: i64, private_reclaimable_bytes: u64| {
-                GeneratedDirDecision {
-                    path: PathBuf::from(repo).join(name),
-                    worktree_path: PathBuf::from(repo),
-                    name: name.to_string(),
-                    mtime: None,
-                    mtime_unix: Some(mtime_unix),
-                    effective_days: 1,
-                    in_use: false,
-                    ownership_evidence_complete: false,
-                    worktree_in_use: false,
-                    owner_free_pressure: false,
-                    protection: None,
-                    cleanup_class: CleanupClass::Pressure,
-                    identity: None,
-                    measurement: Some(GeneratedDirMeasurement {
-                        measured_at_unix: 1,
-                        filesystem: "fixture".to_string(),
-                        complete: true,
-                        visited_entries: 1,
-                        metrics: InventoryMetrics {
-                            allocated_bytes: private_reclaimable_bytes,
-                            private_reclaimable_bytes,
-                            private_reclaimable_complete: true,
-                            ..InventoryMetrics::default()
-                        },
-                    }),
-                    source_dirty_count_without_candidate: None,
-                    source_status_sha256_without_candidate: None,
-                    sweeps: Vec::new(),
-                    action: GeneratedDirAction::Delete,
-                    reason: "pressure fixture".to_string(),
-                }
-            };
+        let generated = |repo: &str,
+                         name: &str,
+                         mtime_unix: i64,
+                         private_reclaimable_bytes: u64,
+                         visited_entries: u64| {
+            GeneratedDirDecision {
+                path: PathBuf::from(repo).join(name),
+                worktree_path: PathBuf::from(repo),
+                name: name.to_string(),
+                mtime: None,
+                mtime_unix: Some(mtime_unix),
+                mtime_nanos: Some(0),
+                effective_days: 1,
+                in_use: false,
+                ownership_evidence_complete: false,
+                worktree_in_use: false,
+                owner_free_pressure: false,
+                protection: None,
+                cleanup_class: CleanupClass::Pressure,
+                identity: None,
+                measurement: Some(GeneratedDirMeasurement {
+                    measured_at_unix: 1,
+                    filesystem: "fixture".to_string(),
+                    complete: true,
+                    visited_entries,
+                    metrics: InventoryMetrics {
+                        allocated_bytes: private_reclaimable_bytes,
+                        private_reclaimable_bytes,
+                        private_reclaimable_complete: true,
+                        ..InventoryMetrics::default()
+                    },
+                }),
+                source_dirty_count_without_candidate: None,
+                source_status_sha256_without_candidate: None,
+                sweeps: Vec::new(),
+                action: GeneratedDirAction::Delete,
+                reason: "pressure fixture".to_string(),
+            }
+        };
         let repository = |repo: &str, generated_dirs: Vec<GeneratedDirDecision>| CleanupRun {
             manifest_path: PathBuf::from(repo).join("manifest.json"),
             manifest: CleanupManifest {
@@ -7307,18 +8792,19 @@ mod tests {
                 repository(
                     "/code/a",
                     vec![
-                        generated("/code/a", "node_modules", 10, 50),
-                        generated("/code/a", ".turbo", 20, 1_000),
+                        generated("/code/a", "node_modules", 10, 50, 1),
+                        generated("/code/a", ".turbo", 20, 1_000, 100),
                     ],
                 ),
                 repository(
                     "/code/b",
                     vec![
-                        generated("/code/b", ".next", 5, 500),
-                        generated("/code/b", ".turbo", 10, 100),
+                        generated("/code/b", ".next", 5, 500, 1),
+                        generated("/code/b", ".turbo", 10, 100, 1),
                     ],
                 ),
             ],
+            execution_metrics: None,
         };
 
         let turbo_candidates = || {
@@ -7334,7 +8820,7 @@ mod tests {
             &mut pressure_candidates,
             ExecutionPass::PressureGenerated(0),
         );
-        assert_eq!(pressure_candidates[0].path, PathBuf::from("/code/a/.turbo"));
+        assert_eq!(pressure_candidates[0].path, PathBuf::from("/code/b/.turbo"));
         let mut routine_candidates = turbo_candidates();
         sort_generated_deletions(&mut routine_candidates, ExecutionPass::Routine);
         assert_eq!(routine_candidates[0].path, PathBuf::from("/code/b/.turbo"));
@@ -7342,8 +8828,8 @@ mod tests {
         assert_eq!(
             pressure_generated_candidate_order(&manifest, 0),
             vec![
-                (0, PathBuf::from("/code/a/.turbo")),
-                (1, PathBuf::from("/code/b/.turbo"))
+                (1, PathBuf::from("/code/b/.turbo")),
+                (0, PathBuf::from("/code/a/.turbo"))
             ]
         );
         assert_eq!(
@@ -7354,51 +8840,738 @@ mod tests {
             pressure_generated_candidate_order(&manifest, 3),
             vec![(0, PathBuf::from("/code/a/node_modules"))]
         );
+        let groups = pressure_epoch_worktree_groups(
+            &manifest,
+            &[
+                (0, PathBuf::from("/code/a/.turbo")),
+                (1, PathBuf::from("/code/b/.turbo")),
+            ],
+        );
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains(&(0, PathBuf::from("/code/a"))));
+        assert!(groups.contains(&(1, PathBuf::from("/code/b"))));
+
+        let epoch = [
+            (0, PathBuf::from("/code/a/.turbo")),
+            (1, PathBuf::from("/code/b/.turbo")),
+        ];
+        let mut metrics = ExecutionMetrics::default();
+        record_incomplete_pressure_epoch(&manifest, &epoch, &mut metrics);
+        assert_eq!(metrics.ownership_incomplete_epochs, 1);
+        assert_eq!(metrics.candidate_refusals.len(), 2);
+        assert_eq!(
+            metrics.pressure_stopped_reason.as_deref(),
+            Some("pressure ownership epoch was incomplete")
+        );
+    }
+
+    #[test]
+    fn pressure_queue_batches_more_than_one_hundred_candidates_by_epoch_limit() {
+        let mut candidates = (0..103)
+            .map(|index| (index, PathBuf::from(format!("/candidate/{index}"))))
+            .collect::<VecDeque<_>>();
+        let mut epochs = Vec::new();
+        while !candidates.is_empty() {
+            let epoch = next_pressure_epoch(&candidates);
+            assert!(!epoch.is_empty());
+            assert!(epoch.len() <= PRESSURE_EPOCH_MAX_CANDIDATES);
+            for expected in &epoch {
+                assert_eq!(candidates.pop_front().as_ref(), Some(expected));
+            }
+            epochs.push(epoch.len());
+        }
+        assert_eq!(epochs, vec![25, 25, 25, 25, 3]);
+        assert!(!pressure_epoch_expired(Instant::now()));
+        assert!(pressure_epoch_expired(
+            Instant::now() - PRESSURE_EPOCH_MAX_DURATION
+        ));
+    }
+
+    #[test]
+    fn candidate_revalidation_must_finish_before_the_ownership_deadline() -> Result<()> {
+        let deadline = Instant::now() + Duration::from_millis(1);
+        let allowed = revalidate_before_ownership_deadline(Some(deadline), || {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(())
+        })?;
+        assert!(!allowed);
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_refusal_is_written_before_the_epoch_continues() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("aggregate.json");
+        let mut manifest = RootCleanupManifest {
+            manifest_version: MANIFEST_VERSION,
+            mode: CleanupMode::Execute,
+            generated_at: "fixture".to_string(),
+            roots: Vec::new(),
+            pressure: None,
+            repositories: Vec::new(),
+            execution_metrics: None,
+        };
+        let mut metrics = Some(ExecutionMetrics::default());
+        persist_candidate_refusal(
+            &mut manifest,
+            &mut metrics,
+            CandidateExecutionRefusal {
+                candidate: PathBuf::from("/candidate"),
+                worktree: PathBuf::from("/worktree"),
+                reason: "fixture refusal".to_string(),
+            },
+            &|manifest| {
+                fs::write(&path, serde_json::to_vec_pretty(manifest)?)?;
+                Ok(path.clone())
+            },
+        )?;
+        let persisted: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        assert_eq!(
+            persisted["execution_metrics"]["candidate_refusals"][0]["reason"],
+            "fixture refusal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_queue_propagates_filesystem_lookup_failures() -> Result<()> {
+        let temp = TempDir::new()?;
+        let candidate = temp.path().join("candidate");
+        fs::create_dir(&candidate)?;
+        let mut candidates = VecDeque::from([(3, candidate.clone())]);
+        let error = filter_pressure_candidates(&mut candidates, &HashSet::new(), |_| {
+            bail!("fixture filesystem lookup failure")
+        })
+        .expect_err("filesystem lookup failures must not silently drop candidates");
+        assert_eq!(error.repository_index, 3);
+        assert_eq!(error.path, candidate);
+        assert!(error.error.to_string().contains("fixture filesystem"));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_candidate_observes_processes_that_appear_between_epochs() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules");
+        fs::create_dir(&candidate)?;
+        fs::write(candidate.join("artifact"), "fixture")?;
+        let candidate = fs::canonicalize(candidate)?;
+        let worktree = fs::canonicalize(repo)?;
+        let identity = generated_dir_identity(&candidate)?;
+        let (mtime_unix, mtime_nanos) =
+            exact_sampled_mtime(&candidate, GENERATED_MTIME_SAMPLE_DEPTH)?;
+        let mut decision = GeneratedDirDecision {
+            path: candidate.clone(),
+            worktree_path: worktree,
+            name: "node_modules".to_string(),
+            mtime: None,
+            mtime_unix: Some(mtime_unix),
+            mtime_nanos: Some(mtime_nanos),
+            effective_days: 1,
+            in_use: false,
+            ownership_evidence_complete: true,
+            worktree_in_use: false,
+            owner_free_pressure: true,
+            protection: None,
+            cleanup_class: CleanupClass::Pressure,
+            identity: Some(identity.clone()),
+            measurement: Some(GeneratedDirMeasurement {
+                measured_at_unix: 1,
+                filesystem: identity.filesystem,
+                complete: true,
+                visited_entries: 1,
+                metrics: InventoryMetrics {
+                    private_reclaimable_complete: true,
+                    ..InventoryMetrics::default()
+                },
+            }),
+            source_dirty_count_without_candidate: Some(0),
+            source_status_sha256_without_candidate: Some("fixture".to_string()),
+            sweeps: Vec::new(),
+            action: GeneratedDirAction::Delete,
+            reason: "pressure fixture".to_string(),
+        };
+        let first_epoch = OpenHandleSnapshot::Available(HashSet::new());
+        revalidate_generated_candidate(&decision, Some(&first_epoch), Some(&[]))?;
+
+        let second_epoch =
+            OpenHandleSnapshot::Available(HashSet::from([candidate.join("artifact")]));
+        let error = revalidate_generated_candidate(&decision, Some(&second_epoch), Some(&[]))
+            .expect_err("a process appearing in the next epoch must retain the candidate");
+        assert!(error.to_string().contains("ownership epoch matched"));
+
+        git_output(
+            &decision.worktree_path,
+            ["add", "-f", "node_modules/artifact"],
+        )?;
+        let error = revalidate_generated_candidate(&decision, Some(&first_epoch), Some(&[]))
+            .expect_err("tracked-content drift must retain the candidate");
+        assert!(error.to_string().contains("tracked content"));
+        git_output(
+            &decision.worktree_path,
+            ["reset", "--", "node_modules/artifact"],
+        )?;
+
+        decision
+            .measurement
+            .as_mut()
+            .context("fixture measurement is absent")?
+            .complete = false;
+        let error = revalidate_generated_candidate(&decision, Some(&first_epoch), Some(&[]))
+            .expect_err("measurement-completeness drift must retain the candidate");
+        assert!(error.to_string().contains("complete physical measurement"));
+        decision
+            .measurement
+            .as_mut()
+            .context("fixture measurement is absent")?
+            .complete = true;
+
+        fs::remove_dir_all(&candidate)?;
+        fs::create_dir(&candidate)?;
+        fs::write(candidate.join("artifact"), "replacement")?;
+        let error = revalidate_generated_candidate(&decision, Some(&first_epoch), Some(&[]))
+            .expect_err("filesystem-identity drift must retain the candidate");
+        assert!(error.to_string().contains("filesystem identity changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_candidate_revalidation_rejects_new_recursive_activity() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules");
+        fs::create_dir(&candidate)?;
+        let artifact = candidate.join("artifact");
+        fs::write(&artifact, "planned")?;
+        let candidate = fs::canonicalize(candidate)?;
+        let (mtime_unix, mtime_nanos) =
+            exact_sampled_mtime(&candidate, GENERATED_MTIME_SAMPLE_DEPTH)?;
+        let identity = generated_dir_identity(&candidate)?;
+        let decision = GeneratedDirDecision {
+            path: candidate.clone(),
+            worktree_path: fs::canonicalize(repo)?,
+            name: "node_modules".to_string(),
+            mtime: None,
+            mtime_unix: Some(mtime_unix),
+            mtime_nanos: Some(mtime_nanos),
+            effective_days: 1,
+            in_use: false,
+            ownership_evidence_complete: true,
+            worktree_in_use: false,
+            owner_free_pressure: true,
+            protection: None,
+            cleanup_class: CleanupClass::Pressure,
+            identity: Some(identity.clone()),
+            measurement: Some(GeneratedDirMeasurement {
+                measured_at_unix: 1,
+                filesystem: identity.filesystem,
+                complete: true,
+                visited_entries: 1,
+                metrics: InventoryMetrics {
+                    private_reclaimable_complete: true,
+                    ..InventoryMetrics::default()
+                },
+            }),
+            source_dirty_count_without_candidate: Some(0),
+            source_status_sha256_without_candidate: Some("fixture".to_string()),
+            sweeps: Vec::new(),
+            action: GeneratedDirAction::Delete,
+            reason: "pressure fixture".to_string(),
+        };
+        set_mtime(&artifact, mtime_unix.saturating_add(1))?;
+        let error = revalidate_generated_candidate(
+            &decision,
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+            Some(&[]),
+        )
+        .expect_err("new recursive activity must retain a pressure candidate");
+        assert!(error
+            .to_string()
+            .contains("generated directory activity changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_worktree_group_revalidation_fails_closed_on_source_drift() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let repo = fs::canonicalize(repo)?;
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+        )?;
+        revalidate_pressure_worktree(&run.manifest, &repo)?;
+        fs::write(repo.join("README.md"), "source drift\n")?;
+        let error = revalidate_pressure_worktree(&run.manifest, &repo)
+            .expect_err("source drift must invalidate the whole worktree group");
+        assert!(error.to_string().contains("source status changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_worktree_baseline_advances_only_after_its_own_deletion() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let first = repo.join("first-generated");
+        let second = repo.join("second-generated");
+        fs::create_dir(&first)?;
+        fs::create_dir(&second)?;
+        fs::write(first.join("artifact"), "first")?;
+        fs::write(second.join("artifact"), "second")?;
+        let repo = fs::canonicalize(repo)?;
+        let mut run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+        )?;
+        revalidate_pressure_worktree(&run.manifest, &repo)?;
+
+        fs::remove_dir_all(&first)?;
+        let stale = revalidate_pressure_worktree(&run.manifest, &repo)
+            .expect_err("the old worktree baseline must observe the deleted candidate");
+        assert!(stale.to_string().contains("source status changed"));
+        refresh_planned_worktree_source(&mut run.manifest, &repo)?;
+        revalidate_pressure_worktree(&run.manifest, &repo)?;
+
+        fs::write(repo.join("external-source-change"), "external")?;
+        let external = revalidate_pressure_worktree(&run.manifest, &repo)
+            .expect_err("external source drift must remain fail-closed");
+        assert!(external.to_string().contains("source status changed"));
+        assert!(second.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_epoch_evidence_is_durable_in_execution_metrics() {
+        let mut metrics = ExecutionMetrics::default();
+        let snapshot = record_execution_ownership(
+            "pressure_epoch:1",
+            ProcessOwnershipEvidence {
+                observed_at_unix: 1_800_000_000,
+                backend: "fixture".to_string(),
+                complete: false,
+                error: Some("fixture incomplete".to_string()),
+                observations: Vec::new(),
+            },
+            Duration::from_millis(17),
+            &mut metrics,
+        );
+        assert!(matches!(
+            snapshot.handles,
+            OpenHandleSnapshot::Indeterminate
+        ));
+        assert!(!snapshot.evidence.complete);
+        assert_eq!(metrics.ownership_snapshots, 1);
+        assert_eq!(metrics.ownership_snapshot_millis, 17);
+        assert_eq!(metrics.ownership_backends["fixture"], 1);
+        assert_eq!(metrics.ownership_epochs.len(), 1);
+        assert!(!metrics.ownership_epochs[0].complete);
+        assert_eq!(
+            metrics.ownership_epochs[0].error.as_deref(),
+            Some("fixture incomplete")
+        );
+    }
+
+    #[test]
+    fn routine_execution_captures_fresh_ownership_and_skips_idle_repositories() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let repo = fs::canonicalize(repo)?;
+        let aggregate_manifest = temp.path().join("aggregate.json");
+        let write_root = |manifest: &RootCleanupManifest| {
+            fs::write(&aggregate_manifest, serde_json::to_vec_pretty(manifest)?)?;
+            Ok(aggregate_manifest.clone())
+        };
+        let phases = RefCell::new(Vec::new());
+        let capture = |_: &[PathBuf], phase: &str, metrics: &mut ExecutionMetrics| {
+            phases.borrow_mut().push(phase.to_string());
+            record_execution_ownership(
+                phase,
+                ProcessOwnershipEvidence {
+                    observed_at_unix: 1_800_000_000,
+                    backend: "fixture".to_string(),
+                    complete: true,
+                    error: None,
+                    observations: Vec::new(),
+                },
+                Duration::from_millis(1),
+                metrics,
+            )
+        };
+        let options = CleanupOptions {
+            execute: true,
+            stale_days: 14,
+            generated_days: 0,
+            generated_activity_only: true,
+            check_in_use: true,
+            generated_config: GeneratedDirConfig::default(),
+            cargo_lock_timeout: None,
+            defer_lock_timeouts: false,
+            pressure: None,
+            pull_requests: None,
+            now: now(),
+        };
+
+        let idle = cleanup_repositories_with_capture(
+            std::slice::from_ref(&repo),
+            std::slice::from_ref(&repo),
+            options.clone(),
+            &capture,
+            &write_root,
+        )?;
+        assert_eq!(phases.borrow().as_slice(), ["initial_plan"]);
+        assert_eq!(
+            idle.manifest
+                .execution_metrics
+                .as_ref()
+                .context("execution metrics are absent")?
+                .repository_refreshes,
+            0
+        );
+
+        phases.borrow_mut().clear();
+        let candidate = repo.join(".turbo");
+        fs::create_dir(&candidate)?;
+        fs::write(candidate.join("artifact"), "fixture")?;
+        let stale = system_time_to_unix(SystemTime::now())
+            .context("system time does not fit in Unix time")?
+            - 30 * 86_400;
+        set_mtime(&candidate.join("artifact"), stale)?;
+        set_mtime(&candidate, stale)?;
+        let executed = cleanup_repositories_with_capture(
+            std::slice::from_ref(&repo),
+            std::slice::from_ref(&repo),
+            options,
+            &capture,
+            &write_root,
+        )?;
+        assert_eq!(phases.borrow().len(), 2);
+        assert_eq!(phases.borrow()[0], "initial_plan");
+        assert!(phases.borrow()[1].starts_with("routine_execute:"));
+        assert!(
+            !candidate.exists(),
+            "routine candidate was retained: {:#?}",
+            executed.manifest.repositories[0].manifest.generated_dirs
+        );
+        let metrics = executed
+            .manifest
+            .execution_metrics
+            .as_ref()
+            .context("execution metrics are absent")?;
+        assert_eq!(metrics.ownership_snapshots, 2);
+        assert_eq!(metrics.repository_refreshes, 1);
+        assert_eq!(metrics.generated_deletions, 1);
+        revalidate_pressure_worktree(&executed.manifest.repositories[0].manifest, &repo)?;
+        Ok(())
+    }
+
+    #[test]
+    fn routine_execution_retains_a_candidate_opened_during_refresh() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let repo = fs::canonicalize(repo)?;
+        let candidate = repo.join(".turbo");
+        fs::create_dir(&candidate)?;
+        fs::write(candidate.join("artifact"), "fixture")?;
+        let stale = system_time_to_unix(SystemTime::now())
+            .context("system time does not fit in Unix time")?
+            - 30 * 86_400;
+        set_mtime(&candidate.join("artifact"), stale)?;
+        set_mtime(&candidate, stale)?;
+        let candidate = fs::canonicalize(candidate)?;
+        let aggregate_manifest = temp.path().join("aggregate.json");
+        let capture = |_: &[PathBuf], phase: &str, metrics: &mut ExecutionMetrics| {
+            let observations = if phase.starts_with("routine_execute:") {
+                vec![ProcessOwnershipObservation {
+                    pid: Some(42),
+                    command: Some("fixture".to_string()),
+                    evidence_kind: ProcessOwnershipEvidenceKind::ProcessCwd,
+                    observed_path: candidate.clone(),
+                    matched_path: candidate.clone(),
+                }]
+            } else {
+                Vec::new()
+            };
+            record_execution_ownership(
+                phase,
+                ProcessOwnershipEvidence {
+                    observed_at_unix: 1_800_000_000,
+                    backend: "fixture".to_string(),
+                    complete: true,
+                    error: None,
+                    observations,
+                },
+                Duration::from_millis(1),
+                metrics,
+            )
+        };
+        let run = cleanup_repositories_with_capture(
+            std::slice::from_ref(&repo),
+            std::slice::from_ref(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 14,
+                generated_days: 0,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+            &capture,
+            &|manifest| {
+                fs::write(&aggregate_manifest, serde_json::to_vec_pretty(manifest)?)?;
+                Ok(aggregate_manifest.clone())
+            },
+        )?;
+        assert!(candidate.exists());
+        assert_eq!(
+            run.manifest
+                .execution_metrics
+                .as_ref()
+                .context("execution metrics are absent")?
+                .ownership_snapshots,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn routine_refresh_ownership_covers_initially_inactive_candidates() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join(".turbo");
+        fs::create_dir(&candidate)?;
+        fs::write(candidate.join("artifact"), "recent")?;
+        let repo = fs::canonicalize(repo)?;
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+        )?;
+        let candidate = fs::canonicalize(candidate)?;
+        let repository = CleanupRun {
+            manifest_path: PathBuf::from("/fixture"),
+            manifest: run.manifest,
+        };
+        let paths = repository_routine_ownership_paths(&repository);
+        assert!(paths.contains(&repo));
+        assert!(
+            paths.contains(&candidate),
+            "refresh ownership must include candidates that were initially inactive"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_worktree_refresh_ownership_covers_every_known_worktree() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let linked = temp.path().join("linked");
+        add_worktree(&repo, &linked, "linked-branch")?;
+        let repo = fs::canonicalize(repo)?;
+        let linked = fs::canonicalize(linked)?;
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+        )?;
+        let paths = repository_worktree_ownership_paths(&CleanupRun {
+            manifest_path: PathBuf::from("/fixture"),
+            manifest: run.manifest,
+        });
+        assert!(paths.contains(&repo));
+        assert!(paths.contains(&linked));
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_worktree_revalidation_supports_an_unborn_head() -> Result<()> {
+        let temp = TempDir::new()?;
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo)?;
+        git_output(&repo, ["init"])?;
+        let repo = fs::canonicalize(repo)?;
+        let mut run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+        )?;
+        revalidate_pressure_worktree(&run.manifest, &repo)?;
+        refresh_planned_worktree_source(&mut run.manifest, &repo)?;
+        Ok(())
+    }
+
+    #[test]
+    fn realized_reclaim_sums_each_observed_filesystem() {
+        let observation = |filesystem: &str, available_bytes| PressureObservation {
+            path: PathBuf::from(format!("/{filesystem}")),
+            filesystem: filesystem.to_string(),
+            available_bytes,
+            total_bytes: 1_000,
+        };
+        let before = [observation("first", 100), observation("second", 200)];
+        let after = [observation("first", 150), observation("second", 280)];
+        assert_eq!(realized_reclaim(&before, &after), 130);
+    }
+
+    #[test]
+    fn routine_reclaim_metrics_observe_a_surviving_worktree_parent() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let linked = temp.path().join("routine-removal");
+        add_worktree(&repo, &linked, "routine-removal-branch")?;
+        let linked = fs::canonicalize(linked)?;
+        let mut run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 0,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+        )?;
+        let decision = run
+            .manifest
+            .worktrees
+            .iter_mut()
+            .find(|decision| decision.path == linked)
+            .context("missing linked worktree decision")?;
+        decision.action = WorktreeAction::Remove;
+        decision.cleanup_class = CleanupClass::Routine;
+
+        let paths = routine_execution_observation_paths(&run.manifest)?;
+        let parent = linked
+            .parent()
+            .context("linked worktree has no surviving parent")?
+            .to_path_buf();
+        assert!(paths.contains(&parent));
+        assert!(!paths.contains(&linked));
+        Ok(())
     }
 
     #[test]
     fn pressure_execution_deletes_only_the_selected_generated_candidate() -> Result<()> {
-        let temp = TempDir::new()?;
-        let first = temp.path().join("first/.turbo");
-        let second = temp.path().join("second/.turbo");
+        let (_temp, repo) = init_repo()?;
+        let linked = repo.with_file_name("linked");
+        add_worktree(&repo, &linked, "linked-branch")?;
+        let first = repo.join(".turbo");
+        let second = linked.join(".turbo");
         fs::create_dir_all(&first)?;
         fs::create_dir_all(&second)?;
         fs::write(first.join("artifact"), "first")?;
         fs::write(second.join("artifact"), "second")?;
         let first = fs::canonicalize(first)?;
         let second = fs::canonicalize(second)?;
-        let decision = |path: PathBuf| GeneratedDirDecision {
-            worktree_path: path.parent().expect("candidate has a parent").to_path_buf(),
-            path,
-            name: ".turbo".to_string(),
-            mtime: None,
-            mtime_unix: Some(1),
-            effective_days: 1,
-            in_use: false,
-            ownership_evidence_complete: false,
-            worktree_in_use: false,
-            owner_free_pressure: false,
-            protection: None,
-            cleanup_class: CleanupClass::Pressure,
-            identity: None,
-            measurement: None,
-            source_dirty_count_without_candidate: None,
-            source_status_sha256_without_candidate: None,
-            sweeps: Vec::new(),
-            action: GeneratedDirAction::Delete,
-            reason: "pressure fixture".to_string(),
+        let decision = |path: PathBuf| -> Result<GeneratedDirDecision> {
+            let identity = generated_dir_identity(&path)?;
+            let (mtime_unix, mtime_nanos) =
+                exact_sampled_mtime(&path, GENERATED_MTIME_SAMPLE_DEPTH)?;
+            Ok(GeneratedDirDecision {
+                worktree_path: path
+                    .parent()
+                    .context("candidate has no worktree")?
+                    .to_path_buf(),
+                path: path.clone(),
+                name: ".turbo".to_string(),
+                mtime: None,
+                mtime_unix: Some(mtime_unix),
+                mtime_nanos: Some(mtime_nanos),
+                effective_days: 1,
+                in_use: false,
+                ownership_evidence_complete: true,
+                worktree_in_use: false,
+                owner_free_pressure: false,
+                protection: None,
+                cleanup_class: CleanupClass::Pressure,
+                identity: Some(identity.clone()),
+                measurement: Some(GeneratedDirMeasurement {
+                    measured_at_unix: 1,
+                    filesystem: identity.filesystem,
+                    complete: true,
+                    visited_entries: 1,
+                    metrics: InventoryMetrics {
+                        private_reclaimable_complete: true,
+                        ..InventoryMetrics::default()
+                    },
+                }),
+                source_dirty_count_without_candidate: Some(0),
+                source_status_sha256_without_candidate: Some("fixture".to_string()),
+                sweeps: Vec::new(),
+                action: GeneratedDirAction::Delete,
+                reason: "pressure fixture".to_string(),
+            })
         };
+        let repo = fs::canonicalize(repo)?;
         let manifest = CleanupManifest {
             manifest_version: MANIFEST_VERSION,
             mode: CleanupMode::Execute,
             generated_at: "fixture".to_string(),
-            repo_root: temp.path().to_path_buf(),
-            current_worktree: temp.path().to_path_buf(),
-            git_common_dir: temp.path().join(".git"),
+            repo_root: repo.clone(),
+            current_worktree: repo.clone(),
+            git_common_dir: fs::canonicalize(repo.join(".git"))?,
             stale_days: 14,
             generated_days: 7,
             generated_activity_only: true,
-            check_in_use: false,
+            check_in_use: true,
             cargo_lock_timeout_secs: None,
             defer_lock_timeouts: false,
             pressure: Some(PressurePolicy {
@@ -7408,7 +9581,7 @@ mod tests {
                 stale_days: 7,
                 owner_free_generated: false,
                 active: true,
-                entered_filesystems: vec![filesystem_key(temp.path())?],
+                entered_filesystems: vec![filesystem_key(&repo)?],
             }),
             pull_requests: None,
             generated_delete_names: Vec::new(),
@@ -7418,13 +9591,16 @@ mod tests {
             metadata_prune_enabled: true,
             prune_output: String::new(),
             worktrees: Vec::new(),
-            generated_dirs: vec![decision(first.clone()), decision(second.clone())],
+            generated_dirs: vec![decision(first.clone())?, decision(second.clone())?],
         };
 
-        execute_cleanup_manifest_matching(
+        let snapshot = OpenHandleSnapshot::Available(HashSet::new());
+        execute_cleanup_manifest_matching_with_snapshot(
             &manifest,
             ExecutionPass::PressureGenerated(0),
             Some(&first),
+            Some(&snapshot),
+            None,
         )?;
         assert!(!first.exists());
         assert!(second.exists());
@@ -7525,6 +9701,7 @@ mod tests {
                 final_observations: None,
             }),
             repositories: Vec::new(),
+            execution_metrics: None,
         };
         let mut satisfied_filesystems = HashSet::new();
 
@@ -8382,6 +10559,12 @@ mod tests {
         assert_eq!(candidate.action, GeneratedDirAction::Delete);
         assert_eq!(candidate.cleanup_class, CleanupClass::Pressure);
         assert_eq!(candidate.effective_days, 1);
+        let private_measurement_complete =
+            candidate.measurement.as_ref().is_some_and(|measurement| {
+                measurement.complete
+                    && measurement.metrics.private_reclaimable_complete
+                    && measurement.metrics.errors == 0
+            });
         assert!(repo.join("node_modules").is_dir());
 
         cleanup(
@@ -8400,7 +10583,11 @@ mod tests {
                 now: now(),
             },
         )?;
-        assert!(!repo.join("node_modules").exists());
+        assert_eq!(
+            repo.join("node_modules").exists(),
+            !private_measurement_complete,
+            "pressure deletion must require complete private-reclaim evidence"
+        );
         Ok(())
     }
 
@@ -8930,7 +11117,7 @@ mod tests {
             set_mtime(&path, pressure_only)?;
         }
 
-        let run = cleanup(
+        let mut run = cleanup(
             Some(&repo),
             CleanupOptions {
                 execute: false,
@@ -8969,6 +11156,54 @@ mod tests {
                     .iter()
                     .any(|candidate| candidate.action == SweepCandidateAction::Delete)
         }));
+
+        let target_path = target.path.clone();
+        let original_identity = target.identity.clone();
+        let original_entries = target
+            .measurement
+            .as_ref()
+            .context("missing target measurement")?
+            .visited_entries;
+        fs::remove_dir_all(&root)?;
+        set_mtime(&target_path, unix_days_before_now(0))?;
+        refresh_generated_candidates_after_sweeps(&mut run, &HashSet::from([target_path.clone()]))?;
+        let refreshed = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.path == target_path)
+            .context("missing refreshed target pressure candidate")?;
+        assert_ne!(refreshed.identity, original_identity);
+        assert!(
+            refreshed
+                .measurement
+                .as_ref()
+                .context("missing refreshed target measurement")?
+                .visited_entries
+                < original_entries
+        );
+        assert_eq!(
+            refreshed
+                .mtime_unix
+                .zip(refreshed.mtime_nanos)
+                .context("missing refreshed activity sample")?,
+            exact_sampled_mtime(&target_path, GENERATED_MTIME_SAMPLE_DEPTH)?
+        );
+        let measurement = refreshed
+            .measurement
+            .as_ref()
+            .context("missing refreshed target measurement")?;
+        if measurement.complete
+            && measurement.metrics.private_reclaimable_complete
+            && measurement.metrics.errors == 0
+        {
+            revalidate_generated_candidate(refreshed, None, Some(&system_mount_points()?))?;
+        } else {
+            let error =
+                revalidate_generated_candidate(refreshed, None, Some(&system_mount_points()?))
+                    .expect_err("incomplete private evidence must remain fail-closed");
+            assert!(error.to_string().contains("complete physical measurement"));
+        }
         Ok(())
     }
 
