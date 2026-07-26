@@ -1658,14 +1658,66 @@ fn cleanup_repositories_with_capture(
                         break;
                     }
                     let epoch = next_pressure_epoch(&candidates);
+                    // Expensive source-state preparation happens before the
+                    // ownership freshness clock starts. The complete candidate
+                    // boundary, ownership, protection, mount, and Cargo-lock
+                    // guards are still revalidated under the bounded epoch
+                    // immediately before deletion.
+                    let worktree_revalidation_started = Instant::now();
+                    let refusal_count_before = execution_metrics
+                        .as_ref()
+                        .context("execute mode has no execution metrics")?
+                        .candidate_refusals
+                        .len();
+                    let valid_worktrees = revalidate_pressure_epoch_worktrees(
+                        &manifest,
+                        &epoch,
+                        execution_metrics
+                            .as_mut()
+                            .context("execute mode has no execution metrics")?,
+                    );
+                    let source_exclusions_by_worktree =
+                        pressure_epoch_candidate_groups(&manifest, &epoch);
+                    let mut source_before_by_worktree = BTreeMap::new();
+                    for ((index, worktree), exclusions) in &source_exclusions_by_worktree {
+                        if !valid_worktrees.contains(&(*index, worktree.clone()))
+                            || !exclusions.iter().any(|path| path.exists())
+                        {
+                            continue;
+                        }
+                        let source_before =
+                            source_status_excluding_candidates(worktree, exclusions)?;
+                        source_before_by_worktree.insert((*index, worktree.clone()), source_before);
+                    }
+                    let worktree_revalidation_millis =
+                        duration_millis(worktree_revalidation_started.elapsed());
+                    let worktree_refusal_added = {
+                        let metrics = execution_metrics
+                            .as_mut()
+                            .context("execute mode has no execution metrics")?;
+                        metrics.candidate_revalidation_millis = metrics
+                            .candidate_revalidation_millis
+                            .saturating_add(worktree_revalidation_millis);
+                        metrics.candidate_refusals.len() > refusal_count_before
+                    };
+                    if worktree_refusal_added {
+                        manifest.execution_metrics = execution_metrics.clone();
+                        write_root(&manifest)?;
+                    }
+
                     let metrics = execution_metrics
                         .as_mut()
                         .context("execute mode has no execution metrics")?;
                     metrics.pressure_epochs = metrics.pressure_epochs.saturating_add(1);
-                    let epoch_started = Instant::now();
-                    let epoch_deadline = epoch_started
-                        .checked_add(PRESSURE_EPOCH_MAX_DURATION)
-                        .context("pressure ownership epoch deadline overflowed")?;
+                    let (
+                        (valid_worktrees, source_exclusions_by_worktree, source_before_by_worktree),
+                        epoch_started,
+                        epoch_deadline,
+                    ) = start_pressure_epoch_after_preparation((
+                        valid_worktrees,
+                        source_exclusions_by_worktree,
+                        source_before_by_worktree,
+                    ))?;
                     let epoch_ownership_paths = pressure_epoch_ownership_paths(&manifest, &epoch);
                     let epoch_snapshot = if options.check_in_use {
                         Some(capture_open_handles(
@@ -1718,35 +1770,6 @@ fn cleanup_repositories_with_capture(
                     metrics.mount_snapshot_millis = metrics
                         .mount_snapshot_millis
                         .saturating_add(duration_millis(mount_snapshot_started.elapsed()));
-
-                    let worktree_revalidation_started = Instant::now();
-                    let refusal_count_before = execution_metrics
-                        .as_ref()
-                        .context("execute mode has no execution metrics")?
-                        .candidate_refusals
-                        .len();
-                    let valid_worktrees = revalidate_pressure_epoch_worktrees(
-                        &manifest,
-                        &epoch,
-                        execution_metrics
-                            .as_mut()
-                            .context("execute mode has no execution metrics")?,
-                    );
-                    let worktree_revalidation_millis =
-                        duration_millis(worktree_revalidation_started.elapsed());
-                    let worktree_refusal_added = {
-                        let metrics = execution_metrics
-                            .as_mut()
-                            .context("execute mode has no execution metrics")?;
-                        metrics.candidate_revalidation_millis = metrics
-                            .candidate_revalidation_millis
-                            .saturating_add(worktree_revalidation_millis);
-                        metrics.candidate_refusals.len() > refusal_count_before
-                    };
-                    if worktree_refusal_added {
-                        manifest.execution_metrics = execution_metrics.clone();
-                        write_root(&manifest)?;
-                    }
                     if pressure_epoch_expired(epoch_started) {
                         let metrics = execution_metrics
                             .as_mut()
@@ -1799,50 +1822,19 @@ fn cleanup_repositories_with_capture(
                             metrics.candidate_revalidations =
                                 metrics.candidate_revalidations.saturating_add(1);
                         }
-                        let candidate_revalidation_started = Instant::now();
-                        if let Err(error) = revalidate_generated_candidate(
-                            &decision,
-                            epoch_snapshot.as_ref().map(|snapshot| &snapshot.handles),
-                            Some(&epoch_mount_points),
-                        ) {
-                            {
-                                let metrics = execution_metrics
-                                    .as_mut()
-                                    .context("execute mode has no execution metrics")?;
-                                metrics.candidate_revalidation_millis =
-                                    metrics.candidate_revalidation_millis.saturating_add(
-                                        duration_millis(candidate_revalidation_started.elapsed()),
-                                    );
-                            }
-                            let refusal = CandidateExecutionRefusal {
-                                candidate: decision.path.clone(),
-                                worktree: decision.worktree_path.clone(),
-                                reason: format!("{error:#}"),
-                            };
-                            persist_candidate_refusal(
-                                &mut manifest,
-                                &mut execution_metrics,
-                                refusal,
-                                write_root,
-                            )?;
-                            continue;
-                        }
-                        {
-                            let metrics = execution_metrics
-                                .as_mut()
-                                .context("execute mode has no execution metrics")?;
-                            metrics.candidate_revalidation_millis =
-                                metrics.candidate_revalidation_millis.saturating_add(
-                                    duration_millis(candidate_revalidation_started.elapsed()),
-                                );
-                        }
                         let existed_before = path.exists();
                         let observation_path = decision.worktree_path.clone();
                         let available_before = fs4::available_space(&observation_path)?;
-                        let source_before = source_status_excluding_candidate(
-                            &decision.worktree_path,
-                            &decision.path,
-                        )?;
+                        let worktree_key = (index, decision.worktree_path.clone());
+                        let source_before = source_before_by_worktree
+                            .get(&worktree_key)
+                            .cloned()
+                            .with_context(|| {
+                            format!(
+                                "pressure epoch has no prepared source baseline for {}",
+                                path.display()
+                            )
+                        })?;
                         let deletion_started = Instant::now();
                         execute_cleanup_manifest_matching_with_snapshot(
                             &manifest.repositories[index].manifest,
@@ -1869,9 +1861,17 @@ fn cleanup_repositories_with_capture(
                             metrics.realized_reclaim_bytes = metrics
                                 .realized_reclaim_bytes
                                 .saturating_add(available_after.saturating_sub(available_before));
-                            let source_after = source_status_excluding_candidate(
+                            let source_exclusions = source_exclusions_by_worktree
+                                .get(&worktree_key)
+                                .with_context(|| {
+                                    format!(
+                                        "pressure epoch has no source exclusions for {}",
+                                        decision.worktree_path.display()
+                                    )
+                                })?;
+                            let source_after = source_status_excluding_candidates(
                                 &decision.worktree_path,
-                                &decision.path,
+                                source_exclusions,
                             )?;
                             anyhow::ensure!(
                                 source_after == source_before,
@@ -2247,6 +2247,14 @@ fn pressure_epoch_expired(started: Instant) -> bool {
     started.elapsed() >= PRESSURE_EPOCH_MAX_DURATION
 }
 
+fn start_pressure_epoch_after_preparation<T>(prepared: T) -> Result<(T, Instant, Instant)> {
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(PRESSURE_EPOCH_MAX_DURATION)
+        .context("pressure ownership epoch deadline overflowed")?;
+    Ok((prepared, started, deadline))
+}
+
 fn revalidate_before_ownership_deadline(
     deadline: Option<Instant>,
     revalidate: impl FnOnce() -> Result<()>,
@@ -2325,6 +2333,15 @@ fn pressure_epoch_worktree_groups(
     manifest: &RootCleanupManifest,
     epoch: &[(usize, PathBuf)],
 ) -> HashSet<(usize, PathBuf)> {
+    pressure_epoch_candidate_groups(manifest, epoch)
+        .into_keys()
+        .collect()
+}
+
+fn pressure_epoch_candidate_groups(
+    manifest: &RootCleanupManifest,
+    epoch: &[(usize, PathBuf)],
+) -> BTreeMap<(usize, PathBuf), Vec<PathBuf>> {
     epoch
         .iter()
         .filter_map(|(index, path)| {
@@ -2333,9 +2350,12 @@ fn pressure_epoch_worktree_groups(
                 .generated_dirs
                 .iter()
                 .find(|decision| decision.path == *path)
-                .map(|decision| (*index, decision.worktree_path.clone()))
+                .map(|decision| ((*index, decision.worktree_path.clone()), path.clone()))
         })
-        .collect()
+        .fold(BTreeMap::new(), |mut groups, (worktree, candidate)| {
+            groups.entry(worktree).or_default().push(candidate);
+            groups
+        })
 }
 
 fn revalidate_pressure_worktree(manifest: &CleanupManifest, worktree: &Path) -> Result<()> {
@@ -3378,20 +3398,15 @@ fn dirty_status(path: &Path) -> Result<DirtyStatus> {
 }
 
 fn source_status_excluding_candidate(worktree: &Path, candidate: &Path) -> Result<(usize, String)> {
-    let relative = candidate.strip_prefix(worktree).with_context(|| {
-        format!(
-            "generated candidate {} is outside worktree {}",
-            candidate.display(),
-            worktree.display()
-        )
-    })?;
-    let relative = relative
-        .to_str()
-        .context("generated candidate relative path is not valid UTF-8")?
-        .replace(std::path::MAIN_SEPARATOR, "/");
-    let mut exclude = OsString::from(":(top,exclude,literal)");
-    exclude.push(relative);
-    let output = Command::new("git")
+    source_status_excluding_candidates(worktree, &[candidate.to_path_buf()])
+}
+
+fn source_status_excluding_candidates(
+    worktree: &Path,
+    candidates: &[PathBuf],
+) -> Result<(usize, String)> {
+    let mut command = Command::new("git");
+    command
         .args([
             "status",
             "--porcelain=v1",
@@ -3400,9 +3415,25 @@ fn source_status_excluding_candidate(worktree: &Path, candidate: &Path) -> Resul
             "--",
             ".",
         ])
-        .arg(exclude)
         .current_dir(worktree)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    for candidate in candidates {
+        let relative = candidate.strip_prefix(worktree).with_context(|| {
+            format!(
+                "generated candidate {} is outside worktree {}",
+                candidate.display(),
+                worktree.display()
+            )
+        })?;
+        let relative = relative
+            .to_str()
+            .context("generated candidate relative path is not valid UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let mut exclude = OsString::from(":(top,exclude,literal)");
+        exclude.push(relative);
+        command.arg(exclude);
+    }
+    let output = command
         .output()
         .with_context(|| format!("failed to run git status in {}", worktree.display()))?;
     anyhow::ensure!(
@@ -8850,6 +8881,22 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert!(groups.contains(&(0, PathBuf::from("/code/a"))));
         assert!(groups.contains(&(1, PathBuf::from("/code/b"))));
+        let candidate_groups = pressure_epoch_candidate_groups(
+            &manifest,
+            &[
+                (0, PathBuf::from("/code/a/.turbo")),
+                (0, PathBuf::from("/code/a/node_modules")),
+            ],
+        );
+        assert_eq!(
+            candidate_groups
+                .get(&(0, PathBuf::from("/code/a")))
+                .cloned(),
+            Some(vec![
+                PathBuf::from("/code/a/.turbo"),
+                PathBuf::from("/code/a/node_modules")
+            ])
+        );
 
         let epoch = [
             (0, PathBuf::from("/code/a/.turbo")),
@@ -8885,6 +8932,38 @@ mod tests {
         assert!(pressure_epoch_expired(
             Instant::now() - PRESSURE_EPOCH_MAX_DURATION
         ));
+    }
+
+    #[test]
+    fn pressure_ownership_clock_starts_after_expensive_preparation() -> Result<()> {
+        std::thread::sleep(Duration::from_millis(5));
+        let (prepared, started, deadline) =
+            start_pressure_epoch_after_preparation("prepared source baseline")?;
+        assert_eq!(prepared, "prepared source baseline");
+        assert!(!pressure_epoch_expired(started));
+        assert_eq!(
+            deadline.duration_since(started),
+            PRESSURE_EPOCH_MAX_DURATION
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_source_preparation_excludes_every_candidate_in_one_worktree() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let first = repo.join("generated-one");
+        let second = repo.join("generated-two");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        fs::write(first.join("artifact"), "first")?;
+        fs::write(second.join("artifact"), "second")?;
+
+        let all_excluded =
+            source_status_excluding_candidates(&repo, &[first.clone(), second.clone()])?;
+        assert_eq!(all_excluded.0, 0);
+        let one_excluded = source_status_excluding_candidates(&repo, &[first])?;
+        assert_eq!(one_excluded.0, 1);
+        Ok(())
     }
 
     #[test]
