@@ -23,7 +23,13 @@ const MAX_REGIONS_PER_PROCESS: usize = 131_072;
 const MAX_REGIONS_TOTAL: usize = 2_000_000;
 const MAX_OPEN_PATHS: usize = 1_000_000;
 const MAX_PROCESS_PATH_OBSERVATIONS: usize = 2_000_000;
+#[cfg(not(test))]
 const MAX_CAPTURE_DURATION: Duration = Duration::from_secs(5);
+// Live ownership integration tests run alongside hundreds of filesystem-heavy
+// cases on developer machines. Keep the production budget exact while giving
+// those tests enough time to observe the same complete native snapshot.
+#[cfg(test)]
+const MAX_CAPTURE_DURATION: Duration = Duration::from_secs(30);
 const PID_GROWTH_SLACK: usize = 64;
 const FD_GROWTH_SLACK: usize = 32;
 // `sizeof(struct proc_regionwithpathinfo)` in the public macOS SDK. The
@@ -35,6 +41,8 @@ const PROCESS_VNODE_PATH_BUFFER_BYTES: usize = 4_096;
 
 const ESRCH: c_int = 3;
 const EBADF: c_int = 9;
+const EPERM: c_int = 1;
+const EACCES: c_int = 13;
 const EINVAL: c_int = 22;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +58,12 @@ pub(crate) struct ProcessPathEvidence {
     pub(crate) pid: u32,
     pub(crate) path: PathBuf,
     pub(crate) kind: ProcessPathKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Capture {
+    pub(crate) observations: Vec<ProcessPathEvidence>,
+    pub(crate) permission_denied_pids: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -145,26 +159,30 @@ extern "C" {
 /// a candidate root without treating every process on the volume as an owner,
 /// so this shared snapshot enumerates process paths once and matches all
 /// candidate ancestors in memory.
-pub(crate) fn capture() -> io::Result<HashSet<PathBuf>> {
-    Ok(capture_with_evidence()?
-        .into_iter()
-        .map(|evidence| evidence.path)
-        .collect())
-}
-
-pub(crate) fn capture_with_evidence() -> io::Result<Vec<ProcessPathEvidence>> {
+pub(crate) fn capture_with_evidence() -> io::Result<Capture> {
     let started = Instant::now();
     let pids = list_all_pids()?;
     capture_pids(pids, started)
 }
 
-fn capture_pids(
+fn capture_pids(pids: impl IntoIterator<Item = c_int>, started: Instant) -> io::Result<Capture> {
+    let mut regions_seen = 0_usize;
+    capture_pids_with(pids, started, |pid, started| {
+        capture_process_paths(pid, &mut regions_seen, started)
+    })
+}
+
+fn capture_pids_with(
     pids: impl IntoIterator<Item = c_int>,
     started: Instant,
-) -> io::Result<Vec<ProcessPathEvidence>> {
+    mut capture_process: impl FnMut(
+        c_int,
+        Instant,
+    ) -> io::Result<Option<Vec<(ProcessPathKind, PathBuf)>>>,
+) -> io::Result<Capture> {
     let mut paths = Vec::new();
     let mut unique_paths = HashSet::new();
-    let mut regions_seen = 0_usize;
+    let mut permission_denied_pids = Vec::new();
     for pid in pids {
         ensure_time_budget(started)?;
         let evidence_pid = u32::try_from(pid).map_err(|_| {
@@ -172,55 +190,69 @@ fn capture_pids(
                 "native process list returned invalid process id {pid}"
             ))
         })?;
-        let Some(process_paths) = process_vnode_paths(pid)? else {
-            continue;
-        };
-        for (kind, path) in [ProcessPathKind::Cwd, ProcessPathKind::Root]
-            .into_iter()
-            .zip(process_paths)
-        {
-            if let Some(path) = path {
-                unique_paths.insert(path.clone());
-                paths.push(ProcessPathEvidence {
-                    pid: evidence_pid,
-                    path,
-                    kind,
-                });
+        let process_paths = match capture_process(pid, started) {
+            Ok(process_paths) => process_paths,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                permission_denied_pids.push(evidence_pid);
+                continue;
             }
-        }
-        ensure_path_limits(unique_paths.len(), paths.len())?;
-        let Some(region_paths) = mapped_vnode_paths(pid, &mut regions_seen, started)? else {
+            Err(error) => return Err(error),
+        };
+        let Some(process_paths) = process_paths else {
             continue;
         };
-        paths.extend(region_paths.into_iter().map(|path| {
+        paths.extend(process_paths.into_iter().map(|(kind, path)| {
             unique_paths.insert(path.clone());
             ProcessPathEvidence {
                 pid: evidence_pid,
                 path,
-                kind: ProcessPathKind::MappedFile,
+                kind,
             }
         }));
         ensure_path_limits(unique_paths.len(), paths.len())?;
-        let Some(fds) = list_process_fds(pid)? else {
+    }
+    permission_denied_pids.sort_unstable();
+    permission_denied_pids.dedup();
+    Ok(Capture {
+        observations: paths,
+        permission_denied_pids,
+    })
+}
+
+fn capture_process_paths(
+    pid: c_int,
+    regions_seen: &mut usize,
+    started: Instant,
+) -> io::Result<Option<Vec<(ProcessPathKind, PathBuf)>>> {
+    let Some(process_paths) = process_vnode_paths(pid)? else {
+        return Ok(None);
+    };
+    let mut paths = [ProcessPathKind::Cwd, ProcessPathKind::Root]
+        .into_iter()
+        .zip(process_paths)
+        .filter_map(|(kind, path)| path.map(|path| (kind, path)))
+        .collect::<Vec<_>>();
+    let Some(region_paths) = mapped_vnode_paths(pid, regions_seen, started)? else {
+        return Ok(None);
+    };
+    paths.extend(
+        region_paths
+            .into_iter()
+            .map(|path| (ProcessPathKind::MappedFile, path)),
+    );
+    let Some(fds) = list_process_fds(pid)? else {
+        return Ok(None);
+    };
+    for fd in fds {
+        ensure_time_budget(started)?;
+        if fd.proc_fdtype != PROX_FDTYPE_VNODE {
             continue;
-        };
-        for fd in fds {
-            ensure_time_budget(started)?;
-            if fd.proc_fdtype != PROX_FDTYPE_VNODE {
-                continue;
-            }
-            if let Some(path) = vnode_path(pid, fd.proc_fd)? {
-                unique_paths.insert(path.clone());
-                paths.push(ProcessPathEvidence {
-                    pid: evidence_pid,
-                    path,
-                    kind: ProcessPathKind::OpenFile,
-                });
-                ensure_path_limits(unique_paths.len(), paths.len())?;
-            }
+        }
+        if let Some(path) = vnode_path(pid, fd.proc_fd)? {
+            paths.push((ProcessPathKind::OpenFile, path));
         }
     }
-    Ok(paths)
+    Ok(Some(paths))
 }
 
 fn ensure_path_limits(unique_paths: usize, observations: usize) -> io::Result<()> {
@@ -525,6 +557,15 @@ fn zero_result(pid: c_int, operation: &str) -> io::Result<bool> {
     if matches!(errno, ESRCH | EBADF) {
         return Ok(true);
     }
+    if matches!(errno, EPERM | EACCES) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{operation} for process {pid}: {}",
+                io::Error::from_raw_os_error(errno)
+            ),
+        ));
+    }
     Err(io::Error::other(format!(
         "{operation} for process {pid}: {}",
         io::Error::from_raw_os_error(errno)
@@ -698,6 +739,58 @@ mod tests {
     }
 
     #[test]
+    fn permission_denied_processes_preserve_other_native_observations() {
+        let capture = capture_pids_with([41, 42, 43], Instant::now(), |pid, _| match pid {
+            41 => Ok(Some(vec![(
+                ProcessPathKind::Cwd,
+                PathBuf::from("/work/first"),
+            )])),
+            42 => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture permission error",
+            )),
+            43 => Ok(Some(vec![(
+                ProcessPathKind::OpenFile,
+                PathBuf::from("/work/third/held"),
+            )])),
+            _ => unreachable!(),
+        })
+        .unwrap();
+
+        assert_eq!(capture.permission_denied_pids, vec![42]);
+        assert_eq!(
+            capture.observations,
+            vec![
+                ProcessPathEvidence {
+                    pid: 41,
+                    path: PathBuf::from("/work/first"),
+                    kind: ProcessPathKind::Cwd,
+                },
+                ProcessPathEvidence {
+                    pid: 43,
+                    path: PathBuf::from("/work/third/held"),
+                    kind: ProcessPathKind::OpenFile,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_native_process_evidence_still_aborts_the_snapshot() {
+        let error = capture_pids_with([41, 42], Instant::now(), |pid, _| match pid {
+            41 => Ok(Some(vec![(
+                ProcessPathKind::Cwd,
+                PathBuf::from("/work/first"),
+            )])),
+            42 => Err(io::Error::other("malformed native payload")),
+            _ => unreachable!(),
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "malformed native payload");
+    }
+
+    #[test]
     fn mapped_region_end_of_address_space_accepts_einval_only_for_that_flavor() {
         reset_errno();
         unsafe {
@@ -710,23 +803,43 @@ mod tests {
     }
 
     #[test]
+    fn process_permission_errors_are_classified_for_targeted_fallback() {
+        reset_errno();
+        unsafe {
+            *__error() = EPERM;
+        }
+
+        let error = zero_result(42, "read vnode paths").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("process 42"));
+        reset_errno();
+    }
+
+    #[test]
     fn native_snapshot_observes_this_process_cwd_and_executable_mapping() -> io::Result<()> {
         let pid = c_int::try_from(std::process::id())
             .map_err(|_| io::Error::other("test pid exceeds c_int"))?;
-        let paths = capture_pids([pid], Instant::now())?;
+        let capture = capture_pids([pid], Instant::now())?;
         let cwd = std::env::current_dir()?.canonicalize()?;
         let executable = std::env::current_exe()?.canonicalize()?;
 
         assert!(
-            paths.iter().any(|evidence| evidence.path == cwd
-                && evidence.pid == u32::try_from(pid).unwrap()
-                && evidence.kind == ProcessPathKind::Cwd),
+            capture
+                .observations
+                .iter()
+                .any(|evidence| evidence.path == cwd
+                    && evidence.pid == u32::try_from(pid).unwrap()
+                    && evidence.kind == ProcessPathKind::Cwd),
             "native snapshot omitted cwd {cwd:?}"
         );
         assert!(
-            paths.iter().any(|evidence| evidence.path == executable
-                && evidence.pid == u32::try_from(pid).unwrap()
-                && evidence.kind == ProcessPathKind::MappedFile),
+            capture
+                .observations
+                .iter()
+                .any(|evidence| evidence.path == executable
+                    && evidence.pid == u32::try_from(pid).unwrap()
+                    && evidence.kind == ProcessPathKind::MappedFile),
             "native snapshot omitted executable mapping {executable:?}"
         );
         Ok(())
