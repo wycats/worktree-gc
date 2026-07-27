@@ -1,10 +1,10 @@
 #[cfg(any(unix, test))]
 use crate::ownership_protocol::{
-    read_message, write_message, OwnershipRequest, WirePath, MAX_REQUEST_ROOTS,
+    read_message, write_message, OwnershipRequest, OwnershipServiceMetadata, MAX_REQUEST_ROOTS,
 };
 #[cfg(any(target_os = "macos", test))]
 use crate::ownership_protocol::{OwnershipObservation, OwnershipPathKind};
-use crate::ownership_protocol::{OwnershipResponse, OWNERSHIP_PROTOCOL_VERSION};
+use crate::ownership_protocol::{OwnershipResponse, WirePath, OWNERSHIP_PROTOCOL_VERSION};
 use anyhow::{bail, Result};
 #[cfg(any(unix, test))]
 use anyhow::{ensure, Context};
@@ -21,6 +21,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
+use std::os::unix::process::CommandExt;
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 #[cfg(unix)]
@@ -48,7 +50,7 @@ pub struct HelperConfig {
     pub config_version: u64,
     pub allowed_uid: u32,
     pub allowed_gid: u32,
-    pub roots: Vec<PathBuf>,
+    pub roots: Vec<WirePath>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +151,18 @@ fn handle_connection(stream: &mut UnixStream, config: &HelperConfig) -> Result<(
     );
     let request: OwnershipRequest = read_message(stream)?;
     let response = match validated_request_roots(&request, config) {
+        Ok(roots) if roots.is_empty() => OwnershipResponse {
+            protocol_version: OWNERSHIP_PROTOCOL_VERSION,
+            request_id: request.request_id,
+            backend: "macos_privileged_libproc".to_string(),
+            complete: true,
+            error: None,
+            observations: Vec::new(),
+            service: Some(OwnershipServiceMetadata {
+                client_uid: config.allowed_uid,
+                roots: config.roots.clone(),
+            }),
+        },
         Ok(roots) => capture_privileged_ownership(request.request_id, &roots),
         Err(error) => OwnershipResponse::refusal(request.request_id, format!("{error:#}")),
     };
@@ -157,16 +171,6 @@ fn handle_connection(stream: &mut UnixStream, config: &HelperConfig) -> Result<(
 
 #[cfg(target_os = "macos")]
 fn capture_privileged_ownership(request_id: u64, roots: &[PathBuf]) -> OwnershipResponse {
-    if roots.is_empty() {
-        return OwnershipResponse {
-            protocol_version: OWNERSHIP_PROTOCOL_VERSION,
-            request_id,
-            backend: "macos_privileged_libproc".to_string(),
-            complete: true,
-            error: None,
-            observations: Vec::new(),
-        };
-    }
     let capture = match crate::macos_open_handles::capture_with_evidence() {
         Ok(capture) => capture,
         Err(error) => {
@@ -232,6 +236,7 @@ fn privileged_response_from_capture(
         complete: true,
         error: None,
         observations,
+        service: None,
     }
 }
 
@@ -299,7 +304,8 @@ fn canonical_config_roots(config: &HelperConfig) -> Result<Vec<PathBuf>> {
         "ownership helper requires at least one allowed root"
     );
     let mut roots = Vec::with_capacity(config.roots.len());
-    for root in &config.roots {
+    for wire_root in &config.roots {
+        let root = wire_root.to_path_buf()?;
         ensure!(
             root.is_absolute(),
             "ownership helper allowlist root {} is not absolute",
@@ -312,7 +318,7 @@ fn canonical_config_roots(config: &HelperConfig) -> Result<Vec<PathBuf>> {
             )
         })?;
         ensure!(
-            canonical == *root,
+            canonical == root,
             "ownership helper allowlist root {} is not canonical (resolved to {})",
             root.display(),
             canonical.display()
@@ -345,11 +351,32 @@ fn validate_response(request: &OwnershipRequest, response: &OwnershipResponse) -
             response.observations.is_empty(),
             "incomplete ownership helper response included observations"
         );
+        ensure!(
+            response.service.is_none(),
+            "incomplete ownership helper response included service metadata"
+        );
         return Ok(());
     }
     ensure!(
         response.error.is_none(),
         "complete ownership helper response included an error"
+    );
+    if request.roots.is_empty() {
+        ensure!(
+            response.observations.is_empty(),
+            "ownership helper status response included observations"
+        );
+        service_metadata_paths(
+            response
+                .service
+                .as_ref()
+                .context("ownership helper status response omitted service metadata")?,
+        )?;
+        return Ok(());
+    }
+    ensure!(
+        response.service.is_none(),
+        "ownership helper evidence response included service metadata"
     );
     let requested = request
         .roots
@@ -374,6 +401,34 @@ fn validate_response(request: &OwnershipRequest, response: &OwnershipResponse) -
     Ok(())
 }
 
+#[cfg(unix)]
+fn service_metadata_paths(metadata: &OwnershipServiceMetadata) -> Result<Vec<PathBuf>> {
+    ensure!(
+        metadata.client_uid != 0,
+        "ownership helper status returned root as its configured client"
+    );
+    ensure!(
+        !metadata.roots.is_empty(),
+        "ownership helper status returned an empty root allowlist"
+    );
+    let mut roots = metadata
+        .roots
+        .iter()
+        .map(WirePath::to_path_buf)
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        roots.iter().all(|root| root.is_absolute()),
+        "ownership helper status returned a non-absolute root"
+    );
+    roots.sort();
+    roots.dedup();
+    ensure!(
+        roots.len() == metadata.roots.len(),
+        "ownership helper status returned duplicate roots"
+    );
+    Ok(roots)
+}
+
 #[cfg(target_os = "macos")]
 pub fn install(options: HelperInstallOptions) -> Result<()> {
     ensure_root()?;
@@ -395,9 +450,12 @@ pub fn install(options: HelperInstallOptions) -> Result<()> {
             .roots
             .iter()
             .map(|root| root.canonicalize())
-            .collect::<std::io::Result<Vec<_>>>()?,
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|root| WirePath::from_path(&root))
+            .collect(),
     };
-    canonical_config_roots(&config)?;
+    let canonical_roots = canonical_config_roots(&config)?;
 
     let helper_binary = Path::new(DEFAULT_HELPER_BINARY);
     let helper_config = Path::new(DEFAULT_HELPER_CONFIG);
@@ -422,8 +480,9 @@ pub fn install(options: HelperInstallOptions) -> Result<()> {
     }
 
     let backup = backup_existing_installation()?;
-    if service_loaded() {
-        bootout_service(true)?;
+    let was_loaded = service_loaded()?;
+    if was_loaded {
+        bootout_service()?;
     }
     let result = (|| {
         atomic_copy(&source_binary, helper_binary, 0o755)?;
@@ -445,13 +504,29 @@ pub fn install(options: HelperInstallOptions) -> Result<()> {
         ensure_root_owned_regular_file(helper_config, 0o600)?;
         ensure_root_owned_regular_file(helper_plist, 0o644)?;
         bootstrap_service(helper_plist)?;
-        wait_for_service_socket(Path::new(DEFAULT_HELPER_SOCKET))
+        wait_for_service_socket(
+            helper_binary,
+            Path::new(DEFAULT_HELPER_SOCKET),
+            config.allowed_uid,
+            config.allowed_gid,
+            &canonical_roots,
+        )
     })();
     if let Err(error) = result {
-        let _ = bootout_service(false);
-        restore_installation(&backup)?;
-        if helper_plist.exists() {
-            let _ = bootstrap_service(helper_plist);
+        let rollback = (|| {
+            if service_loaded()? {
+                bootout_service()?;
+            }
+            restore_installation(&backup)?;
+            if was_loaded {
+                bootstrap_service(helper_plist)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(rollback_error) = rollback {
+            return Err(error).context(format!(
+                "ownership helper installation also failed to roll back: {rollback_error:#}"
+            ));
         }
         return Err(error);
     }
@@ -466,7 +541,9 @@ pub fn install(_options: HelperInstallOptions) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub fn uninstall() -> Result<()> {
     ensure_root()?;
-    bootout_service(false)?;
+    if service_loaded()? {
+        bootout_service()?;
+    }
     for (path, expected_socket) in [
         (Path::new(DEFAULT_HELPER_SOCKET), true),
         (Path::new(DEFAULT_HELPER_PLIST), false),
@@ -494,36 +571,61 @@ pub fn uninstall() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub fn status() -> HelperStatus {
-    let loaded = service_loaded();
-    let probe = capture_from_helper(Path::new(DEFAULT_HELPER_SOCKET), &[]);
     let installed = Path::new(DEFAULT_HELPER_BINARY).exists()
         && Path::new(DEFAULT_HELPER_CONFIG).exists()
         && Path::new(DEFAULT_HELPER_PLIST).exists();
-    let config = fs::read_to_string(DEFAULT_HELPER_CONFIG)
-        .ok()
-        .and_then(|contents| toml::from_str::<HelperConfig>(&contents).ok());
-    match probe {
-        Ok(response) => HelperStatus {
-            installed,
-            loaded,
-            protocol_version: response.protocol_version,
-            client_uid: config.as_ref().map(|config| config.allowed_uid),
-            roots: config.map(|config| config.roots).unwrap_or_default(),
-            socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
-            probe_complete: response.complete,
-            error: response.error,
-        },
+    let loaded = match service_loaded() {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return HelperStatus {
+                installed,
+                loaded: false,
+                protocol_version: OWNERSHIP_PROTOCOL_VERSION,
+                client_uid: None,
+                roots: Vec::new(),
+                socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
+                probe_complete: false,
+                error: Some(format!("{error:#}")),
+            };
+        }
+    };
+    let probe = capture_from_helper(Path::new(DEFAULT_HELPER_SOCKET), &[]);
+    match probe.and_then(|response| status_from_response(installed, loaded, response)) {
+        Ok(status) => status,
         Err(error) => HelperStatus {
             installed,
             loaded,
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
-            client_uid: config.as_ref().map(|config| config.allowed_uid),
-            roots: config.map(|config| config.roots).unwrap_or_default(),
+            client_uid: None,
+            roots: Vec::new(),
             socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
             probe_complete: false,
             error: Some(format!("{error:#}")),
         },
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn status_from_response(
+    installed: bool,
+    loaded: bool,
+    response: OwnershipResponse,
+) -> Result<HelperStatus> {
+    let metadata = response
+        .service
+        .as_ref()
+        .context("ownership helper status omitted service metadata")?;
+    let roots = service_metadata_paths(metadata)?;
+    Ok(HelperStatus {
+        installed,
+        loaded,
+        protocol_version: response.protocol_version,
+        client_uid: Some(metadata.client_uid),
+        roots,
+        socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
+        probe_complete: response.complete,
+        error: response.error,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -765,17 +867,16 @@ fn xml_escape(path: &Path) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn bootout_service(required: bool) -> Result<()> {
+fn bootout_service() -> Result<()> {
     let output = Command::new("/bin/launchctl")
         .args(["bootout", &format!("system/{HELPER_LABEL}")])
         .stdin(Stdio::null())
         .output()?;
-    if required && !output.status.success() {
-        bail!(
-            "launchctl bootout failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    ensure!(
+        output.status.success(),
+        "launchctl bootout failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Ok(())
 }
 
@@ -796,7 +897,13 @@ fn bootstrap_service(plist: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn wait_for_service_socket(socket: &Path) -> Result<()> {
+fn wait_for_service_socket(
+    helper_binary: &Path,
+    socket: &Path,
+    client_uid: u32,
+    client_gid: u32,
+    expected_roots: &[PathBuf],
+) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let Ok(metadata) = fs::symlink_metadata(socket) {
@@ -807,7 +914,13 @@ fn wait_for_service_socket(socket: &Path) -> Result<()> {
                 "ownership helper created an unexpected socket at {}",
                 socket.display()
             );
-            if let Ok(response) = capture_from_helper(socket, &[]) {
+            if let Ok(response) = probe_service_as_client(
+                helper_binary,
+                socket,
+                client_uid,
+                client_gid,
+                expected_roots,
+            ) {
                 ensure!(
                     response.complete,
                     "ownership helper readiness probe was incomplete: {}",
@@ -826,14 +939,88 @@ fn wait_for_service_socket(socket: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn service_loaded() -> bool {
-    Command::new("/bin/launchctl")
+fn probe_service_as_client(
+    helper_binary: &Path,
+    socket: &Path,
+    client_uid: u32,
+    client_gid: u32,
+    expected_roots: &[PathBuf],
+) -> Result<OwnershipResponse> {
+    let output = Command::new(helper_binary)
+        .arg("probe")
+        .arg("--socket")
+        .arg(socket)
+        .uid(client_uid)
+        .gid(client_gid)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to run ownership helper readiness probe as the configured client")?;
+    ensure!(
+        output.status.success(),
+        "ownership helper readiness probe failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let response: OwnershipResponse = serde_json::from_slice(&output.stdout)
+        .context("ownership helper readiness probe returned invalid JSON")?;
+    ensure!(
+        response.protocol_version == OWNERSHIP_PROTOCOL_VERSION,
+        "ownership helper readiness probe returned protocol version {}",
+        response.protocol_version
+    );
+    ensure!(
+        response.complete,
+        "ownership helper readiness probe was incomplete: {}",
+        response.error.as_deref().unwrap_or("unspecified error")
+    );
+    let metadata = response
+        .service
+        .as_ref()
+        .context("ownership helper readiness probe omitted service metadata")?;
+    ensure!(
+        metadata.client_uid == client_uid,
+        "ownership helper readiness probe returned client uid {}, expected {client_uid}",
+        metadata.client_uid
+    );
+    ensure!(
+        service_metadata_paths(metadata)? == expected_roots,
+        "ownership helper readiness probe returned a different root allowlist"
+    );
+    Ok(response)
+}
+
+#[cfg(target_os = "macos")]
+fn service_loaded() -> Result<bool> {
+    let output = Command::new("/bin/launchctl")
         .args(["print", &format!("system/{HELPER_LABEL}")])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+        .context("failed to inspect ownership helper launchd state")?;
+    classify_service_state(
+        output.status.success(),
+        output.status.code(),
+        &output.stderr,
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn classify_service_state(success: bool, code: Option<i32>, stderr: &[u8]) -> Result<bool> {
+    if success {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(stderr);
+    if code == Some(113)
+        && stderr.contains("Could not find service")
+        && stderr.contains(HELPER_LABEL)
+    {
+        return Ok(false);
+    }
+    bail!(
+        "launchctl print failed with status {}: {}",
+        code.map_or_else(|| "signal".to_string(), |code| code.to_string()),
+        stderr.trim()
+    )
 }
 
 #[cfg(unix)]
@@ -865,8 +1052,61 @@ mod tests {
             config_version: HELPER_CONFIG_VERSION,
             allowed_uid: 501,
             allowed_gid: 20,
-            roots: vec![root.to_path_buf()],
+            roots: vec![WirePath::from_path(root)],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_round_trips_non_utf8_allowlist_roots() -> Result<()> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = PathBuf::from(OsString::from_vec(b"/tmp/non-utf8-\xff".to_vec()));
+        let encoded = toml::to_string_pretty(&config(&root))?;
+        let decoded: HelperConfig = toml::from_str(&encoded)?;
+        assert_eq!(decoded.roots[0].to_path_buf()?, root);
+        Ok(())
+    }
+
+    #[test]
+    fn status_uses_authenticated_service_metadata() -> Result<()> {
+        let root = PathBuf::from("/tmp/allowed");
+        let request = OwnershipRequest::new(8, &[]);
+        let response = OwnershipResponse {
+            protocol_version: OWNERSHIP_PROTOCOL_VERSION,
+            request_id: 8,
+            backend: "macos_privileged_libproc".to_string(),
+            complete: true,
+            error: None,
+            observations: Vec::new(),
+            service: Some(OwnershipServiceMetadata {
+                client_uid: 501,
+                roots: vec![WirePath::from_path(&root)],
+            }),
+        };
+        validate_response(&request, &response)?;
+        let status = status_from_response(true, true, response)?;
+        assert_eq!(status.client_uid, Some(501));
+        assert_eq!(status.roots, vec![root]);
+        assert!(status.probe_complete);
+        Ok(())
+    }
+
+    #[test]
+    fn launchd_state_tolerates_only_the_explicit_missing_service_result() -> Result<()> {
+        assert!(classify_service_state(true, Some(0), b"")?);
+        let missing = format!(
+            "Bad request.\nCould not find service \"{HELPER_LABEL}\" in domain for system\n"
+        );
+        assert!(!classify_service_state(
+            false,
+            Some(113),
+            missing.as_bytes()
+        )?);
+        assert!(classify_service_state(false, Some(113), b"permission denied").is_err());
+        assert!(classify_service_state(false, Some(1), missing.as_bytes()).is_err());
+        Ok(())
     }
 
     #[test]
@@ -921,6 +1161,7 @@ mod tests {
                 observed_path: WirePath::from_path(Path::new("/tmp/other")),
                 matched_root: WirePath::from_path(&root),
             }],
+            service: None,
         };
         assert!(validate_response(&request, &response).is_err());
         Ok(())
@@ -942,6 +1183,7 @@ mod tests {
                 observed_path: WirePath::from_path(&root.join("open")),
                 matched_root: WirePath::from_path(&root),
             }],
+            service: None,
         };
         assert!(validate_response(&request, &response).is_err());
     }

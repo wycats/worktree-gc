@@ -64,6 +64,12 @@ pub struct OwnershipObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnershipServiceMetadata {
+    pub client_uid: u32,
+    pub roots: Vec<WirePath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnershipResponse {
     pub protocol_version: u64,
     pub request_id: u64,
@@ -72,6 +78,8 @@ pub struct OwnershipResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub observations: Vec<OwnershipObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<OwnershipServiceMetadata>,
 }
 
 impl OwnershipResponse {
@@ -83,6 +91,7 @@ impl OwnershipResponse {
             complete: false,
             error: Some(error.into()),
             observations: Vec::new(),
+            service: None,
         }
     }
 }
@@ -212,6 +221,7 @@ mod tests {
         assert!(!response.complete);
         assert_eq!(response.error.as_deref(), Some("denied"));
         assert!(response.observations.is_empty());
+        assert!(response.service.is_none());
     }
 
     #[test]

@@ -48,8 +48,8 @@ jobs:
       - name: Check helper and protocol
         run: cargo check --locked --all-targets --all-features
 
-      - name: Run ownership tests
-        run: cargo test --locked ownership_ --all-features
+      - name: Run library tests
+        run: cargo test --locked --lib --all-features
 
       - name: Check ownership lints
         run: cargo clippy --locked --all-targets --all-features -- -D warnings

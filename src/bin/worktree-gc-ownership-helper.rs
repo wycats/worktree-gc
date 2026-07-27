@@ -40,7 +40,7 @@ enum Command {
     Status,
     /// Request bounded evidence for exact allowlisted roots
     Probe {
-        #[arg(long, value_name = "PATH", required = true)]
+        #[arg(long, value_name = "PATH")]
         root: Vec<PathBuf>,
         #[arg(long, default_value = DEFAULT_HELPER_SOCKET)]
         socket: PathBuf,
