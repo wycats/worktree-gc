@@ -144,11 +144,9 @@ fn handle_connection(stream: &mut UnixStream, config: &HelperConfig) -> Result<(
     stream.set_read_timeout(Some(HELPER_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(HELPER_IO_TIMEOUT))?;
     let peer_uid = peer_uid(stream)?;
-    ensure!(
-        peer_uid == config.allowed_uid,
-        "peer uid {peer_uid} is not the configured client uid {}",
-        config.allowed_uid
-    );
+    if !peer_is_authorized(peer_uid, config.allowed_uid) {
+        return Ok(());
+    }
     let request: OwnershipRequest = read_message(stream)?;
     let response = match validated_request_roots(&request, config) {
         Ok(roots) if roots.is_empty() => OwnershipResponse {
@@ -167,6 +165,11 @@ fn handle_connection(stream: &mut UnixStream, config: &HelperConfig) -> Result<(
         Err(error) => OwnershipResponse::refusal(request.request_id, format!("{error:#}")),
     };
     write_message(stream, &response)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn peer_is_authorized(peer_uid: u32, allowed_uid: u32) -> bool {
+    peer_uid == allowed_uid
 }
 
 #[cfg(target_os = "macos")]
@@ -432,6 +435,7 @@ fn service_metadata_paths(metadata: &OwnershipServiceMetadata) -> Result<Vec<Pat
 #[cfg(target_os = "macos")]
 pub fn install(options: HelperInstallOptions) -> Result<()> {
     ensure_root()?;
+    validate_client_group_membership(options.client_uid, options.client_gid)?;
     ensure!(
         options.source_binary.is_absolute(),
         "helper source binary must be absolute"
@@ -521,6 +525,7 @@ pub fn install(options: HelperInstallOptions) -> Result<()> {
             if was_loaded {
                 bootstrap_service(helper_plist)?;
             }
+            discard_installation_backup(&backup)?;
             Ok::<(), anyhow::Error>(())
         })();
         if let Err(rollback_error) = rollback {
@@ -530,7 +535,48 @@ pub fn install(options: HelperInstallOptions) -> Result<()> {
         }
         return Err(error);
     }
+    discard_installation_backup(&backup)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_client_group_membership(client_uid: u32, client_gid: u32) -> Result<()> {
+    ensure!(
+        client_uid != 0,
+        "ownership helper client uid must not be root"
+    );
+    let output = Command::new("/usr/bin/id")
+        .arg("-G")
+        .arg(client_uid.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to inspect ownership helper client groups")?;
+    ensure!(
+        output.status.success(),
+        "failed to inspect groups for client uid {client_uid}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let groups = parse_client_groups(&output.stdout)?;
+    ensure!(
+        groups.contains(&client_gid),
+        "configured gid {client_gid} does not belong to client uid {client_uid}"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_client_groups(stdout: &[u8]) -> Result<Vec<u32>> {
+    let stdout = std::str::from_utf8(stdout).context("id -G returned non-UTF-8 output")?;
+    let groups = stdout
+        .split_ascii_whitespace()
+        .map(|group| {
+            group
+                .parse::<u32>()
+                .with_context(|| format!("id -G returned invalid group id {group:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!groups.is_empty(), "id -G returned no groups");
+    Ok(groups)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -561,6 +607,7 @@ pub fn uninstall() -> Result<()> {
             fs::remove_file(path)?;
         }
     }
+    remove_all_installation_backups()?;
     Ok(())
 }
 
@@ -766,16 +813,12 @@ fn backup_existing_installation() -> Result<InstallationBackup> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let directory = Path::new(DEFAULT_HELPER_CONFIG)
-        .parent()
-        .context("helper config path has no parent")?
-        .join("backups")
-        .join(format!("{timestamp}-{}", std::process::id()));
-    fs::create_dir_all(
-        directory
-            .parent()
-            .context("helper backup directory has no parent")?,
-    )?;
+    let backup_root = installation_backup_root()?;
+    fs::create_dir_all(&backup_root)?;
+    fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o700))?;
+    chown(&backup_root, 0, 0)?;
+    ensure_root_owned_directory_chain(&backup_root)?;
+    let directory = backup_root.join(format!("{timestamp}-{}", std::process::id()));
     fs::create_dir(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     chown(&directory, 0, 0)?;
@@ -796,6 +839,115 @@ fn backup_existing_installation() -> Result<InstallationBackup> {
         }
     }
     Ok(InstallationBackup { directory, files })
+}
+
+#[cfg(target_os = "macos")]
+fn installation_backup_root() -> Result<PathBuf> {
+    Ok(Path::new(DEFAULT_HELPER_CONFIG)
+        .parent()
+        .context("helper config path has no parent")?
+        .join("backups"))
+}
+
+#[cfg(target_os = "macos")]
+fn discard_installation_backup(backup: &InstallationBackup) -> Result<()> {
+    let backup_root = installation_backup_root()?;
+    ensure!(
+        backup.directory.parent() == Some(backup_root.as_path()),
+        "refusing to remove backup outside {}",
+        backup_root.display()
+    );
+    validate_backup_directory(&backup.directory)?;
+    fs::remove_dir_all(&backup.directory)?;
+    if backup_root
+        .read_dir()
+        .with_context(|| format!("failed to inspect {}", backup_root.display()))?
+        .next()
+        .is_none()
+    {
+        fs::remove_dir(&backup_root)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_all_installation_backups() -> Result<()> {
+    let backup_root = installation_backup_root()?;
+    let metadata = match fs::symlink_metadata(&backup_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.file_type().is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == 0
+            && metadata.mode() & 0o077 == 0,
+        "refusing to remove unexpected helper backup root {}",
+        backup_root.display()
+    );
+    for entry in backup_root.read_dir()? {
+        validate_backup_directory(&entry?.path())?;
+    }
+    fs::remove_dir_all(&backup_root)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_backup_directory(directory: &Path) -> Result<()> {
+    let backup_root = installation_backup_root()?;
+    ensure!(
+        directory.parent() == Some(backup_root.as_path())
+            && directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_backup_directory_name),
+        "unexpected helper backup directory {}",
+        directory.display()
+    );
+    let metadata = fs::symlink_metadata(directory)?;
+    ensure!(
+        metadata.file_type().is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == 0
+            && metadata.mode() & 0o077 == 0,
+        "refusing to remove unexpected helper backup directory {}",
+        directory.display()
+    );
+    let expected_names = [
+        Path::new(DEFAULT_HELPER_BINARY).file_name(),
+        Path::new(DEFAULT_HELPER_CONFIG).file_name(),
+        Path::new(DEFAULT_HELPER_PLIST).file_name(),
+    ];
+    for entry in directory.read_dir()? {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let metadata = fs::symlink_metadata(entry.path())?;
+        ensure!(
+            expected_names
+                .iter()
+                .flatten()
+                .any(|expected| *expected == entry_name.as_os_str())
+                && metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == 0
+                && metadata.mode() & 0o022 == 0,
+            "refusing to remove unexpected helper backup entry {}",
+            entry.path().display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_backup_directory_name(name: &str) -> bool {
+    let Some((timestamp, pid)) = name.split_once('-') else {
+        return false;
+    };
+    !timestamp.is_empty()
+        && !pid.is_empty()
+        && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(target_os = "macos")]
@@ -1067,6 +1219,33 @@ mod tests {
         let decoded: HelperConfig = toml::from_str(&encoded)?;
         assert_eq!(decoded.roots[0].to_path_buf()?, root);
         Ok(())
+    }
+
+    #[test]
+    fn configured_client_group_parser_is_strict() -> Result<()> {
+        assert_eq!(parse_client_groups(b"20 12 61\n")?, vec![20, 12, 61]);
+        assert!(parse_client_groups(b"").is_err());
+        assert!(parse_client_groups(b"20 staff").is_err());
+        assert!(parse_client_groups(&[0xff]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn helper_authentication_accepts_only_the_configured_uid() {
+        assert!(peer_is_authorized(501, 501));
+        assert!(!peer_is_authorized(502, 501));
+        assert!(!peer_is_authorized(0, 501));
+    }
+
+    #[test]
+    fn backup_names_are_exact_timestamp_pid_pairs() {
+        assert!(is_backup_directory_name("1721600000000000000-1234"));
+        assert!(!is_backup_directory_name(""));
+        assert!(!is_backup_directory_name("1721600000000000000"));
+        assert!(!is_backup_directory_name("1721600000000000000-"));
+        assert!(!is_backup_directory_name("-1234"));
+        assert!(!is_backup_directory_name("1721600000000000000-1234-extra"));
+        assert!(!is_backup_directory_name("latest-1234"));
     }
 
     #[test]
