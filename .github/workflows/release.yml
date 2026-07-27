@@ -74,7 +74,11 @@ jobs:
           echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
-        run: cargo build --locked --release --bins --target ${{ matrix.target }}
+        run: cargo build --locked --release --bin "${BIN_NAME}" --target ${{ matrix.target }}
+
+      - name: Build macOS ownership helper
+        if: runner.os == 'macOS'
+        run: cargo build --locked --release --features privileged-macos-helper --bin "${HELPER_BIN_NAME}" --target ${{ matrix.target }}
 
       - name: Package release archive
         id: package
@@ -84,7 +88,9 @@ jobs:
           staging="dist/${package}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.binary_ext }}" "$staging/"
-          cp "target/${{ matrix.target }}/release/${HELPER_BIN_NAME}${{ matrix.binary_ext }}" "$staging/"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            cp "target/${{ matrix.target }}/release/${HELPER_BIN_NAME}" "$staging/"
+          fi
           if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
             PACKAGE="$package" python - <<'PY'
           import os
@@ -110,7 +116,7 @@ jobs:
           ARCHIVE: ${{ steps.package.outputs.archive }}
           PACKAGE: ${{ env.BIN_NAME }}-${{ matrix.target }}-v${{ steps.version.outputs.cargo_version }}
           MAIN_BINARY: ${{ env.BIN_NAME }}${{ matrix.binary_ext }}
-          HELPER_BINARY: ${{ env.HELPER_BIN_NAME }}${{ matrix.binary_ext }}
+          HELPER_BINARY: ${{ runner.os == 'macOS' && env.HELPER_BIN_NAME || '' }}
         run: |
           python - <<'PY'
           import os
@@ -121,8 +127,9 @@ jobs:
           package = os.environ["PACKAGE"]
           expected = {
               f"{package}/{os.environ['MAIN_BINARY']}",
-              f"{package}/{os.environ['HELPER_BINARY']}",
           }
+          if os.environ["HELPER_BINARY"]:
+              expected.add(f"{package}/{os.environ['HELPER_BINARY']}")
           if archive.endswith(".zip"):
               with zipfile.ZipFile(archive) as release:
                   actual = set(release.namelist())
