@@ -47,8 +47,8 @@ pub const DEFAULT_HELPER_SOCKET: &str =
 const HELPER_CONFIG_VERSION: u64 = 1;
 #[cfg(unix)]
 const HELPER_IO_TIMEOUT: Duration = Duration::from_secs(15);
-#[cfg(target_os = "macos")]
-const MAX_MATCHED_OBSERVATIONS: usize = 250_000;
+#[cfg(any(target_os = "macos", test))]
+pub const MAX_MATCHED_OBSERVATIONS: usize = 250_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

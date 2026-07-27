@@ -613,27 +613,32 @@ fn scheduled_ownership_policy(
     ownership: &config::OwnershipConfig,
     check_in_use: bool,
 ) -> Result<OwnershipPolicy> {
-    anyhow::ensure!(
-        ownership.helper_socket.is_absolute(),
-        "ownership.helper_socket must be absolute"
-    );
-    anyhow::ensure!(
-        !ownership
-            .helper_socket
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir)),
-        "ownership.helper_socket must not contain '.' or '..' components"
-    );
     #[cfg(not(target_os = "macos"))]
-    anyhow::ensure!(
-        ownership.macos_backend != worktree_gc::MacosOwnershipBackend::PrivilegedHelper,
-        "ownership.macos_backend = \"privileged_helper\" requires macOS"
-    );
-    anyhow::ensure!(
-        ownership.macos_backend != worktree_gc::MacosOwnershipBackend::PrivilegedHelper
-            || check_in_use,
-        "ownership.macos_backend = \"privileged_helper\" requires cleanup.check_in_use = true"
-    );
+    let _ = check_in_use;
+    if ownership.macos_backend == worktree_gc::MacosOwnershipBackend::PrivilegedHelper {
+        #[cfg(not(target_os = "macos"))]
+        {
+            anyhow::bail!("ownership.macos_backend = \"privileged_helper\" requires macOS");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            anyhow::ensure!(
+                ownership.helper_socket.is_absolute(),
+                "ownership.helper_socket must be absolute"
+            );
+            anyhow::ensure!(
+                !ownership
+                    .helper_socket
+                    .components()
+                    .any(|component| matches!(component, Component::CurDir | Component::ParentDir)),
+                "ownership.helper_socket must not contain '.' or '..' components"
+            );
+            anyhow::ensure!(
+                check_in_use,
+                "ownership.macos_backend = \"privileged_helper\" requires cleanup.check_in_use = true"
+            );
+        }
+    }
     Ok(OwnershipPolicy {
         macos_backend: ownership.macos_backend,
         helper_socket: ownership.helper_socket.clone(),
@@ -1557,13 +1562,14 @@ owner_free_generated = true
     }
 
     #[test]
-    fn scheduled_ownership_policy_rejects_relative_or_parent_socket_paths() -> Result<()> {
-        let relative: config::OwnershipConfig = toml::from_str("helper_socket = 'helper.sock'")?;
-        assert!(scheduled_ownership_policy(&relative, true).is_err());
+    fn unused_helper_socket_is_not_validated_for_automatic_or_global_backends() -> Result<()> {
+        let automatic: config::OwnershipConfig =
+            toml::from_str("helper_socket = 'unused-helper.sock'")?;
+        assert!(scheduled_ownership_policy(&automatic, true).is_ok());
 
-        let parent: config::OwnershipConfig =
-            toml::from_str("helper_socket = '/tmp/run/../helper.sock'")?;
-        assert!(scheduled_ownership_policy(&parent, true).is_err());
+        let global: config::OwnershipConfig =
+            toml::from_str("macos_backend = 'global_lsof'\nhelper_socket = 'unused-helper.sock'")?;
+        assert!(scheduled_ownership_policy(&global, true).is_ok());
         Ok(())
     }
 
@@ -1582,6 +1588,15 @@ helper_socket = "/Library/Application Support/worktree-gc/run/ownership.sock"
             worktree_gc::MacosOwnershipBackend::PrivilegedHelper
         );
         assert!(scheduled_ownership_policy(&config, false).is_err());
+
+        let relative: config::OwnershipConfig =
+            toml::from_str("macos_backend = 'privileged_helper'\nhelper_socket = 'helper.sock'")?;
+        assert!(scheduled_ownership_policy(&relative, true).is_err());
+
+        let parent: config::OwnershipConfig = toml::from_str(
+            "macos_backend = 'privileged_helper'\nhelper_socket = '/tmp/run/../helper.sock'",
+        )?;
+        assert!(scheduled_ownership_policy(&parent, true).is_err());
         Ok(())
     }
 

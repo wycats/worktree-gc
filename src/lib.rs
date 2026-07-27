@@ -744,7 +744,7 @@ pub(crate) enum OpenHandleSnapshot {
     Indeterminate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessOwnershipEvidenceKind {
     ProcessCwd,
@@ -1349,21 +1349,62 @@ fn capture_execution_open_handles_with_policy(
     metrics: &mut ExecutionMetrics,
     policy: &OwnershipPolicy,
 ) -> ExecutionOwnershipSnapshot {
-    let paths = existing_ownership_roots(paths);
     let started = Instant::now();
-    let evidence = process_ownership_evidence_for_paths_with_policy(&paths, policy);
-    record_execution_ownership(phase, paths.len(), evidence, started.elapsed(), metrics)
+    let (requested_roots, evidence) = match existing_ownership_roots(paths) {
+        Ok(paths) => {
+            let requested_roots = paths.len();
+            (
+                requested_roots,
+                process_ownership_evidence_for_paths_with_policy(&paths, policy),
+            )
+        }
+        Err(error) => (
+            0,
+            ProcessOwnershipEvidence {
+                observed_at_unix: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                backend: "ownership_root_preflight".to_string(),
+                protocol_version: None,
+                helper_build_sha256: None,
+                complete: false,
+                error: Some(format!(
+                    "failed to classify ownership request roots: {error:#}"
+                )),
+                observations: Vec::new(),
+            },
+        ),
+    };
+    record_execution_ownership(phase, requested_roots, evidence, started.elapsed(), metrics)
 }
 
-fn existing_ownership_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
-    let mut paths = paths
-        .iter()
-        .filter(|path| path.exists())
-        .cloned()
-        .collect::<Vec<_>>();
+fn existing_ownership_roots(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    existing_ownership_roots_with(paths, |path| match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    })
+}
+
+fn existing_ownership_roots_with(
+    paths: &[PathBuf],
+    inspect: impl Fn(&Path) -> io::Result<bool>,
+) -> Result<Vec<PathBuf>> {
+    let mut paths =
+        paths
+            .iter()
+            .filter_map(|path| match inspect(path) {
+                Ok(true) => Some(Ok(path.clone())),
+                Ok(false) => None,
+                Err(error) => Some(Err(error).with_context(|| {
+                    format!("failed to inspect ownership root {}", path.display())
+                })),
+            })
+            .collect::<Result<Vec<_>>>()?;
     paths.sort();
     paths.dedup();
-    paths
+    Ok(paths)
 }
 
 fn record_execution_ownership(
@@ -1427,18 +1468,30 @@ fn repository_has_routine_actions(repository: &CleanupRun) -> bool {
 
 fn repository_routine_ownership_paths(repository: &CleanupRun) -> Vec<PathBuf> {
     let manifest = &repository.manifest;
-    let mut paths = vec![manifest.current_worktree.clone()];
+    let mut paths = Vec::new();
+    if manifest.metadata_prune_enabled {
+        paths.push(manifest.current_worktree.clone());
+    }
     paths.extend(
         manifest
             .worktrees
             .iter()
+            .filter(|decision| {
+                decision.action == WorktreeAction::Remove
+                    && decision.cleanup_class == CleanupClass::Routine
+            })
             .map(|decision| decision.path.clone()),
     );
     paths.extend(
         manifest
             .generated_dirs
             .iter()
-            .flat_map(|decision| [decision.worktree_path.clone(), decision.path.clone()]),
+            .filter(|decision| {
+                (decision.action == GeneratedDirAction::Delete
+                    && decision.cleanup_class == CleanupClass::Routine)
+                    || decision.sweeps.iter().any(SweepDecision::has_work)
+            })
+            .map(|decision| decision.worktree_path.clone()),
     );
     paths.sort();
     paths.dedup();
@@ -1450,6 +1503,10 @@ fn repository_worktree_ownership_paths(repository: &CleanupRun) -> Vec<PathBuf> 
         .manifest
         .worktrees
         .iter()
+        .filter(|decision| {
+            decision.action == WorktreeAction::Remove
+                && decision.cleanup_class == CleanupClass::Pressure
+        })
         .map(|decision| decision.path.clone())
         .collect::<Vec<_>>();
     paths.sort();
@@ -1520,10 +1577,7 @@ fn cleanup_repositories_with_capture(
     };
     let protections = active_protections(options.now)?;
     let mut execution_metrics = options.execute.then(ExecutionMetrics::default);
-    let mut initial_ownership_paths = roots.clone();
-    initial_ownership_paths.extend(repositories.iter().cloned());
-    initial_ownership_paths.sort();
-    initial_ownership_paths.dedup();
+    let initial_ownership_paths = roots.clone();
     let mut dry_run_metrics = ExecutionMetrics::default();
     let initial_execution_snapshot = options.check_in_use.then(|| {
         let metrics = execution_metrics.as_mut().unwrap_or(&mut dry_run_metrics);
@@ -2316,14 +2370,13 @@ fn pressure_epoch_ownership_paths(
 ) -> Vec<PathBuf> {
     let mut paths = epoch
         .iter()
-        .flat_map(|(index, path)| {
-            let worktree = manifest.repositories[*index]
+        .filter_map(|(index, path)| {
+            manifest.repositories[*index]
                 .manifest
                 .generated_dirs
                 .iter()
                 .find(|decision| decision.path == *path)
-                .map(|decision| decision.worktree_path.clone());
-            worktree.into_iter().chain(std::iter::once(path.clone()))
+                .map(|decision| decision.worktree_path.clone())
         })
         .collect::<Vec<_>>();
     paths.sort();
@@ -4452,7 +4505,7 @@ fn parse_lsof_snapshot_paths(output: &[u8]) -> HashSet<PathBuf> {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RawProcessOwnershipObservation {
     pid: u32,
     command: Option<String>,
@@ -4509,48 +4562,105 @@ fn resolve_macos_backend(
 
 #[cfg(target_os = "macos")]
 fn capture_privileged_helper_raw(socket: &Path, roots: &[PathBuf]) -> RawOwnershipCapture {
-    let response = match ownership_helper::capture_from_helper(socket, roots) {
-        Ok(response) => response,
-        Err(error) => {
-            return RawOwnershipCapture {
-                backend: "macos_privileged_libproc",
-                protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
-                helper_build_sha256: None,
-                complete: false,
-                error: Some(format!(
-                    "privileged ownership helper request failed: {error:#}"
-                )),
-                observations: Vec::new(),
-            };
-        }
-    };
-    if response.backend != "macos_privileged_libproc" {
-        return RawOwnershipCapture {
-            backend: "macos_privileged_libproc",
-            protocol_version: Some(response.protocol_version),
-            helper_build_sha256: None,
-            complete: false,
-            error: Some(format!(
-                "privileged ownership helper returned unexpected backend {:?}",
-                response.backend
-            )),
-            observations: Vec::new(),
+    capture_privileged_helper_raw_with(socket, roots, ownership_helper::capture_from_helper)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn capture_privileged_helper_raw_with(
+    socket: &Path,
+    roots: &[PathBuf],
+    capture: impl Fn(&Path, &[PathBuf]) -> Result<ownership_protocol::OwnershipResponse>,
+) -> RawOwnershipCapture {
+    let mut protocol_version = None;
+    let mut helper_build_sha256 = None;
+    let mut observations = Vec::new();
+    let mut seen_observations = HashSet::new();
+    let batch_count = roots.len().div_ceil(ownership_protocol::MAX_REQUEST_ROOTS);
+
+    for (batch_index, batch) in roots
+        .chunks(ownership_protocol::MAX_REQUEST_ROOTS)
+        .enumerate()
+    {
+        let response = match capture(socket, batch) {
+            Ok(response) => response,
+            Err(error) => {
+                return incomplete_privileged_helper_capture(format!(
+                    "privileged ownership helper batch {}/{} failed: {error:#}",
+                    batch_index + 1,
+                    batch_count
+                ));
+            }
         };
+        let batch_capture = privileged_helper_response_to_raw(response);
+        if !batch_capture.complete {
+            return incomplete_privileged_helper_capture(format!(
+                "privileged ownership helper batch {}/{} was incomplete: {}",
+                batch_index + 1,
+                batch_count,
+                batch_capture.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+        if protocol_version.is_some_and(|version| {
+            batch_capture
+                .protocol_version
+                .is_none_or(|current| current != version)
+        }) {
+            return incomplete_privileged_helper_capture(
+                "privileged ownership helper protocol changed between batches".to_string(),
+            );
+        }
+        if helper_build_sha256.as_ref().is_some_and(|build| {
+            batch_capture
+                .helper_build_sha256
+                .as_ref()
+                .is_none_or(|current| current != build)
+        }) {
+            return incomplete_privileged_helper_capture(
+                "privileged ownership helper executable changed between batches".to_string(),
+            );
+        }
+        protocol_version = batch_capture.protocol_version;
+        helper_build_sha256 = batch_capture.helper_build_sha256;
+        for observation in batch_capture.observations {
+            if seen_observations.insert(observation.clone()) {
+                if observations.len() >= ownership_helper::MAX_MATCHED_OBSERVATIONS {
+                    return incomplete_privileged_helper_capture(format!(
+                        "privileged ownership helper batches exceeded {} unique observations",
+                        ownership_helper::MAX_MATCHED_OBSERVATIONS
+                    ));
+                }
+                observations.push(observation);
+            }
+        }
+    }
+
+    RawOwnershipCapture {
+        backend: "macos_privileged_libproc",
+        protocol_version,
+        helper_build_sha256,
+        complete: true,
+        error: None,
+        observations,
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn privileged_helper_response_to_raw(
+    response: ownership_protocol::OwnershipResponse,
+) -> RawOwnershipCapture {
+    if response.backend != "macos_privileged_libproc" {
+        return incomplete_privileged_helper_capture(format!(
+            "privileged ownership helper returned unexpected backend {:?}",
+            response.backend
+        ));
     }
     let observations = if response.complete {
         match helper_observations_to_raw(&response.observations) {
             Ok(observations) => observations,
             Err(error) => {
-                return RawOwnershipCapture {
-                    backend: "macos_privileged_libproc",
-                    protocol_version: Some(response.protocol_version),
-                    helper_build_sha256: None,
-                    complete: false,
-                    error: Some(format!(
-                        "privileged ownership helper returned invalid evidence: {error:#}"
-                    )),
-                    observations: Vec::new(),
-                };
+                return incomplete_privileged_helper_capture(format!(
+                    "privileged ownership helper returned invalid evidence: {error:#}"
+                ));
             }
         }
     } else {
@@ -4563,6 +4673,18 @@ fn capture_privileged_helper_raw(socket: &Path, roots: &[PathBuf]) -> RawOwnersh
         complete: response.complete,
         error: response.error,
         observations,
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn incomplete_privileged_helper_capture(error: String) -> RawOwnershipCapture {
+    RawOwnershipCapture {
+        backend: "macos_privileged_libproc",
+        protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
+        helper_build_sha256: None,
+        complete: false,
+        error: Some(error),
+        observations: Vec::new(),
     }
 }
 
@@ -8590,6 +8712,103 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn helper_requests_are_batched_without_losing_complete_evidence() {
+        use ownership_protocol::{
+            OwnershipObservation, OwnershipPathKind, OwnershipResponse, WirePath,
+        };
+
+        let roots = (0..=ownership_protocol::MAX_REQUEST_ROOTS)
+            .map(|index| PathBuf::from(format!("/allowed/root-{index}")))
+            .collect::<Vec<_>>();
+        let batch_sizes = RefCell::new(Vec::new());
+        let calls = Cell::new(0);
+        let capture = capture_privileged_helper_raw_with(
+            Path::new("/unused/helper.sock"),
+            &roots,
+            |_, batch| {
+                calls.set(calls.get() + 1);
+                batch_sizes.borrow_mut().push(batch.len());
+                let observed = batch[0].join("artifact");
+                Ok(OwnershipResponse {
+                    protocol_version: ownership_protocol::OWNERSHIP_PROTOCOL_VERSION,
+                    request_id: calls.get(),
+                    backend: "macos_privileged_libproc".to_string(),
+                    helper_build_sha256: Some(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_string(),
+                    ),
+                    complete: true,
+                    error: None,
+                    observations: vec![OwnershipObservation {
+                        pid: u32::try_from(calls.get()).unwrap(),
+                        kind: OwnershipPathKind::OpenFile,
+                        observed_path: WirePath::from_path(&observed),
+                        matched_root: WirePath::from_path(&batch[0]),
+                    }],
+                    service: None,
+                })
+            },
+        );
+
+        assert!(capture.complete);
+        assert_eq!(
+            *batch_sizes.borrow(),
+            vec![ownership_protocol::MAX_REQUEST_ROOTS, 1]
+        );
+        assert_eq!(
+            capture.protocol_version,
+            Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            capture
+                .observations
+                .iter()
+                .map(|observation| observation.observed_path.clone())
+                .collect::<Vec<_>>(),
+            vec![roots[0].join("artifact"), roots[2048].join("artifact")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_incomplete_helper_batch_rejects_the_whole_epoch() {
+        use ownership_protocol::OwnershipResponse;
+
+        let roots = (0..=ownership_protocol::MAX_REQUEST_ROOTS)
+            .map(|index| PathBuf::from(format!("/allowed/root-{index}")))
+            .collect::<Vec<_>>();
+        let calls = Cell::new(0);
+        let capture =
+            capture_privileged_helper_raw_with(Path::new("/unused/helper.sock"), &roots, |_, _| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    return Ok(OwnershipResponse::refusal(2, "fixture incomplete"));
+                }
+                Ok(OwnershipResponse {
+                    protocol_version: ownership_protocol::OWNERSHIP_PROTOCOL_VERSION,
+                    request_id: 1,
+                    backend: "macos_privileged_libproc".to_string(),
+                    helper_build_sha256: Some(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_string(),
+                    ),
+                    complete: true,
+                    error: None,
+                    observations: Vec::new(),
+                    service: None,
+                })
+            });
+
+        assert_eq!(calls.get(), 2);
+        assert!(!capture.complete);
+        assert!(capture.observations.is_empty());
+        assert!(capture.error.as_deref().is_some_and(|error| {
+            error.contains("batch 2/2") && error.contains("fixture incomplete")
+        }));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn targeted_pid_fallback_merges_complete_native_evidence() {
@@ -10295,10 +10514,26 @@ mod tests {
         fs::create_dir(&existing)?;
 
         assert_eq!(
-            existing_ownership_roots(&[missing, existing.clone(), existing.clone()]),
+            existing_ownership_roots(&[missing, existing.clone(), existing.clone()])?,
             vec![existing]
         );
         Ok(())
+    }
+
+    #[test]
+    fn ownership_root_metadata_errors_are_not_treated_as_tombstones() {
+        let root = PathBuf::from("/unreadable/root");
+        let error = existing_ownership_roots_with(std::slice::from_ref(&root), |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture denied",
+            ))
+        })
+        .expect_err("metadata errors must make ownership evidence incomplete");
+
+        let message = format!("{error:#}");
+        assert!(message.contains(root.to_string_lossy().as_ref()));
+        assert!(message.contains("fixture denied"));
     }
 
     #[test]
@@ -10544,18 +10779,23 @@ mod tests {
     }
 
     #[test]
-    fn routine_refresh_ownership_covers_initially_inactive_candidates() -> Result<()> {
+    fn routine_ownership_requests_only_actionable_worktrees() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let candidate = repo.join(".turbo");
         fs::create_dir(&candidate)?;
-        fs::write(candidate.join("artifact"), "recent")?;
+        fs::write(candidate.join("artifact"), "stale")?;
+        let stale = system_time_to_unix(SystemTime::now())
+            .context("system time does not fit in Unix time")?
+            - 30 * 86_400;
+        set_mtime(&candidate.join("artifact"), stale)?;
+        set_mtime(&candidate, stale)?;
         let repo = fs::canonicalize(repo)?;
         let run = cleanup(
             Some(&repo),
             CleanupOptions {
                 execute: false,
                 stale_days: 14,
-                generated_days: 7,
+                generated_days: 0,
                 generated_activity_only: true,
                 check_in_use: false,
                 generated_config: GeneratedDirConfig::default(),
@@ -10566,28 +10806,23 @@ mod tests {
                 now: now(),
             },
         )?;
-        let candidate = fs::canonicalize(candidate)?;
         let repository = CleanupRun {
             manifest_path: PathBuf::from("/fixture"),
             manifest: run.manifest,
         };
         let paths = repository_routine_ownership_paths(&repository);
-        assert!(paths.contains(&repo));
-        assert!(
-            paths.contains(&candidate),
-            "refresh ownership must include candidates that were initially inactive"
-        );
+        assert_eq!(paths, vec![repo]);
         Ok(())
     }
 
     #[test]
-    fn pressure_worktree_refresh_ownership_covers_every_known_worktree() -> Result<()> {
+    fn pressure_worktree_ownership_requests_only_actionable_worktrees() -> Result<()> {
         let (temp, repo) = init_repo()?;
         let linked = temp.path().join("linked");
         add_worktree(&repo, &linked, "linked-branch")?;
         let repo = fs::canonicalize(repo)?;
         let linked = fs::canonicalize(linked)?;
-        let run = cleanup(
+        let mut run = cleanup(
             Some(&repo),
             CleanupOptions {
                 execute: false,
@@ -10603,12 +10838,20 @@ mod tests {
                 now: now(),
             },
         )?;
+        let linked_decision = run
+            .manifest
+            .worktrees
+            .iter_mut()
+            .find(|decision| decision.path == linked)
+            .context("linked worktree decision is absent")?;
+        linked_decision.action = WorktreeAction::Remove;
+        linked_decision.cleanup_class = CleanupClass::Pressure;
         let paths = repository_worktree_ownership_paths(&CleanupRun {
             manifest_path: PathBuf::from("/fixture"),
             manifest: run.manifest,
         });
-        assert!(paths.contains(&repo));
-        assert!(paths.contains(&linked));
+        assert_eq!(paths, vec![linked]);
+        assert!(!paths.contains(&repo));
         Ok(())
     }
 

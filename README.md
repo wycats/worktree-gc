@@ -482,6 +482,13 @@ Aggregate execution metrics record the helper backend,
 protocol version, helper executable SHA-256, requested-root count, observation
 count, duration, completeness, and any refusal.
 
+The controller narrows routine and pressure requests to actionable worktree
+roots. If a snapshot still exceeds the protocol's 2,048-root request bound, it
+uses bounded batches, requires one protocol version and helper digest across
+every batch, and rejects the entire epoch if any batch is incomplete. Missing
+tombstone paths are omitted, while every other root-metadata error makes the
+epoch incomplete.
+
 The integrated client and helper use ownership protocol v2. Because v2 adds a
 required helper-executable digest to complete responses, an evidence-only v1
 helper is deliberately incompatible and causes strict mode to fail closed until

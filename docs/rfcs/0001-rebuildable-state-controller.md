@@ -389,6 +389,13 @@ now require the helper executable SHA-256. The client rejects a v1 helper rather
 than accepting evidence whose binary identity cannot be recorded; the helper
 and client are therefore installed as a verified release pair.
 
+Execution requests only actionable worktree roots and divides any remaining
+set above 2,048 roots into bounded helper requests. All batches must report the
+same protocol and helper digest, and one incomplete batch rejects the whole
+epoch. A genuinely missing worktree tombstone needs no ownership probe, but a
+permission or filesystem error while inspecting a requested root is incomplete
+evidence rather than absence.
+
 ## Implementation plan
 
 The phases are ordered by expected effect. Tier 2 owner-free coarse cleanup is
