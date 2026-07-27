@@ -1148,6 +1148,8 @@ mod tests {
         let evidence = ProcessOwnershipEvidence {
             observed_at_unix: 1,
             backend: "test".to_string(),
+            protocol_version: None,
+            helper_build_sha256: None,
             complete: true,
             error: None,
             observations: vec![

@@ -912,6 +912,8 @@ fn validate_current_ownership(
             ProcessOwnershipEvidence {
                 observed_at_unix,
                 backend: "override".to_string(),
+                protocol_version: None,
+                helper_build_sha256: None,
                 complete,
                 error: None,
                 observations,
@@ -1977,6 +1979,8 @@ mod tests {
         let mut ownership = ProcessOwnershipEvidence {
             observed_at_unix: 1,
             backend: "fixture".to_string(),
+            protocol_version: None,
+            helper_build_sha256: None,
             complete: true,
             error: None,
             observations: vec![

@@ -139,10 +139,9 @@ Removal is likewise explicit and limited to the helper-owned service files:
 sudo ./worktree-gc-ownership-helper uninstall
 ```
 
-Installing this first-stage helper does not change cleanup behavior. Selection
-of the privileged backend remains a separate integration and rollout gate; the
-ordinary process retains all protection, source, lock, quarantine, and deletion
-authority.
+Installing the helper does not change cleanup behavior until scheduled
+configuration selects it. The ordinary process retains all protection, source,
+lock, quarantine, and deletion authority.
 
 Active Rust `target` directories receive a built-in incremental-cache sweep
 during ordinary cleanup planning. They also receive an atomic profile-reset
@@ -450,6 +449,13 @@ cargo_sweep_max_size = "50GB"
 provider = "github"
 merged_grace_days = 1
 
+[ownership]
+# "auto" preserves the native/libproc and global-lsof compatibility path.
+# "privileged_helper" requires complete evidence from the installed helper and
+# never falls back. "global_lsof" requests the legacy global snapshot directly.
+macos_backend = "auto"
+helper_socket = "/Library/Application Support/worktree-gc/run/ownership.sock"
+
 [pressure]
 # Optional hysteresis controller. Routine TTL cleanup still runs above this.
 enter_free_space = "100GiB"
@@ -464,6 +470,35 @@ owner_free_generated = true
 retention_days = 90
 repository_refresh_days = 7
 ```
+
+With `macos_backend = "privileged_helper"`, the initial plan, each actionable
+routine repository, and each bounded pressure epoch use one helper request
+containing that snapshot's exact candidate and worktree roots. If the socket is
+unavailable, authentication or protocol validation fails, or the helper reports
+incomplete evidence, the corresponding routine repository is skipped or the
+pressure epoch stops. Strict helper mode never falls back to unprivileged
+`libproc` or `lsof`, and configuration requires `cleanup.check_in_use = true`.
+Aggregate execution metrics record the helper backend,
+protocol version, helper executable SHA-256, requested-root count, observation
+count, duration, completeness, and any refusal.
+
+The controller narrows routine and pressure requests to actionable worktree
+roots. If a snapshot still exceeds the protocol's 2,048-root request bound, it
+uses bounded batches, requires one protocol version and helper digest across
+every batch, and rejects the entire epoch if any batch is incomplete. Missing
+tombstone paths are omitted, while every other root-metadata error makes the
+epoch incomplete.
+
+The integrated client and helper use ownership protocol v2. Because v2 adds a
+required helper-executable digest to complete responses, an evidence-only v1
+helper is deliberately incompatible and causes strict mode to fail closed until
+the root-owned helper and ordinary client are upgraded together.
+
+`macos_backend = "auto"` is the backward-compatible default. It retains the
+existing native macOS capture and `lsof` fallback behavior while a helper
+installation is being supervised. Selecting `privileged_helper` is therefore a
+separate explicit policy change after `worktree-gc-ownership-helper status` is
+fully green.
 
 `no_default_generated = true` has the same meaning as the CLI
 `--no-default-generated` flag: scheduled cleanup considers only explicitly
