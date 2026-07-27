@@ -1,20 +1,25 @@
 use crate::ownership_protocol::{
-    read_message, write_message, OwnershipObservation, OwnershipPathKind, OwnershipRequest,
-    OwnershipResponse, WirePath, MAX_REQUEST_ROOTS, OWNERSHIP_PROTOCOL_VERSION,
+    read_message, write_message, OwnershipRequest, OwnershipResponse, WirePath, MAX_REQUEST_ROOTS,
+    OWNERSHIP_PROTOCOL_VERSION,
 };
+#[cfg(any(target_os = "macos", test))]
+use crate::ownership_protocol::{OwnershipObservation, OwnershipPathKind};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", test))]
+use std::fs;
+#[cfg(target_os = "macos")]
 use std::io::Write;
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(target_os = "macos")]
+use std::os::unix::net::UnixListener;
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
-#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 
 pub const HELPER_LABEL: &str = "com.wycats.worktree-gc.ownership-helper";
@@ -26,8 +31,10 @@ pub const DEFAULT_HELPER_PLIST: &str =
     "/Library/LaunchDaemons/com.wycats.worktree-gc.ownership-helper.plist";
 pub const DEFAULT_HELPER_SOCKET: &str =
     "/Library/Application Support/worktree-gc/run/ownership.sock";
+#[cfg(any(target_os = "macos", test))]
 const HELPER_CONFIG_VERSION: u64 = 1;
 const HELPER_IO_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(target_os = "macos")]
 const MAX_MATCHED_OBSERVATIONS: usize = 250_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +230,7 @@ fn privileged_response_from_capture(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn validated_request_roots(
     request: &OwnershipRequest,
     config: &HelperConfig,
@@ -270,6 +278,7 @@ fn validated_request_roots(
     Ok(roots)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn canonical_config_roots(config: &HelperConfig) -> Result<Vec<PathBuf>> {
     ensure!(
         config.config_version == HELPER_CONFIG_VERSION,
