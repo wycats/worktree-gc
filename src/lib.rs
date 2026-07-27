@@ -8,6 +8,8 @@ mod github_pr;
 mod inventory;
 #[cfg(target_os = "macos")]
 mod macos_open_handles;
+pub mod ownership_helper;
+pub mod ownership_protocol;
 mod protection;
 
 use anyhow::{bail, Context, Result};

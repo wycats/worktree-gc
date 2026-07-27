@@ -17,6 +17,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BIN_NAME: worktree-gc
+  HELPER_BIN_NAME: worktree-gc-ownership-helper
 
 jobs:
   build:
@@ -73,7 +74,7 @@ jobs:
           echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --bins --target ${{ matrix.target }}
 
       - name: Package release archive
         id: package
@@ -83,6 +84,9 @@ jobs:
           staging="dist/${package}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.binary_ext }}" "$staging/"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            cp "target/${{ matrix.target }}/release/${HELPER_BIN_NAME}" "$staging/"
+          fi
           if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
             PACKAGE="$package" BINARY="${BIN_NAME}${{ matrix.binary_ext }}" python - <<'PY'
           import os
