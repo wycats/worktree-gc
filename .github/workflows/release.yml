@@ -17,6 +17,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BIN_NAME: worktree-gc
+  HELPER_BIN_NAME: worktree-gc-ownership-helper
 
 jobs:
   build:
@@ -73,7 +74,11 @@ jobs:
           echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
 
       - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --bin "${BIN_NAME}" --target ${{ matrix.target }}
+
+      - name: Build macOS ownership helper
+        if: runner.os == 'macOS'
+        run: cargo build --locked --release --features privileged-macos-helper --bin "${HELPER_BIN_NAME}" --target ${{ matrix.target }}
 
       - name: Package release archive
         id: package
@@ -83,24 +88,59 @@ jobs:
           staging="dist/${package}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.binary_ext }}" "$staging/"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            cp "target/${{ matrix.target }}/release/${HELPER_BIN_NAME}" "$staging/"
+          fi
           if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
-            PACKAGE="$package" BINARY="${BIN_NAME}${{ matrix.binary_ext }}" python - <<'PY'
+            PACKAGE="$package" python - <<'PY'
           import os
           import zipfile
 
           package = os.environ["PACKAGE"]
-          binary = os.environ["BINARY"]
           archive = f"{package}.zip"
-          source = os.path.join("dist", package, binary)
-          destination = f"{package}/{binary}"
+          staging = os.path.join("dist", package)
 
           with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
-              zip_file.write(source, destination)
+              for filename in sorted(os.listdir(staging)):
+                  source = os.path.join(staging, filename)
+                  zip_file.write(source, f"{package}/{filename}")
           PY
           else
-            tar -C dist -czf "${package}.tgz" "$package"
+            COPYFILE_DISABLE=1 tar -C dist -czf "${package}.tgz" "$package"
           fi
           echo "archive=${package}.${{ matrix.archive_ext }}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release archive contents
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          PACKAGE: ${{ env.BIN_NAME }}-${{ matrix.target }}-v${{ steps.version.outputs.cargo_version }}
+          MAIN_BINARY: ${{ env.BIN_NAME }}${{ matrix.binary_ext }}
+          HELPER_BINARY: ${{ runner.os == 'macOS' && env.HELPER_BIN_NAME || '' }}
+        run: |
+          python - <<'PY'
+          import os
+          import tarfile
+          import zipfile
+
+          archive = os.environ["ARCHIVE"]
+          package = os.environ["PACKAGE"]
+          expected = {
+              f"{package}/{os.environ['MAIN_BINARY']}",
+          }
+          if os.environ["HELPER_BINARY"]:
+              expected.add(f"{package}/{os.environ['HELPER_BINARY']}")
+          if archive.endswith(".zip"):
+              with zipfile.ZipFile(archive) as release:
+                  actual = set(release.namelist())
+          else:
+              with tarfile.open(archive) as release:
+                  actual = {member.name for member in release.getmembers() if member.isfile()}
+          if actual != expected:
+              raise SystemExit(
+                  f"release archive entries differ: expected {sorted(expected)}, got {sorted(actual)}"
+              )
+          PY
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@v4

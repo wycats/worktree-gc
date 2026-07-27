@@ -31,3 +31,25 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
+
+  macos-ownership-helper:
+    name: macOS ownership helper
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check helper and protocol
+        run: cargo check --locked --all-targets --all-features
+
+      - name: Run library tests
+        run: cargo test --locked --lib --all-features
+
+      - name: Check ownership lints
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings

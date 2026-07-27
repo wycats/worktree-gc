@@ -360,6 +360,21 @@ that remain absent validate aggressive coarse cleanup. The controller should
 optimize the machine's steady state from this evidence rather than canonizing
 an arbitrary TTL.
 
+### Privileged ownership evidence
+
+The deletion controller remains unprivileged. On macOS, a separate minimal
+LaunchDaemon may provide process-path evidence that the current user cannot
+observe through `libproc`. Its protocol is versioned, bounded, scoped to
+canonical roots from a root-owned allowlist, and authenticated by peer UID. The
+helper returns only ownership evidence; it has no protection, planning,
+quarantine, or deletion operation.
+
+The initial helper ships independently of cleanup integration. A later policy
+slice selects it explicitly and fails closed if the helper is unavailable or
+returns incomplete evidence. This preserves a supervised boundary between
+installing the capability and granting any execution path authority to depend
+on it.
+
 ## Implementation plan
 
 The phases are ordered by expected effect. Tier 2 owner-free coarse cleanup is

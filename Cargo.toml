@@ -3,6 +3,7 @@ name = "worktree-gc"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
+default-run = "worktree-gc"
 description = "Triage and clean stale Git worktrees"
 repository = "https://github.com/wycats/worktree-gc"
 readme = "README.md"
@@ -18,6 +19,15 @@ pkg-fmt = "tgz"
 
 [package.metadata.binstall.overrides.'cfg(windows)']
 pkg-fmt = "zip"
+
+[features]
+default = []
+privileged-macos-helper = []
+
+[[bin]]
+name = "worktree-gc-ownership-helper"
+path = "src/bin/worktree-gc-ownership-helper.rs"
+required-features = ["privileged-macos-helper"]
 
 [dependencies]
 anyhow = "1.0.95"

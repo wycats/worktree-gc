@@ -100,6 +100,50 @@ rather than granting mtime-only deletion authority:
 cargo run -- cleanup --repo /path/to/repo --generated-activity-only --check-in-use --execute
 ```
 
+### Privileged ownership evidence on macOS
+
+macOS can deny process-path inspection even when the process is visible to the
+current user. Release archives for macOS therefore also contain
+`worktree-gc-ownership-helper`, an evidence-only LaunchDaemon. The helper has no
+cleanup command and cannot delete a generated tree. It accepts bounded
+ownership requests from one configured local UID, verifies every requested path
+against a root-owned canonical allowlist, and returns only matching cwd, root,
+mapped-file, and open-file observations.
+
+Install the helper explicitly from an extracted release archive:
+
+```sh
+sudo ./worktree-gc-ownership-helper install \
+  --client-uid "$(id -u)" \
+  --client-gid "$(id -g)" \
+  --root /Users/me/Code \
+  --root /Users/me/plugins
+```
+
+The installer atomically places the helper under
+`/Library/PrivilegedHelperTools`, writes its owner-only configuration under
+`/Library/Application Support/worktree-gc`, and bootstraps
+`com.wycats.worktree-gc.ownership-helper`. The Unix socket authenticates the
+peer UID and is available at
+`/Library/Application Support/worktree-gc/run/ownership.sock`. Inspect the
+service without mutation:
+
+```sh
+./worktree-gc-ownership-helper status
+./worktree-gc-ownership-helper probe --root /Users/me/Code/repo/target
+```
+
+Removal is likewise explicit and limited to the helper-owned service files:
+
+```sh
+sudo ./worktree-gc-ownership-helper uninstall
+```
+
+Installing this first-stage helper does not change cleanup behavior. Selection
+of the privileged backend remains a separate integration and rollout gate; the
+ordinary process retains all protection, source, lock, quarantine, and deletion
+authority.
+
 Active Rust `target` directories receive a built-in incremental-cache sweep
 during ordinary cleanup planning. They also receive an atomic profile-reset
 pass. Rustc incremental roots with no session activity for 14 days are
@@ -577,4 +621,5 @@ archives for GitHub Releases.
 
 The release workflow builds Linux, macOS, and Windows archives using
 `cargo-binstall`'s default GitHub release layout, with asset names like
-`worktree-gc-x86_64-unknown-linux-gnu-v0.1.0.tgz`.
+`worktree-gc-x86_64-unknown-linux-gnu-v0.1.0.tgz`. macOS archives additionally
+include the evidence-only `worktree-gc-ownership-helper` binary.
