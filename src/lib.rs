@@ -126,6 +126,30 @@ pub struct CleanupOptions {
     pub now: SystemTime,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MacosOwnershipBackend {
+    #[default]
+    Auto,
+    PrivilegedHelper,
+    GlobalLsof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipPolicy {
+    pub macos_backend: MacosOwnershipBackend,
+    pub helper_socket: PathBuf,
+}
+
+impl Default for OwnershipPolicy {
+    fn default() -> Self {
+        Self {
+            macos_backend: MacosOwnershipBackend::Auto,
+            helper_socket: PathBuf::from(ownership_helper::DEFAULT_HELPER_SOCKET),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PressurePolicy {
     pub enter_bytes: u64,
@@ -230,6 +254,12 @@ pub struct OwnershipEpochEvidence {
     pub phase: String,
     pub observed_at_unix: u64,
     pub backend: String,
+    pub requested_roots: u64,
+    pub observation_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub helper_build_sha256: Option<String>,
     pub complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -738,6 +768,8 @@ pub struct ProcessOwnershipObservation {
 pub struct ProcessOwnershipEvidence {
     pub observed_at_unix: u64,
     pub backend: String,
+    pub protocol_version: Option<u64>,
+    pub helper_build_sha256: Option<String>,
     pub complete: bool,
     pub error: Option<String>,
     pub observations: Vec<ProcessOwnershipObservation>,
@@ -1308,13 +1340,35 @@ fn capture_execution_open_handles(
     phase: &str,
     metrics: &mut ExecutionMetrics,
 ) -> ExecutionOwnershipSnapshot {
+    capture_execution_open_handles_with_policy(paths, phase, metrics, &OwnershipPolicy::default())
+}
+
+fn capture_execution_open_handles_with_policy(
+    paths: &[PathBuf],
+    phase: &str,
+    metrics: &mut ExecutionMetrics,
+    policy: &OwnershipPolicy,
+) -> ExecutionOwnershipSnapshot {
+    let paths = existing_ownership_roots(paths);
     let started = Instant::now();
-    let evidence = process_ownership_evidence_for_paths(paths);
-    record_execution_ownership(phase, evidence, started.elapsed(), metrics)
+    let evidence = process_ownership_evidence_for_paths_with_policy(&paths, policy);
+    record_execution_ownership(phase, paths.len(), evidence, started.elapsed(), metrics)
+}
+
+fn existing_ownership_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = paths
+        .iter()
+        .filter(|path| path.exists())
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn record_execution_ownership(
     phase: &str,
+    requested_roots: usize,
     evidence: ProcessOwnershipEvidence,
     elapsed: Duration,
     metrics: &mut ExecutionMetrics,
@@ -1331,6 +1385,10 @@ fn record_execution_ownership(
         phase: phase.to_string(),
         observed_at_unix: evidence.observed_at_unix,
         backend: evidence.backend.clone(),
+        requested_roots: u64::try_from(requested_roots).unwrap_or(u64::MAX),
+        observation_count: u64::try_from(evidence.observations.len()).unwrap_or(u64::MAX),
+        protocol_version: evidence.protocol_version,
+        helper_build_sha256: evidence.helper_build_sha256.clone(),
         complete: evidence.complete,
         error: evidence.error.clone(),
         observations: evidence.observations.clone(),
@@ -1411,6 +1469,18 @@ pub fn cleanup_repositories(
         &capture_execution_open_handles,
         &write_root_manifest,
     )
+}
+
+pub fn cleanup_repositories_with_ownership(
+    roots: &[PathBuf],
+    repositories: &[PathBuf],
+    options: CleanupOptions,
+    ownership: OwnershipPolicy,
+) -> Result<RootCleanupRun> {
+    let capture = |paths: &[PathBuf], phase: &str, metrics: &mut ExecutionMetrics| {
+        capture_execution_open_handles_with_policy(paths, phase, metrics, &ownership)
+    };
+    cleanup_repositories_with_capture(roots, repositories, options, &capture, &write_root_manifest)
 }
 
 fn cleanup_repositories_with_capture(
@@ -1571,6 +1641,20 @@ fn cleanup_repositories_with_capture(
                 .map(|snapshot| &snapshot.handles);
             manifest.execution_metrics = execution_metrics.clone();
             write_root(&manifest)?;
+            if execution_ownership
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.evidence.complete)
+            {
+                record_incomplete_routine_epoch(
+                    &manifest.repositories[index],
+                    execution_metrics
+                        .as_mut()
+                        .context("execute mode has no execution metrics")?,
+                );
+                manifest.execution_metrics = execution_metrics.clone();
+                write_root(&manifest)?;
+                continue;
+            }
             let execution_started = Instant::now();
             execute_cleanup_manifest_with_snapshot(
                 &manifest.repositories[index].manifest,
@@ -2329,6 +2413,40 @@ fn record_incomplete_pressure_epoch(
         });
     }
     metrics.pressure_stopped_reason = Some("pressure ownership epoch was incomplete".to_string());
+}
+
+fn record_incomplete_routine_epoch(repository: &CleanupRun, metrics: &mut ExecutionMetrics) {
+    metrics.ownership_incomplete_epochs = metrics.ownership_incomplete_epochs.saturating_add(1);
+    let manifest = &repository.manifest;
+    metrics.candidate_refusals.extend(
+        manifest
+            .generated_dirs
+            .iter()
+            .filter(|decision| {
+                (decision.action == GeneratedDirAction::Delete
+                    && decision.cleanup_class == CleanupClass::Routine)
+                    || decision.sweeps.iter().any(SweepDecision::has_work)
+            })
+            .map(|decision| CandidateExecutionRefusal {
+                candidate: decision.path.clone(),
+                worktree: decision.worktree_path.clone(),
+                reason: "routine ownership epoch was incomplete".to_string(),
+            }),
+    );
+    metrics.candidate_refusals.extend(
+        manifest
+            .worktrees
+            .iter()
+            .filter(|decision| {
+                decision.action == WorktreeAction::Remove
+                    && decision.cleanup_class == CleanupClass::Routine
+            })
+            .map(|decision| CandidateExecutionRefusal {
+                candidate: decision.path.clone(),
+                worktree: decision.path.clone(),
+                reason: "routine ownership epoch was incomplete".to_string(),
+            }),
+    );
 }
 
 fn persist_candidate_refusal(
@@ -4346,6 +4464,8 @@ struct RawProcessOwnershipObservation {
 #[derive(Debug)]
 struct RawOwnershipCapture {
     backend: &'static str,
+    protocol_version: Option<u64>,
+    helper_build_sha256: Option<String>,
     complete: bool,
     error: Option<String>,
     observations: Vec<RawProcessOwnershipObservation>,
@@ -4373,6 +4493,109 @@ fn capture_macos_raw_ownership() -> RawOwnershipCapture {
     })
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn resolve_macos_backend(
+    backend: MacosOwnershipBackend,
+    automatic: impl FnOnce() -> RawOwnershipCapture,
+    privileged_helper: impl FnOnce() -> RawOwnershipCapture,
+    global_lsof: impl FnOnce() -> RawOwnershipCapture,
+) -> RawOwnershipCapture {
+    match backend {
+        MacosOwnershipBackend::Auto => automatic(),
+        MacosOwnershipBackend::PrivilegedHelper => privileged_helper(),
+        MacosOwnershipBackend::GlobalLsof => global_lsof(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_privileged_helper_raw(socket: &Path, roots: &[PathBuf]) -> RawOwnershipCapture {
+    let response = match ownership_helper::capture_from_helper(socket, roots) {
+        Ok(response) => response,
+        Err(error) => {
+            return RawOwnershipCapture {
+                backend: "macos_privileged_libproc",
+                protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
+                helper_build_sha256: None,
+                complete: false,
+                error: Some(format!(
+                    "privileged ownership helper request failed: {error:#}"
+                )),
+                observations: Vec::new(),
+            };
+        }
+    };
+    if response.backend != "macos_privileged_libproc" {
+        return RawOwnershipCapture {
+            backend: "macos_privileged_libproc",
+            protocol_version: Some(response.protocol_version),
+            helper_build_sha256: None,
+            complete: false,
+            error: Some(format!(
+                "privileged ownership helper returned unexpected backend {:?}",
+                response.backend
+            )),
+            observations: Vec::new(),
+        };
+    }
+    let observations = if response.complete {
+        match helper_observations_to_raw(&response.observations) {
+            Ok(observations) => observations,
+            Err(error) => {
+                return RawOwnershipCapture {
+                    backend: "macos_privileged_libproc",
+                    protocol_version: Some(response.protocol_version),
+                    helper_build_sha256: None,
+                    complete: false,
+                    error: Some(format!(
+                        "privileged ownership helper returned invalid evidence: {error:#}"
+                    )),
+                    observations: Vec::new(),
+                };
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    RawOwnershipCapture {
+        backend: "macos_privileged_libproc",
+        protocol_version: Some(response.protocol_version),
+        helper_build_sha256: response.helper_build_sha256,
+        complete: response.complete,
+        error: response.error,
+        observations,
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn helper_observations_to_raw(
+    observations: &[ownership_protocol::OwnershipObservation],
+) -> Result<Vec<RawProcessOwnershipObservation>> {
+    observations
+        .iter()
+        .map(|observation| {
+            Ok(RawProcessOwnershipObservation {
+                pid: observation.pid,
+                command: None,
+                evidence_kind: match observation.kind {
+                    ownership_protocol::OwnershipPathKind::Cwd => {
+                        ProcessOwnershipEvidenceKind::ProcessCwd
+                    }
+                    ownership_protocol::OwnershipPathKind::Root => {
+                        ProcessOwnershipEvidenceKind::ProcessRoot
+                    }
+                    ownership_protocol::OwnershipPathKind::MappedFile => {
+                        ProcessOwnershipEvidenceKind::MappedFile
+                    }
+                    ownership_protocol::OwnershipPathKind::OpenFile => {
+                        ProcessOwnershipEvidenceKind::OpenFile
+                    }
+                },
+                observed_path: observation.observed_path.to_path_buf()?,
+            })
+        })
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
 fn resolve_macos_ownership_capture(
     native: MacosNativeCapture,
@@ -4383,6 +4606,8 @@ fn resolve_macos_ownership_capture(
         return match native {
             MacosNativeCapture::ResourceLimit(error) => RawOwnershipCapture {
                 backend: "macos_libproc",
+                protocol_version: None,
+                helper_build_sha256: None,
                 complete: false,
                 error: Some(error),
                 observations: Vec::new(),
@@ -4401,6 +4626,8 @@ fn resolve_macos_ownership_capture(
     if capture.permission_denied_pids.is_empty() {
         return RawOwnershipCapture {
             backend: "macos_libproc",
+            protocol_version: None,
+            helper_build_sha256: None,
             complete: true,
             error: None,
             observations,
@@ -4411,6 +4638,8 @@ fn resolve_macos_ownership_capture(
             observations.extend(targeted);
             RawOwnershipCapture {
                 backend: "macos_libproc+lsof_pid",
+                protocol_version: None,
+                helper_build_sha256: None,
                 complete: true,
                 error: None,
                 observations,
@@ -4457,12 +4686,16 @@ fn capture_global_lsof_raw(prior_error: Option<String>) -> RawOwnershipCapture {
     match run_lsof_raw(&["-nP", "-F0pcfn"]) {
         Ok(observations) => RawOwnershipCapture {
             backend: "lsof_global",
+            protocol_version: None,
+            helper_build_sha256: None,
             complete: true,
             error: prior_error,
             observations,
         },
         Err(error) => RawOwnershipCapture {
             backend: "lsof_global",
+            protocol_version: None,
+            helper_build_sha256: None,
             complete: false,
             error: Some(match prior_error {
                 Some(prior) => format!("{prior}; global lsof failed ({error})"),
@@ -4582,6 +4815,14 @@ fn match_process_ownership(
 
 #[cfg(target_os = "macos")]
 pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> ProcessOwnershipEvidence {
+    process_ownership_evidence_for_paths_with_policy(paths, &OwnershipPolicy::default())
+}
+
+#[cfg(target_os = "macos")]
+fn process_ownership_evidence_for_paths_with_policy(
+    paths: &[PathBuf],
+    policy: &OwnershipPolicy,
+) -> ProcessOwnershipEvidence {
     let observed_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4589,22 +4830,57 @@ pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> Process
     if paths.is_empty() {
         return ProcessOwnershipEvidence {
             observed_at_unix,
-            backend: "macos_libproc".to_string(),
+            backend: match policy.macos_backend {
+                MacosOwnershipBackend::Auto => "macos_libproc",
+                MacosOwnershipBackend::PrivilegedHelper => "macos_privileged_libproc",
+                MacosOwnershipBackend::GlobalLsof => "lsof_global",
+            }
+            .to_string(),
+            protocol_version: (policy.macos_backend == MacosOwnershipBackend::PrivilegedHelper)
+                .then_some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
+            helper_build_sha256: None,
             complete: true,
             error: None,
             observations: Vec::new(),
         };
     }
-    process_ownership_evidence_from_raw(paths, observed_at_unix, capture_macos_raw_ownership())
+    let capture = resolve_macos_backend(
+        policy.macos_backend,
+        capture_macos_raw_ownership,
+        || capture_privileged_helper_raw(&policy.helper_socket, paths),
+        || capture_global_lsof_raw(None),
+    );
+    process_ownership_evidence_from_raw(paths, observed_at_unix, capture)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> ProcessOwnershipEvidence {
+    process_ownership_evidence_for_paths_with_policy(paths, &OwnershipPolicy::default())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_ownership_evidence_for_paths_with_policy(
+    paths: &[PathBuf],
+    policy: &OwnershipPolicy,
+) -> ProcessOwnershipEvidence {
     let observed_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    process_ownership_evidence_from_raw(paths, observed_at_unix, capture_global_lsof_raw(None))
+    let capture = match policy.macos_backend {
+        MacosOwnershipBackend::PrivilegedHelper => RawOwnershipCapture {
+            backend: "macos_privileged_libproc",
+            protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
+            helper_build_sha256: None,
+            complete: false,
+            error: Some("the privileged ownership helper requires macOS".to_string()),
+            observations: Vec::new(),
+        },
+        MacosOwnershipBackend::Auto | MacosOwnershipBackend::GlobalLsof => {
+            capture_global_lsof_raw(None)
+        }
+    };
+    process_ownership_evidence_from_raw(paths, observed_at_unix, capture)
 }
 
 #[cfg(unix)]
@@ -4621,6 +4897,8 @@ fn process_ownership_evidence_from_raw(
     ProcessOwnershipEvidence {
         observed_at_unix,
         backend: capture.backend.to_string(),
+        protocol_version: capture.protocol_version,
+        helper_build_sha256: capture.helper_build_sha256,
         complete: capture.complete,
         error: capture.error,
         observations,
@@ -4629,12 +4907,27 @@ fn process_ownership_evidence_from_raw(
 
 #[cfg(not(unix))]
 pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> ProcessOwnershipEvidence {
+    process_ownership_evidence_for_paths_with_policy(paths, &OwnershipPolicy::default())
+}
+
+#[cfg(not(unix))]
+fn process_ownership_evidence_for_paths_with_policy(
+    paths: &[PathBuf],
+    policy: &OwnershipPolicy,
+) -> ProcessOwnershipEvidence {
     ProcessOwnershipEvidence {
         observed_at_unix: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        backend: "unsupported".to_string(),
+        backend: match policy.macos_backend {
+            MacosOwnershipBackend::PrivilegedHelper => "macos_privileged_libproc",
+            MacosOwnershipBackend::Auto | MacosOwnershipBackend::GlobalLsof => "unsupported",
+        }
+        .to_string(),
+        protocol_version: (policy.macos_backend == MacosOwnershipBackend::PrivilegedHelper)
+            .then_some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
+        helper_build_sha256: None,
         complete: paths.is_empty(),
         error: (!paths.is_empty()).then(|| "no supported process ownership backend".to_string()),
         observations: Vec::new(),
@@ -8237,6 +8530,66 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn required_helper_backend_never_falls_back() {
+        let automatic_calls = Cell::new(0);
+        let helper_calls = Cell::new(0);
+        let global_calls = Cell::new(0);
+        let capture = resolve_macos_backend(
+            MacosOwnershipBackend::PrivilegedHelper,
+            || {
+                automatic_calls.set(automatic_calls.get() + 1);
+                unreachable!("required helper mode must not use automatic ownership")
+            },
+            || {
+                helper_calls.set(helper_calls.get() + 1);
+                RawOwnershipCapture {
+                    backend: "macos_privileged_libproc",
+                    protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
+                    helper_build_sha256: None,
+                    complete: false,
+                    error: Some("helper unavailable".to_string()),
+                    observations: Vec::new(),
+                }
+            },
+            || {
+                global_calls.set(global_calls.get() + 1);
+                unreachable!("required helper mode must not use global lsof")
+            },
+        );
+
+        assert_eq!(capture.backend, "macos_privileged_libproc");
+        assert!(!capture.complete);
+        assert_eq!(automatic_calls.get(), 0);
+        assert_eq!(helper_calls.get(), 1);
+        assert_eq!(global_calls.get(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_observations_preserve_paths_and_evidence_kinds() -> Result<()> {
+        use ownership_protocol::{OwnershipObservation, OwnershipPathKind, WirePath};
+
+        let root = PathBuf::from("/tmp/repo/target");
+        let observed = root.join("debug/deps/libfixture.dylib");
+        let raw = helper_observations_to_raw(&[OwnershipObservation {
+            pid: 42,
+            kind: OwnershipPathKind::MappedFile,
+            observed_path: WirePath::from_path(&observed),
+            matched_root: WirePath::from_path(&root),
+        }])?;
+
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].pid, 42);
+        assert_eq!(
+            raw[0].evidence_kind,
+            ProcessOwnershipEvidenceKind::MappedFile
+        );
+        assert_eq!(raw[0].observed_path, observed);
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn targeted_pid_fallback_merges_complete_native_evidence() {
@@ -8297,6 +8650,8 @@ mod tests {
                 assert!(prior.contains("targeted output was incomplete"));
                 RawOwnershipCapture {
                     backend: "lsof_global",
+                    protocol_version: None,
+                    helper_build_sha256: None,
                     complete: true,
                     error: Some(prior),
                     observations: vec![RawProcessOwnershipObservation {
@@ -8326,6 +8681,8 @@ mod tests {
             |_| Err(io::Error::other("targeted output was incomplete")),
             |prior| RawOwnershipCapture {
                 backend: "lsof_global",
+                protocol_version: None,
+                helper_build_sha256: None,
                 complete: false,
                 error: Some(format!("{prior}; global output was incomplete")),
                 observations: Vec::new(),
@@ -8380,6 +8737,8 @@ mod tests {
                 assert!(prior.contains("malformed native payload"));
                 RawOwnershipCapture {
                     backend: "lsof_global",
+                    protocol_version: None,
+                    helper_build_sha256: None,
                     complete: true,
                     error: Some(prior),
                     observations: Vec::new(),
@@ -9202,6 +9561,8 @@ mod tests {
         let clear = ProcessOwnershipEvidence {
             observed_at_unix: 1_800_000_000,
             backend: "fixture".to_string(),
+            protocol_version: None,
+            helper_build_sha256: None,
             complete: true,
             error: None,
             observations: Vec::new(),
@@ -9859,9 +10220,12 @@ mod tests {
         let mut metrics = ExecutionMetrics::default();
         let snapshot = record_execution_ownership(
             "pressure_epoch:1",
+            2,
             ProcessOwnershipEvidence {
                 observed_at_unix: 1_800_000_000,
                 backend: "fixture".to_string(),
+                protocol_version: None,
+                helper_build_sha256: None,
                 complete: false,
                 error: Some("fixture incomplete".to_string()),
                 observations: Vec::new(),
@@ -9878,11 +10242,63 @@ mod tests {
         assert_eq!(metrics.ownership_snapshot_millis, 17);
         assert_eq!(metrics.ownership_backends["fixture"], 1);
         assert_eq!(metrics.ownership_epochs.len(), 1);
+        assert_eq!(metrics.ownership_epochs[0].requested_roots, 2);
+        assert_eq!(metrics.ownership_epochs[0].observation_count, 0);
         assert!(!metrics.ownership_epochs[0].complete);
         assert_eq!(
             metrics.ownership_epochs[0].error.as_deref(),
             Some("fixture incomplete")
         );
+    }
+
+    #[test]
+    fn helper_identity_is_durable_in_execution_metrics() {
+        let helper_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut metrics = ExecutionMetrics::default();
+        record_execution_ownership(
+            "pressure_epoch:1",
+            25,
+            ProcessOwnershipEvidence {
+                observed_at_unix: 1_800_000_000,
+                backend: "macos_privileged_libproc".to_string(),
+                protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
+                helper_build_sha256: Some(helper_hash.to_string()),
+                complete: true,
+                error: None,
+                observations: vec![ProcessOwnershipObservation {
+                    pid: Some(42),
+                    command: None,
+                    evidence_kind: ProcessOwnershipEvidenceKind::MappedFile,
+                    observed_path: PathBuf::from("/tmp/repo/target/debug/tool"),
+                    matched_path: PathBuf::from("/tmp/repo/target"),
+                }],
+            },
+            Duration::from_millis(3),
+            &mut metrics,
+        );
+
+        let epoch = &metrics.ownership_epochs[0];
+        assert_eq!(epoch.requested_roots, 25);
+        assert_eq!(epoch.observation_count, 1);
+        assert_eq!(
+            epoch.protocol_version,
+            Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION)
+        );
+        assert_eq!(epoch.helper_build_sha256.as_deref(), Some(helper_hash));
+    }
+
+    #[test]
+    fn ownership_requests_omit_missing_tombstone_paths() -> Result<()> {
+        let temp = TempDir::new()?;
+        let existing = temp.path().join("existing");
+        let missing = temp.path().join("missing");
+        fs::create_dir(&existing)?;
+
+        assert_eq!(
+            existing_ownership_roots(&[missing, existing.clone(), existing.clone()]),
+            vec![existing]
+        );
+        Ok(())
     }
 
     #[test]
@@ -9899,9 +10315,12 @@ mod tests {
             phases.borrow_mut().push(phase.to_string());
             record_execution_ownership(
                 phase,
+                1,
                 ProcessOwnershipEvidence {
                     observed_at_unix: 1_800_000_000,
                     backend: "fixture".to_string(),
+                    protocol_version: None,
+                    helper_build_sha256: None,
                     complete: true,
                     error: None,
                     observations: Vec::new(),
@@ -9978,6 +10397,77 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_routine_helper_epoch_refuses_the_repository() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let repo = fs::canonicalize(repo)?;
+        let candidate = repo.join(".turbo");
+        fs::create_dir(&candidate)?;
+        fs::write(candidate.join("artifact"), "fixture")?;
+        let stale = system_time_to_unix(SystemTime::now())
+            .context("system time does not fit in Unix time")?
+            - 30 * 86_400;
+        set_mtime(&candidate.join("artifact"), stale)?;
+        set_mtime(&candidate, stale)?;
+        let aggregate_manifest = temp.path().join("aggregate.json");
+        let write_root = |manifest: &RootCleanupManifest| {
+            fs::write(&aggregate_manifest, serde_json::to_vec_pretty(manifest)?)?;
+            Ok(aggregate_manifest.clone())
+        };
+        let capture = |paths: &[PathBuf], phase: &str, metrics: &mut ExecutionMetrics| {
+            let complete = phase == "initial_plan";
+            record_execution_ownership(
+                phase,
+                paths.len(),
+                ProcessOwnershipEvidence {
+                    observed_at_unix: 1_800_000_000,
+                    backend: "macos_privileged_libproc".to_string(),
+                    protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
+                    helper_build_sha256: complete.then(|| {
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                            .to_string()
+                    }),
+                    complete,
+                    error: (!complete).then(|| "helper unavailable".to_string()),
+                    observations: Vec::new(),
+                },
+                Duration::from_millis(1),
+                metrics,
+            )
+        };
+        let run = cleanup_repositories_with_capture(
+            std::slice::from_ref(&repo),
+            std::slice::from_ref(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 14,
+                generated_days: 0,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+            &capture,
+            &write_root,
+        )?;
+
+        assert!(candidate.exists());
+        let metrics = run
+            .manifest
+            .execution_metrics
+            .context("execution metrics are absent")?;
+        assert_eq!(metrics.ownership_incomplete_epochs, 1);
+        assert!(metrics.candidate_refusals.iter().any(|refusal| {
+            refusal.candidate == candidate
+                && refusal.reason == "routine ownership epoch was incomplete"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn routine_execution_retains_a_candidate_opened_during_refresh() -> Result<()> {
         let (temp, repo) = init_repo()?;
         let repo = fs::canonicalize(repo)?;
@@ -10005,9 +10495,12 @@ mod tests {
             };
             record_execution_ownership(
                 phase,
+                1,
                 ProcessOwnershipEvidence {
                     observed_at_unix: 1_800_000_000,
                     backend: "fixture".to_string(),
+                    protocol_version: None,
+                    helper_build_sha256: None,
                     complete: true,
                     error: None,
                     observations,

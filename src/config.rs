@@ -4,14 +4,33 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use worktree_gc::{MacosOwnershipBackend, OwnershipPolicy};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Config {
     pub roots: Vec<PathBuf>,
     pub cleanup: CleanupConfig,
+    pub ownership: OwnershipConfig,
     pub pressure: PressureConfig,
     pub history: HistoryConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct OwnershipConfig {
+    pub macos_backend: MacosOwnershipBackend,
+    pub helper_socket: PathBuf,
+}
+
+impl Default for OwnershipConfig {
+    fn default() -> Self {
+        let policy = OwnershipPolicy::default();
+        Self {
+            macos_backend: policy.macos_backend,
+            helper_socket: policy.helper_socket,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +236,10 @@ cargo_sweep_max_size = "50GB"
 provider = "github"
 merged_grace_days = 1
 
+[ownership]
+macos_backend = "privileged_helper"
+helper_socket = "/Library/Application Support/worktree-gc/run/ownership.sock"
+
 [pressure]
 enter_free_space = "100GiB"
 target_free_space = "150GiB"
@@ -253,6 +276,14 @@ retention_days = 120
             Some(PullRequestProvider::Github)
         );
         assert_eq!(config.cleanup.pull_requests.merged_grace_days, 1);
+        assert_eq!(
+            config.ownership.macos_backend,
+            MacosOwnershipBackend::PrivilegedHelper
+        );
+        assert_eq!(
+            config.ownership.helper_socket,
+            PathBuf::from("/Library/Application Support/worktree-gc/run/ownership.sock")
+        );
         let pressure = config.pressure;
         assert_eq!(pressure.enter_free_space.as_deref(), Some("100GiB"));
         assert_eq!(pressure.target_free_space.as_deref(), Some("150GiB"));
@@ -267,5 +298,16 @@ retention_days = 120
     #[test]
     fn rejects_unknown_configuration() {
         assert!(toml::from_str::<Config>("root = ['/code']").is_err());
+    }
+
+    #[test]
+    fn ownership_configuration_defaults_to_auto() -> Result<()> {
+        let config: Config = toml::from_str("roots = ['/code']")?;
+        assert_eq!(config.ownership.macos_backend, MacosOwnershipBackend::Auto);
+        assert_eq!(
+            config.ownership.helper_socket,
+            PathBuf::from(worktree_gc::ownership_helper::DEFAULT_HELPER_SOCKET)
+        );
+        Ok(())
     }
 }

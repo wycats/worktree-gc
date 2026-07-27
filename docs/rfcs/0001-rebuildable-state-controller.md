@@ -369,11 +369,25 @@ canonical roots from a root-owned allowlist, and authenticated by peer UID. The
 helper returns only ownership evidence; it has no protection, planning,
 quarantine, or deletion operation.
 
-The initial helper ships independently of cleanup integration. A later policy
-slice selects it explicitly and fails closed if the helper is unavailable or
-returns incomplete evidence. This preserves a supervised boundary between
-installing the capability and granting any execution path authority to depend
-on it.
+The helper ships independently of cleanup integration. Scheduled policy may
+select `auto`, `privileged_helper`, or `global_lsof`. The backward-compatible
+`auto` mode retains native enumeration and its existing fallback. Required
+`privileged_helper` mode routes the initial plan, each routine-repository
+snapshot, and each bounded pressure epoch through one helper request and never
+falls back. If the helper is unavailable, rejects the roots, exceeds a bound,
+or returns incomplete evidence, the routine repository is skipped or the
+pressure epoch stops.
+
+The client still revalidates containment, tracked content, source identity,
+measurement, protection, mount boundaries, Cargo locks, quarantine, and source
+parity. Aggregate metrics identify the helper protocol and executable hash,
+requested roots, observations, duration, and completeness. Installation and
+strict policy selection remain separate supervised gates.
+
+Integration advances the ownership protocol to v2 because complete responses
+now require the helper executable SHA-256. The client rejects a v1 helper rather
+than accepting evidence whose binary identity cannot be recorded; the helper
+and client are therefore installed as a verified release pair.
 
 ## Implementation plan
 

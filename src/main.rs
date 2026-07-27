@@ -6,18 +6,18 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use worktree_gc::{
-    add_protection, cleanup, cleanup_repositories, cleanup_roots, collect_codex_sessions,
-    collect_generated, discover_repositories, execute_approved_generated, gateway_storage_report,
-    inventory, list_protections, print_cleanup, print_codex_sessions_collect,
-    print_gateway_storage_report, print_generated_collect, print_inventory, print_root_cleanup,
-    print_root_triage, print_triage, remove_protection, renew_protection, triage, triage_roots,
-    CleanupOptions, CodexSessionCollectOptions, GatewayStorageOptions, GeneratedCollectOptions,
-    GeneratedDirConfig, InventoryOptions, PressurePolicy, PullRequestPolicy, SweepLimit,
-    SweepStrategy, SweepTool, TriageOptions, DEFAULT_CODEX_SESSION_MAX_ENTRIES,
-    DEFAULT_GATEWAY_EXACT_MAX_ENTRIES, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT,
-    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
-    DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
-    MAX_PROTECTION_TTL_DAYS,
+    add_protection, cleanup, cleanup_repositories_with_ownership, cleanup_roots,
+    collect_codex_sessions, collect_generated, discover_repositories, execute_approved_generated,
+    gateway_storage_report, inventory, list_protections, print_cleanup,
+    print_codex_sessions_collect, print_gateway_storage_report, print_generated_collect,
+    print_inventory, print_root_cleanup, print_root_triage, print_triage, remove_protection,
+    renew_protection, triage, triage_roots, CleanupOptions, CodexSessionCollectOptions,
+    GatewayStorageOptions, GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions,
+    OwnershipPolicy, PressurePolicy, PullRequestPolicy, SweepLimit, SweepStrategy, SweepTool,
+    TriageOptions, DEFAULT_CODEX_SESSION_MAX_ENTRIES, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES,
+    DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT, DEFAULT_GENERATED_DAYS,
+    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
+    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -609,6 +609,37 @@ fn scheduled_pull_request_policy(
     }))
 }
 
+fn scheduled_ownership_policy(
+    ownership: &config::OwnershipConfig,
+    check_in_use: bool,
+) -> Result<OwnershipPolicy> {
+    anyhow::ensure!(
+        ownership.helper_socket.is_absolute(),
+        "ownership.helper_socket must be absolute"
+    );
+    anyhow::ensure!(
+        !ownership
+            .helper_socket
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir)),
+        "ownership.helper_socket must not contain '.' or '..' components"
+    );
+    #[cfg(not(target_os = "macos"))]
+    anyhow::ensure!(
+        ownership.macos_backend != worktree_gc::MacosOwnershipBackend::PrivilegedHelper,
+        "ownership.macos_backend = \"privileged_helper\" requires macOS"
+    );
+    anyhow::ensure!(
+        ownership.macos_backend != worktree_gc::MacosOwnershipBackend::PrivilegedHelper
+            || check_in_use,
+        "ownership.macos_backend = \"privileged_helper\" requires cleanup.check_in_use = true"
+    );
+    Ok(OwnershipPolicy {
+        macos_backend: ownership.macos_backend,
+        helper_socket: ownership.helper_socket.clone(),
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let now = SystemTime::now();
@@ -825,7 +856,12 @@ fn main() -> Result<()> {
                 refresh_repositories,
                 now,
             )?;
-            let run = cleanup_repositories(&scheduled.roots, &repositories, options)?;
+            let run = cleanup_repositories_with_ownership(
+                &scheduled.roots,
+                &repositories,
+                options,
+                scheduled_ownership_policy(&scheduled.ownership, scheduled.cleanup.check_in_use)?,
+            )?;
             print_root_cleanup(&run);
             if !dry_run {
                 let removed = config::prune_history(scheduled.history.retention_days, now)?;
@@ -1503,6 +1539,49 @@ owner_free_generated = true
         assert_eq!(policy.stale_days, 7);
         assert!(policy.owner_free_generated);
         assert!(!policy.active);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_ownership_policy_defaults_to_automatic_backend() -> Result<()> {
+        let policy = scheduled_ownership_policy(&config::OwnershipConfig::default(), true)?;
+        assert_eq!(
+            policy.macos_backend,
+            worktree_gc::MacosOwnershipBackend::Auto
+        );
+        assert_eq!(
+            policy.helper_socket,
+            PathBuf::from(worktree_gc::ownership_helper::DEFAULT_HELPER_SOCKET)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_ownership_policy_rejects_relative_or_parent_socket_paths() -> Result<()> {
+        let relative: config::OwnershipConfig = toml::from_str("helper_socket = 'helper.sock'")?;
+        assert!(scheduled_ownership_policy(&relative, true).is_err());
+
+        let parent: config::OwnershipConfig =
+            toml::from_str("helper_socket = '/tmp/run/../helper.sock'")?;
+        assert!(scheduled_ownership_policy(&parent, true).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scheduled_ownership_policy_selects_required_helper_without_fallback() -> Result<()> {
+        let config: config::OwnershipConfig = toml::from_str(
+            r#"
+macos_backend = "privileged_helper"
+helper_socket = "/Library/Application Support/worktree-gc/run/ownership.sock"
+"#,
+        )?;
+        let policy = scheduled_ownership_policy(&config, true)?;
+        assert_eq!(
+            policy.macos_backend,
+            worktree_gc::MacosOwnershipBackend::PrivilegedHelper
+        );
+        assert!(scheduled_ownership_policy(&config, false).is_err());
         Ok(())
     }
 

@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-pub const OWNERSHIP_PROTOCOL_VERSION: u64 = 1;
+// Version 2 adds the required helper executable SHA-256 to every complete
+// response. A v1 helper is intentionally rejected so strict helper mode fails
+// closed until the client and root-owned service are upgraded as a pair.
+pub const OWNERSHIP_PROTOCOL_VERSION: u64 = 2;
 pub const MAX_REQUEST_ROOTS: usize = 2_048;
 pub const MAX_PROTOCOL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -74,6 +77,8 @@ pub struct OwnershipResponse {
     pub protocol_version: u64,
     pub request_id: u64,
     pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper_build_sha256: Option<String>,
     pub complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -88,6 +93,7 @@ impl OwnershipResponse {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id,
             backend: "macos_privileged_libproc".to_string(),
+            helper_build_sha256: None,
             complete: false,
             error: Some(error.into()),
             observations: Vec::new(),
@@ -260,6 +266,7 @@ mod tests {
         assert_eq!(response.request_id, 7);
         assert!(!response.complete);
         assert_eq!(response.error.as_deref(), Some("denied"));
+        assert!(response.helper_build_sha256.is_none());
         assert!(response.observations.is_empty());
         assert!(response.service.is_none());
     }

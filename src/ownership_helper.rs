@@ -9,6 +9,8 @@ use anyhow::{bail, Result};
 #[cfg(any(unix, test))]
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "macos", test))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +18,7 @@ use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", test))]
 use std::fs;
 #[cfg(target_os = "macos")]
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(target_os = "macos")]
@@ -27,6 +29,8 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 #[cfg(unix)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -68,6 +72,7 @@ pub struct HelperStatus {
     pub installed: bool,
     pub loaded: bool,
     pub protocol_version: u64,
+    pub helper_build_sha256: Option<String>,
     pub client_uid: Option<u32>,
     pub roots: Vec<WirePath>,
     pub socket: PathBuf,
@@ -87,12 +92,35 @@ pub fn capture_from_helper(socket: &Path, roots: &[PathBuf]) -> Result<Ownership
     let request = OwnershipRequest::new(request_id, roots);
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("failed to connect to ownership helper {}", socket.display()))?;
+    #[cfg(target_os = "macos")]
+    validate_helper_server(socket, &stream)?;
     stream.set_read_timeout(Some(HELPER_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(HELPER_IO_TIMEOUT))?;
     write_message(&mut stream, &request)?;
     let response: OwnershipResponse = read_message(&mut stream)?;
     validate_response(&request, &response)?;
     Ok(response)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_helper_server(socket: &Path, stream: &UnixStream) -> Result<()> {
+    let metadata = fs::symlink_metadata(socket)
+        .with_context(|| format!("failed to inspect helper socket {}", socket.display()))?;
+    ensure!(
+        metadata.file_type().is_socket() && metadata.uid() == 0,
+        "ownership helper socket {} is not a root-owned socket",
+        socket.display()
+    );
+    ensure_root_owned_directory_chain(
+        socket
+            .parent()
+            .context("ownership helper socket has no parent directory")?,
+    )?;
+    ensure!(
+        peer_uid(stream)? == 0,
+        "ownership helper peer is not running as root"
+    );
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -150,11 +178,13 @@ fn handle_connection(stream: &mut UnixStream, config: &HelperConfig) -> Result<(
         return Ok(());
     }
     let request: OwnershipRequest = read_message(stream)?;
+    let helper_build_sha256 = current_helper_build_sha256()?;
     let response = match validated_request_roots(&request, config) {
         Ok(roots) if roots.is_empty() => OwnershipResponse {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: request.request_id,
             backend: "macos_privileged_libproc".to_string(),
+            helper_build_sha256: Some(helper_build_sha256),
             complete: true,
             error: None,
             observations: Vec::new(),
@@ -163,10 +193,43 @@ fn handle_connection(stream: &mut UnixStream, config: &HelperConfig) -> Result<(
                 roots: config.roots.clone(),
             }),
         },
-        Ok(roots) => capture_privileged_ownership(request.request_id, &roots),
+        Ok(roots) => capture_privileged_ownership(request.request_id, &roots, helper_build_sha256),
         Err(error) => OwnershipResponse::refusal(request.request_id, format!("{error:#}")),
     };
     write_message(stream, &response)
+}
+
+#[cfg(target_os = "macos")]
+fn current_helper_build_sha256() -> Result<String> {
+    static HELPER_BUILD_SHA256: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+    HELPER_BUILD_SHA256
+        .get_or_init(|| {
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("failed to resolve helper executable: {error}"))?;
+            let mut file = fs::File::open(&executable).map_err(|error| {
+                format!(
+                    "failed to open helper executable {}: {error}",
+                    executable.display()
+                )
+            })?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer).map_err(|error| {
+                    format!(
+                        "failed to hash helper executable {}: {error}",
+                        executable.display()
+                    )
+                })?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            Ok(format!("{:x}", digest.finalize()))
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -175,7 +238,11 @@ fn peer_is_authorized(peer_uid: u32, allowed_uid: u32) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn capture_privileged_ownership(request_id: u64, roots: &[PathBuf]) -> OwnershipResponse {
+fn capture_privileged_ownership(
+    request_id: u64,
+    roots: &[PathBuf],
+    helper_build_sha256: String,
+) -> OwnershipResponse {
     let capture = match crate::macos_open_handles::capture_with_evidence() {
         Ok(capture) => capture,
         Err(error) => {
@@ -185,7 +252,7 @@ fn capture_privileged_ownership(request_id: u64, roots: &[PathBuf]) -> Ownership
             );
         }
     };
-    privileged_response_from_capture(request_id, roots, capture)
+    privileged_response_from_capture(request_id, roots, capture, helper_build_sha256)
 }
 
 #[cfg(target_os = "macos")]
@@ -193,6 +260,7 @@ fn privileged_response_from_capture(
     request_id: u64,
     roots: &[PathBuf],
     capture: crate::macos_open_handles::Capture,
+    helper_build_sha256: String,
 ) -> OwnershipResponse {
     if !capture.permission_denied_pids.is_empty() {
         return OwnershipResponse::refusal(
@@ -242,6 +310,7 @@ fn privileged_response_from_capture(
         protocol_version: OWNERSHIP_PROTOCOL_VERSION,
         request_id,
         backend: "macos_privileged_libproc".to_string(),
+        helper_build_sha256: Some(helper_build_sha256),
         complete: true,
         error: None,
         observations,
@@ -374,11 +443,22 @@ fn validate_response(request: &OwnershipRequest, response: &OwnershipResponse) -
             response.service.is_none(),
             "incomplete ownership helper response included service metadata"
         );
+        ensure!(
+            response.helper_build_sha256.is_none(),
+            "incomplete ownership helper response included a build hash"
+        );
         return Ok(());
     }
     ensure!(
         response.error.is_none(),
         "complete ownership helper response included an error"
+    );
+    ensure!(
+        response
+            .helper_build_sha256
+            .as_deref()
+            .is_some_and(is_lower_hex_sha256),
+        "complete ownership helper response omitted a valid build hash"
     );
     if request.roots.is_empty() {
         ensure!(
@@ -418,6 +498,13 @@ fn validate_response(request: &OwnershipRequest, response: &OwnershipResponse) -
         );
     }
     Ok(())
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(unix)]
@@ -655,6 +742,7 @@ pub fn status() -> HelperStatus {
                 installed,
                 loaded: false,
                 protocol_version: OWNERSHIP_PROTOCOL_VERSION,
+                helper_build_sha256: None,
                 client_uid: None,
                 roots: Vec::new(),
                 socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
@@ -670,6 +758,7 @@ pub fn status() -> HelperStatus {
             installed,
             loaded,
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
+            helper_build_sha256: None,
             client_uid: None,
             roots: Vec::new(),
             socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
@@ -685,6 +774,13 @@ fn status_from_response(
     loaded: bool,
     response: OwnershipResponse,
 ) -> Result<HelperStatus> {
+    ensure!(
+        response
+            .helper_build_sha256
+            .as_deref()
+            .is_some_and(is_lower_hex_sha256),
+        "ownership helper status omitted a valid build hash"
+    );
     let metadata = response
         .service
         .as_ref()
@@ -694,6 +790,7 @@ fn status_from_response(
         installed,
         loaded,
         protocol_version: response.protocol_version,
+        helper_build_sha256: response.helper_build_sha256,
         client_uid: Some(metadata.client_uid),
         roots: metadata.roots.clone(),
         socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
@@ -708,6 +805,7 @@ pub fn status() -> HelperStatus {
         installed: false,
         loaded: false,
         protocol_version: OWNERSHIP_PROTOCOL_VERSION,
+        helper_build_sha256: None,
         client_uid: None,
         roots: Vec::new(),
         socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
@@ -1226,6 +1324,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    const TEST_HELPER_BUILD_SHA256: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn config(root: &Path) -> HelperConfig {
         HelperConfig {
             config_version: HELPER_CONFIG_VERSION,
@@ -1325,6 +1426,7 @@ mod tests {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: 8,
             backend: "macos_privileged_libproc".to_string(),
+            helper_build_sha256: Some(TEST_HELPER_BUILD_SHA256.to_string()),
             complete: true,
             error: None,
             observations: Vec::new(),
@@ -1336,9 +1438,51 @@ mod tests {
         validate_response(&request, &response)?;
         let status = status_from_response(true, true, response)?;
         assert_eq!(status.client_uid, Some(501));
+        assert_eq!(
+            status.helper_build_sha256.as_deref(),
+            Some(TEST_HELPER_BUILD_SHA256)
+        );
         assert_eq!(status.roots, vec![WirePath::from_path(&root)]);
         assert!(status.probe_complete);
         Ok(())
+    }
+
+    #[test]
+    fn client_rejects_complete_responses_without_a_build_hash() {
+        let request = OwnershipRequest::new(82, &[]);
+        let response = OwnershipResponse {
+            protocol_version: OWNERSHIP_PROTOCOL_VERSION,
+            request_id: 82,
+            backend: "macos_privileged_libproc".to_string(),
+            helper_build_sha256: None,
+            complete: true,
+            error: None,
+            observations: Vec::new(),
+            service: Some(OwnershipServiceMetadata {
+                client_uid: 501,
+                roots: vec![WirePath::from_path(Path::new("/tmp/allowed"))],
+            }),
+        };
+        assert!(validate_response(&request, &response).is_err());
+    }
+
+    #[test]
+    fn client_rejects_the_evidence_only_v1_protocol() {
+        let request = OwnershipRequest::new(83, &[]);
+        let response = OwnershipResponse {
+            protocol_version: 1,
+            request_id: 83,
+            backend: "macos_privileged_libproc".to_string(),
+            helper_build_sha256: Some(TEST_HELPER_BUILD_SHA256.to_string()),
+            complete: true,
+            error: None,
+            observations: Vec::new(),
+            service: Some(OwnershipServiceMetadata {
+                client_uid: 501,
+                roots: vec![WirePath::from_path(Path::new("/tmp/allowed"))],
+            }),
+        };
+        assert!(validate_response(&request, &response).is_err());
     }
 
     #[cfg(unix)]
@@ -1352,6 +1496,7 @@ mod tests {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: 81,
             backend: "macos_privileged_libproc".to_string(),
+            helper_build_sha256: Some(TEST_HELPER_BUILD_SHA256.to_string()),
             complete: true,
             error: None,
             observations: Vec::new(),
@@ -1426,6 +1571,7 @@ mod tests {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: 12,
             backend: "macos_privileged_libproc".to_string(),
+            helper_build_sha256: Some(TEST_HELPER_BUILD_SHA256.to_string()),
             complete: true,
             error: None,
             observations: vec![OwnershipObservation {
@@ -1448,6 +1594,7 @@ mod tests {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: 13,
             backend: "macos_privileged_libproc".to_string(),
+            helper_build_sha256: None,
             complete: false,
             error: Some("incomplete".to_string()),
             observations: vec![OwnershipObservation {
@@ -1485,6 +1632,7 @@ mod tests {
                 ],
                 permission_denied_pids: Vec::new(),
             },
+            TEST_HELPER_BUILD_SHA256.to_string(),
         );
         assert!(response.complete);
         assert_eq!(response.observations.len(), 1);
@@ -1503,6 +1651,7 @@ mod tests {
                 observations: Vec::new(),
                 permission_denied_pids: vec![1],
             },
+            TEST_HELPER_BUILD_SHA256.to_string(),
         );
         assert!(!response.complete);
         assert!(response.observations.is_empty());
