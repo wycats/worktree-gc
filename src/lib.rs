@@ -1658,14 +1658,70 @@ fn cleanup_repositories_with_capture(
                         break;
                     }
                     let epoch = next_pressure_epoch(&candidates);
+                    // Expensive source-state preparation happens before the
+                    // ownership freshness clock starts. The complete candidate
+                    // boundary, ownership, protection, mount, and Cargo-lock
+                    // guards are still revalidated under the bounded epoch
+                    // immediately before deletion.
+                    let worktree_revalidation_started = Instant::now();
+                    let refusal_count_before = execution_metrics
+                        .as_ref()
+                        .context("execute mode has no execution metrics")?
+                        .candidate_refusals
+                        .len();
+                    let valid_worktrees = revalidate_pressure_epoch_worktrees(
+                        &manifest,
+                        &epoch,
+                        execution_metrics
+                            .as_mut()
+                            .context("execute mode has no execution metrics")?,
+                    );
+                    let source_exclusions_by_worktree =
+                        pressure_epoch_candidate_groups(&manifest, &epoch);
+                    let mut source_before_by_worktree = BTreeMap::new();
+                    for ((index, worktree), exclusions) in &source_exclusions_by_worktree {
+                        if !valid_worktrees.contains(&(*index, worktree.clone()))
+                            || !exclusions.iter().any(|path| path.exists())
+                        {
+                            continue;
+                        }
+                        let source_before =
+                            pressure_worktree_source_baseline(worktree, exclusions)?;
+                        source_before_by_worktree.insert((*index, worktree.clone()), source_before);
+                    }
+                    let worktree_revalidation_millis =
+                        duration_millis(worktree_revalidation_started.elapsed());
+                    let worktree_refusal_added = {
+                        let metrics = execution_metrics
+                            .as_mut()
+                            .context("execute mode has no execution metrics")?;
+                        metrics.candidate_revalidation_millis = metrics
+                            .candidate_revalidation_millis
+                            .saturating_add(worktree_revalidation_millis);
+                        metrics.candidate_refusals.len() > refusal_count_before
+                    };
+                    if worktree_refusal_added {
+                        manifest.execution_metrics = execution_metrics.clone();
+                        write_root(&manifest)?;
+                    }
+
                     let metrics = execution_metrics
                         .as_mut()
                         .context("execute mode has no execution metrics")?;
                     metrics.pressure_epochs = metrics.pressure_epochs.saturating_add(1);
-                    let epoch_started = Instant::now();
-                    let epoch_deadline = epoch_started
-                        .checked_add(PRESSURE_EPOCH_MAX_DURATION)
-                        .context("pressure ownership epoch deadline overflowed")?;
+                    let (
+                        (
+                            mut valid_worktrees,
+                            source_exclusions_by_worktree,
+                            source_before_by_worktree,
+                        ),
+                        epoch_started,
+                        epoch_deadline,
+                    ) = start_pressure_epoch_after_preparation((
+                        valid_worktrees,
+                        source_exclusions_by_worktree,
+                        source_before_by_worktree,
+                    ))?;
                     let epoch_ownership_paths = pressure_epoch_ownership_paths(&manifest, &epoch);
                     let epoch_snapshot = if options.check_in_use {
                         Some(capture_open_handles(
@@ -1718,16 +1774,16 @@ fn cleanup_repositories_with_capture(
                     metrics.mount_snapshot_millis = metrics
                         .mount_snapshot_millis
                         .saturating_add(duration_millis(mount_snapshot_started.elapsed()));
-
                     let worktree_revalidation_started = Instant::now();
                     let refusal_count_before = execution_metrics
                         .as_ref()
                         .context("execute mode has no execution metrics")?
                         .candidate_refusals
                         .len();
-                    let valid_worktrees = revalidate_pressure_epoch_worktrees(
+                    valid_worktrees = revalidate_prepared_pressure_epoch_worktrees(
                         &manifest,
-                        &epoch,
+                        &valid_worktrees,
+                        &source_before_by_worktree,
                         execution_metrics
                             .as_mut()
                             .context("execute mode has no execution metrics")?,
@@ -1799,66 +1855,40 @@ fn cleanup_repositories_with_capture(
                             metrics.candidate_revalidations =
                                 metrics.candidate_revalidations.saturating_add(1);
                         }
-                        let candidate_revalidation_started = Instant::now();
-                        if let Err(error) = revalidate_generated_candidate(
-                            &decision,
-                            epoch_snapshot.as_ref().map(|snapshot| &snapshot.handles),
-                            Some(&epoch_mount_points),
-                        ) {
-                            {
-                                let metrics = execution_metrics
-                                    .as_mut()
-                                    .context("execute mode has no execution metrics")?;
-                                metrics.candidate_revalidation_millis =
-                                    metrics.candidate_revalidation_millis.saturating_add(
-                                        duration_millis(candidate_revalidation_started.elapsed()),
-                                    );
-                            }
-                            let refusal = CandidateExecutionRefusal {
-                                candidate: decision.path.clone(),
-                                worktree: decision.worktree_path.clone(),
-                                reason: format!("{error:#}"),
-                            };
-                            persist_candidate_refusal(
-                                &mut manifest,
-                                &mut execution_metrics,
-                                refusal,
-                                write_root,
-                            )?;
-                            continue;
-                        }
-                        {
-                            let metrics = execution_metrics
-                                .as_mut()
-                                .context("execute mode has no execution metrics")?;
-                            metrics.candidate_revalidation_millis =
-                                metrics.candidate_revalidation_millis.saturating_add(
-                                    duration_millis(candidate_revalidation_started.elapsed()),
-                                );
-                        }
                         let existed_before = path.exists();
                         let observation_path = decision.worktree_path.clone();
                         let available_before = fs4::available_space(&observation_path)?;
-                        let source_before = source_status_excluding_candidate(
-                            &decision.worktree_path,
-                            &decision.path,
-                        )?;
-                        let deletion_started = Instant::now();
-                        execute_cleanup_manifest_matching_with_snapshot(
+                        let worktree_key = (index, decision.worktree_path.clone());
+                        let source_before = source_before_by_worktree
+                            .get(&worktree_key)
+                            .cloned()
+                            .with_context(|| {
+                            format!(
+                                "pressure epoch has no prepared source baseline for {}",
+                                path.display()
+                            )
+                        })?;
+                        let candidate_timing = CandidateExecutionTiming::default();
+                        let execution_result = execute_cleanup_manifest_matching_with_snapshot(
                             &manifest.repositories[index].manifest,
                             ExecutionPass::PressureGenerated(rank),
                             Some(&path),
                             epoch_snapshot.as_ref().map(|snapshot| &snapshot.handles),
                             Some(epoch_deadline),
-                        )?;
+                            Some(&candidate_timing),
+                        );
                         {
                             let metrics = execution_metrics
                                 .as_mut()
                                 .context("execute mode has no execution metrics")?;
+                            metrics.candidate_revalidation_millis = metrics
+                                .candidate_revalidation_millis
+                                .saturating_add(candidate_timing.revalidation_millis.get());
                             metrics.deletion_millis = metrics
                                 .deletion_millis
-                                .saturating_add(duration_millis(deletion_started.elapsed()));
+                                .saturating_add(candidate_timing.deletion_millis.get());
                         }
+                        execution_result?;
                         if existed_before && !path.exists() {
                             let metrics = execution_metrics
                                 .as_mut()
@@ -1869,13 +1899,21 @@ fn cleanup_repositories_with_capture(
                             metrics.realized_reclaim_bytes = metrics
                                 .realized_reclaim_bytes
                                 .saturating_add(available_after.saturating_sub(available_before));
-                            let source_after = source_status_excluding_candidate(
+                            let source_exclusions = source_exclusions_by_worktree
+                                .get(&worktree_key)
+                                .with_context(|| {
+                                    format!(
+                                        "pressure epoch has no source exclusions for {}",
+                                        decision.worktree_path.display()
+                                    )
+                                })?;
+                            let source_after = pressure_worktree_source_baseline(
                                 &decision.worktree_path,
-                                &decision.path,
+                                source_exclusions,
                             )?;
                             anyhow::ensure!(
                                 source_after == source_before,
-                                "worktree source changed while deleting {}",
+                                "worktree head or source changed while deleting {}",
                                 decision.path.display()
                             );
                             refresh_planned_worktree_source(
@@ -2181,6 +2219,7 @@ fn refresh_and_execute_repository(
         only_generated_path,
         open_handles,
         None,
+        None,
     )
 }
 
@@ -2247,6 +2286,14 @@ fn pressure_epoch_expired(started: Instant) -> bool {
     started.elapsed() >= PRESSURE_EPOCH_MAX_DURATION
 }
 
+fn start_pressure_epoch_after_preparation<T>(prepared: T) -> Result<(T, Instant, Instant)> {
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(PRESSURE_EPOCH_MAX_DURATION)
+        .context("pressure ownership epoch deadline overflowed")?;
+    Ok((prepared, started, deadline))
+}
+
 fn revalidate_before_ownership_deadline(
     deadline: Option<Instant>,
     revalidate: impl FnOnce() -> Result<()>,
@@ -2297,6 +2344,154 @@ fn persist_candidate_refusal(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PressureWorktreeSourceBaseline {
+    head: Option<String>,
+    tracked_status_sha256: String,
+    source_status: (usize, String),
+}
+
+fn pressure_worktree_source_baseline(
+    worktree: &Path,
+    exclusions: &[PathBuf],
+) -> Result<PressureWorktreeSourceBaseline> {
+    let head_before = live_worktree_head(worktree)?;
+    let tracked_status_before = pressure_worktree_tracked_status_sha256(worktree)?;
+    let source_status = source_status_excluding_candidates(worktree, exclusions)?;
+    let tracked_status_after = pressure_worktree_tracked_status_sha256(worktree)?;
+    let head_after = live_worktree_head(worktree)?;
+    anyhow::ensure!(
+        head_after == head_before,
+        "worktree head changed while capturing its pressure source baseline"
+    );
+    anyhow::ensure!(
+        tracked_status_after == tracked_status_before,
+        "worktree tracked status changed while capturing its pressure source baseline"
+    );
+    Ok(PressureWorktreeSourceBaseline {
+        head: head_after,
+        tracked_status_sha256: tracked_status_after,
+        source_status,
+    })
+}
+
+fn revalidate_prepared_pressure_worktree_identity(
+    manifest: &CleanupManifest,
+    worktree: &Path,
+    prepared: &PressureWorktreeSourceBaseline,
+) -> Result<()> {
+    let canonical_worktree = fs::canonicalize(worktree)
+        .with_context(|| format!("failed to resolve worktree {}", worktree.display()))?;
+    anyhow::ensure!(
+        canonical_worktree == worktree,
+        "worktree canonical identity changed"
+    );
+    let git_common_dir = git_common_dir_hint(worktree)
+        .context("worktree Git common-directory hint is unavailable")?;
+    anyhow::ensure!(
+        git_common_dir == manifest.git_common_dir,
+        "Git common-directory identity changed"
+    );
+    let current_head = pressure_worktree_head(worktree)?;
+    anyhow::ensure!(
+        pressure_worktree_heads_match(&current_head, &prepared.head),
+        "worktree head changed after pressure source preparation"
+    );
+    let tracked_status_sha256 = pressure_worktree_tracked_status_sha256(worktree)?;
+    anyhow::ensure!(
+        tracked_status_sha256 == prepared.tracked_status_sha256,
+        "worktree tracked status changed after pressure source preparation"
+    );
+    Ok(())
+}
+
+fn pressure_worktree_heads_match(current: &Option<String>, prepared: &Option<String>) -> bool {
+    current == prepared
+        || (pressure_worktree_head_is_unborn(current) && pressure_worktree_head_is_unborn(prepared))
+}
+
+fn pressure_worktree_head_is_unborn(head: &Option<String>) -> bool {
+    head.as_deref()
+        .is_none_or(|head| !head.is_empty() && head.bytes().all(|byte| byte == b'0'))
+}
+
+fn revalidate_prepared_pressure_epoch_worktrees(
+    manifest: &RootCleanupManifest,
+    prepared_worktrees: &HashSet<(usize, PathBuf)>,
+    prepared_sources: &BTreeMap<(usize, PathBuf), PressureWorktreeSourceBaseline>,
+    metrics: &mut ExecutionMetrics,
+) -> HashSet<(usize, PathBuf)> {
+    let mut revalidated = HashSet::new();
+    for key @ (index, worktree) in prepared_worktrees {
+        let result = (|| {
+            let repository = &manifest.repositories[*index].manifest;
+            let prepared = prepared_sources.get(key).with_context(|| {
+                format!(
+                    "pressure epoch has no prepared source baseline for {}",
+                    worktree.display()
+                )
+            })?;
+            revalidate_prepared_pressure_worktree_identity(repository, worktree, prepared)
+        })();
+        match result {
+            Ok(()) => {
+                revalidated.insert((*key).clone());
+            }
+            Err(error) => metrics.candidate_refusals.push(CandidateExecutionRefusal {
+                candidate: worktree.clone(),
+                worktree: worktree.clone(),
+                reason: format!("bounded worktree revalidation failed: {error:#}"),
+            }),
+        }
+    }
+    revalidated
+}
+
+fn pressure_worktree_head(worktree: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to read worktree head in {}", worktree.display()))?;
+    if output.status.success() {
+        let head = String::from_utf8(output.stdout).context("worktree head is not valid UTF-8")?;
+        let head = head.trim();
+        anyhow::ensure!(!head.is_empty(), "worktree head is empty");
+        return Ok(Some(head.to_string()));
+    }
+    let symbolic = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to determine whether {} has an unborn head",
+                worktree.display()
+            )
+        })?;
+    anyhow::ensure!(
+        symbolic.status.success(),
+        "failed to resolve worktree head in {}: {}",
+        worktree.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(None)
+}
+
+fn pressure_worktree_tracked_status_sha256(worktree: &Path) -> Result<String> {
+    // The complete grouped baseline above includes untracked files and can be
+    // expensive in large worktrees. This bounded epoch probe intentionally
+    // asks Git only for tracked/index state; exact candidate containment and
+    // tracked-content guards separately protect the deletion boundary.
+    let output = git_bytes(
+        worktree,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+    )?;
+    Ok(format!("{:x}", Sha256::digest(output)))
+}
+
 fn revalidate_pressure_epoch_worktrees(
     manifest: &RootCleanupManifest,
     epoch: &[(usize, PathBuf)],
@@ -2325,6 +2520,15 @@ fn pressure_epoch_worktree_groups(
     manifest: &RootCleanupManifest,
     epoch: &[(usize, PathBuf)],
 ) -> HashSet<(usize, PathBuf)> {
+    pressure_epoch_candidate_groups(manifest, epoch)
+        .into_keys()
+        .collect()
+}
+
+fn pressure_epoch_candidate_groups(
+    manifest: &RootCleanupManifest,
+    epoch: &[(usize, PathBuf)],
+) -> BTreeMap<(usize, PathBuf), Vec<PathBuf>> {
     epoch
         .iter()
         .filter_map(|(index, path)| {
@@ -2333,12 +2537,18 @@ fn pressure_epoch_worktree_groups(
                 .generated_dirs
                 .iter()
                 .find(|decision| decision.path == *path)
-                .map(|decision| (*index, decision.worktree_path.clone()))
+                .map(|decision| ((*index, decision.worktree_path.clone()), path.clone()))
         })
-        .collect()
+        .fold(BTreeMap::new(), |mut groups, (worktree, candidate)| {
+            groups.entry(worktree).or_default().push(candidate);
+            groups
+        })
 }
 
-fn revalidate_pressure_worktree(manifest: &CleanupManifest, worktree: &Path) -> Result<()> {
+fn revalidate_pressure_worktree_identity(
+    manifest: &CleanupManifest,
+    worktree: &Path,
+) -> Result<Option<String>> {
     let canonical_worktree = fs::canonicalize(worktree)
         .with_context(|| format!("failed to resolve worktree {}", worktree.display()))?;
     anyhow::ensure!(
@@ -2361,12 +2571,27 @@ fn revalidate_pressure_worktree(manifest: &CleanupManifest, worktree: &Path) -> 
             )
         })?;
     let head = live_worktree_head(worktree)?;
+    anyhow::ensure!(planned.head == head, "worktree head changed");
+    Ok(head)
+}
+
+fn revalidate_pressure_worktree(manifest: &CleanupManifest, worktree: &Path) -> Result<()> {
+    revalidate_pressure_worktree_identity(manifest, worktree)?;
+    let planned = manifest
+        .worktrees
+        .iter()
+        .find(|decision| decision.path == worktree)
+        .with_context(|| {
+            format!(
+                "manifest has no worktree identity for {}",
+                worktree.display()
+            )
+        })?;
     let source = dirty_status(worktree)?;
     anyhow::ensure!(
-        planned.head == head
-            && planned.dirty_count == Some(source.dirty_count)
+        planned.dirty_count == Some(source.dirty_count)
             && planned.status_sha256.as_deref() == Some(source.status_sha256.as_str()),
-        "worktree head or source status changed"
+        "worktree source status changed"
     );
     Ok(())
 }
@@ -2582,6 +2807,30 @@ enum ExecutionPass {
     PressureWorktrees,
 }
 
+#[derive(Debug, Default)]
+struct CandidateExecutionTiming {
+    revalidation_millis: std::cell::Cell<u64>,
+    deletion_millis: std::cell::Cell<u64>,
+}
+
+impl CandidateExecutionTiming {
+    fn record_revalidation(&self, elapsed: Duration) {
+        self.revalidation_millis.set(
+            self.revalidation_millis
+                .get()
+                .saturating_add(duration_millis(elapsed)),
+        );
+    }
+
+    fn record_deletion(&self, elapsed: Duration) {
+        self.deletion_millis.set(
+            self.deletion_millis
+                .get()
+                .saturating_add(duration_millis(elapsed)),
+        );
+    }
+}
+
 fn execute_cleanup_manifest(manifest: &CleanupManifest, pass: ExecutionPass) -> Result<()> {
     execute_cleanup_manifest_matching(manifest, pass, None)
 }
@@ -2592,10 +2841,10 @@ fn execute_cleanup_manifest_with_snapshot(
     open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<()> {
     if pass != ExecutionPass::Routine {
-        return execute_cleanup(manifest, pass, None, open_handles, None);
+        return execute_cleanup(manifest, pass, None, open_handles, None, None);
     }
     execute_planned_metadata_prune(manifest)?;
-    execute_cleanup(manifest, pass, None, open_handles, None)
+    execute_cleanup(manifest, pass, None, open_handles, None, None)
 }
 
 fn execute_cleanup_manifest_matching(
@@ -2603,7 +2852,14 @@ fn execute_cleanup_manifest_matching(
     pass: ExecutionPass,
     only_generated_path: Option<&Path>,
 ) -> Result<()> {
-    execute_cleanup_manifest_matching_with_snapshot(manifest, pass, only_generated_path, None, None)
+    execute_cleanup_manifest_matching_with_snapshot(
+        manifest,
+        pass,
+        only_generated_path,
+        None,
+        None,
+        None,
+    )
 }
 
 fn execute_cleanup_manifest_matching_with_snapshot(
@@ -2612,6 +2868,7 @@ fn execute_cleanup_manifest_matching_with_snapshot(
     only_generated_path: Option<&Path>,
     open_handles: Option<&OpenHandleSnapshot>,
     ownership_deadline: Option<Instant>,
+    timing: Option<&CandidateExecutionTiming>,
 ) -> Result<()> {
     if pass != ExecutionPass::Routine {
         return execute_cleanup(
@@ -2620,6 +2877,7 @@ fn execute_cleanup_manifest_matching_with_snapshot(
             only_generated_path,
             open_handles,
             ownership_deadline,
+            timing,
         );
     }
     execute_planned_metadata_prune(manifest)?;
@@ -2629,6 +2887,7 @@ fn execute_cleanup_manifest_matching_with_snapshot(
         only_generated_path,
         open_handles,
         ownership_deadline,
+        timing,
     )
 }
 
@@ -3378,20 +3637,15 @@ fn dirty_status(path: &Path) -> Result<DirtyStatus> {
 }
 
 fn source_status_excluding_candidate(worktree: &Path, candidate: &Path) -> Result<(usize, String)> {
-    let relative = candidate.strip_prefix(worktree).with_context(|| {
-        format!(
-            "generated candidate {} is outside worktree {}",
-            candidate.display(),
-            worktree.display()
-        )
-    })?;
-    let relative = relative
-        .to_str()
-        .context("generated candidate relative path is not valid UTF-8")?
-        .replace(std::path::MAIN_SEPARATOR, "/");
-    let mut exclude = OsString::from(":(top,exclude,literal)");
-    exclude.push(relative);
-    let output = Command::new("git")
+    source_status_excluding_candidates(worktree, &[candidate.to_path_buf()])
+}
+
+fn source_status_excluding_candidates(
+    worktree: &Path,
+    candidates: &[PathBuf],
+) -> Result<(usize, String)> {
+    let mut command = Command::new("git");
+    command
         .args([
             "status",
             "--porcelain=v1",
@@ -3400,9 +3654,25 @@ fn source_status_excluding_candidate(worktree: &Path, candidate: &Path) -> Resul
             "--",
             ".",
         ])
-        .arg(exclude)
         .current_dir(worktree)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    for candidate in candidates {
+        let relative = candidate.strip_prefix(worktree).with_context(|| {
+            format!(
+                "generated candidate {} is outside worktree {}",
+                candidate.display(),
+                worktree.display()
+            )
+        })?;
+        let relative = relative
+            .to_str()
+            .context("generated candidate relative path is not valid UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let mut exclude = OsString::from(":(top,exclude,literal)");
+        exclude.push(relative);
+        command.arg(exclude);
+    }
+    let output = command
         .output()
         .with_context(|| format!("failed to run git status in {}", worktree.display()))?;
     anyhow::ensure!(
@@ -4897,6 +5167,7 @@ fn execute_cleanup(
     only_generated_path: Option<&Path>,
     open_handles: Option<&OpenHandleSnapshot>,
     ownership_deadline: Option<Instant>,
+    timing: Option<&CandidateExecutionTiming>,
 ) -> Result<()> {
     let mut worktree_removals = manifest
         .worktrees
@@ -5044,9 +5315,10 @@ fn execute_cleanup(
             continue;
         }
         let result = match with_protection_guard(&decision.path, SystemTime::now(), || {
-            remove_generated_directory(
+            remove_generated_directory_with_timing(
                 decision,
                 manifest.cargo_lock_timeout_secs.map(Duration::from_secs),
+                timing,
                 || {
                     if pass != ExecutionPass::Routine {
                         match revalidate_before_ownership_deadline(ownership_deadline, || {
@@ -5812,9 +6084,19 @@ fn print_execution_protection(path: &Path, lease: &ProtectionMatch) {
     );
 }
 
+#[cfg(test)]
 fn remove_generated_directory(
     decision: &GeneratedDirDecision,
     cargo_lock_timeout: Option<Duration>,
+    before_remove: impl Fn() -> Result<bool>,
+) -> Result<bool> {
+    remove_generated_directory_with_timing(decision, cargo_lock_timeout, None, before_remove)
+}
+
+fn remove_generated_directory_with_timing(
+    decision: &GeneratedDirDecision,
+    cargo_lock_timeout: Option<Duration>,
+    timing: Option<&CandidateExecutionTiming>,
     before_remove: impl Fn() -> Result<bool>,
 ) -> Result<bool> {
     if !decision.path.exists() {
@@ -5822,12 +6104,22 @@ fn remove_generated_directory(
     }
 
     let remove = || {
-        if !before_remove()? {
+        let revalidation_started = Instant::now();
+        let should_remove = before_remove();
+        if let Some(timing) = timing {
+            timing.record_revalidation(revalidation_started.elapsed());
+        }
+        if !should_remove? {
             return Ok(false);
         }
-        fs::remove_dir_all(&decision.path)
+        let deletion_started = Instant::now();
+        let result = fs::remove_dir_all(&decision.path)
             .map_err(Into::into)
-            .map(|()| true)
+            .map(|()| true);
+        if let Some(timing) = timing {
+            timing.record_deletion(deletion_started.elapsed());
+        }
+        result
     };
     if decision.name == "target"
         && cargo_lock_timeout.is_some()
@@ -7709,6 +8001,48 @@ mod tests {
     }
 
     #[test]
+    fn candidate_timing_keeps_failed_revalidation_out_of_deletion_time() -> Result<()> {
+        let temp = TempDir::new()?;
+        let worktree = temp.path().join("repo");
+        let generated = worktree.join("node_modules");
+        fs::create_dir_all(&generated)?;
+        fs::write(generated.join("artifact"), "stale")?;
+        let decision = GeneratedDirDecision {
+            path: fs::canonicalize(generated)?,
+            worktree_path: fs::canonicalize(worktree)?,
+            name: "node_modules".to_string(),
+            mtime: None,
+            mtime_unix: None,
+            mtime_nanos: None,
+            effective_days: 1,
+            in_use: false,
+            ownership_evidence_complete: true,
+            worktree_in_use: false,
+            owner_free_pressure: true,
+            protection: None,
+            cleanup_class: CleanupClass::Pressure,
+            identity: None,
+            measurement: None,
+            source_dirty_count_without_candidate: None,
+            source_status_sha256_without_candidate: None,
+            sweeps: Vec::new(),
+            action: GeneratedDirAction::Delete,
+            reason: "pressure fixture".to_string(),
+        };
+        let timing = CandidateExecutionTiming::default();
+        let removed =
+            remove_generated_directory_with_timing(&decision, None, Some(&timing), || {
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(false)
+            })?;
+        assert!(!removed);
+        assert!(decision.path.exists());
+        assert!(timing.revalidation_millis.get() >= 5);
+        assert_eq!(timing.deletion_millis.get(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn build_caches_use_tighter_default_window() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let worktree = repo.with_file_name("class-windows");
@@ -8850,6 +9184,22 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert!(groups.contains(&(0, PathBuf::from("/code/a"))));
         assert!(groups.contains(&(1, PathBuf::from("/code/b"))));
+        let candidate_groups = pressure_epoch_candidate_groups(
+            &manifest,
+            &[
+                (0, PathBuf::from("/code/a/.turbo")),
+                (0, PathBuf::from("/code/a/node_modules")),
+            ],
+        );
+        assert_eq!(
+            candidate_groups
+                .get(&(0, PathBuf::from("/code/a")))
+                .cloned(),
+            Some(vec![
+                PathBuf::from("/code/a/.turbo"),
+                PathBuf::from("/code/a/node_modules")
+            ])
+        );
 
         let epoch = [
             (0, PathBuf::from("/code/a/.turbo")),
@@ -8885,6 +9235,38 @@ mod tests {
         assert!(pressure_epoch_expired(
             Instant::now() - PRESSURE_EPOCH_MAX_DURATION
         ));
+    }
+
+    #[test]
+    fn pressure_ownership_clock_starts_after_expensive_preparation() -> Result<()> {
+        std::thread::sleep(Duration::from_millis(5));
+        let (prepared, started, deadline) =
+            start_pressure_epoch_after_preparation("prepared source baseline")?;
+        assert_eq!(prepared, "prepared source baseline");
+        assert!(!pressure_epoch_expired(started));
+        assert_eq!(
+            deadline.duration_since(started),
+            PRESSURE_EPOCH_MAX_DURATION
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_source_preparation_excludes_every_candidate_in_one_worktree() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let first = repo.join("generated-one");
+        let second = repo.join("generated-two");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        fs::write(first.join("artifact"), "first")?;
+        fs::write(second.join("artifact"), "second")?;
+
+        let all_excluded =
+            source_status_excluding_candidates(&repo, &[first.clone(), second.clone()])?;
+        assert_eq!(all_excluded.0, 0);
+        let one_excluded = source_status_excluding_candidates(&repo, &[first])?;
+        assert_eq!(one_excluded.0, 1);
+        Ok(())
     }
 
     #[test]
@@ -9115,6 +9497,78 @@ mod tests {
         let error = revalidate_pressure_worktree(&run.manifest, &repo)
             .expect_err("source drift must invalidate the whole worktree group");
         assert!(error.to_string().contains("source status changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_pressure_worktree_revalidation_rejects_clean_head_drift() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let repo = fs::canonicalize(repo)?;
+        let candidate = repo.join("target");
+        fs::create_dir(&candidate)?;
+        fs::write(candidate.join("artifact"), "generated\n")?;
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+        )?;
+        revalidate_pressure_worktree(&run.manifest, &repo)?;
+        let exclusions = vec![candidate];
+        let prepared = pressure_worktree_source_baseline(&repo, &exclusions)?;
+
+        fs::write(repo.join("README.md"), "new clean revision\n")?;
+        git_output(&repo, ["add", "README.md"])?;
+        commit_with_date(&repo, "new clean revision", "2025-01-02T00:00:00Z")?;
+        let changed = pressure_worktree_source_baseline(&repo, &exclusions)?;
+        assert_eq!(changed.source_status, prepared.source_status);
+        assert_ne!(changed.head, prepared.head);
+
+        let error = revalidate_prepared_pressure_worktree_identity(&run.manifest, &repo, &prepared)
+            .expect_err("a clean checkout to another revision must invalidate the epoch");
+        assert!(error.to_string().contains("worktree head changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_pressure_worktree_revalidation_rejects_tracked_status_drift() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let repo = fs::canonicalize(repo)?;
+        let candidate = repo.join("target");
+        fs::create_dir(&candidate)?;
+        fs::write(candidate.join("artifact"), "generated\n")?;
+        let run = cleanup(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+        )?;
+        let prepared = pressure_worktree_source_baseline(&repo, &[candidate])?;
+
+        fs::write(repo.join("README.md"), "tracked drift\n")?;
+        let error = revalidate_prepared_pressure_worktree_identity(&run.manifest, &repo, &prepared)
+            .expect_err("tracked source drift must invalidate the epoch");
+        assert!(error.to_string().contains("tracked status changed"));
         Ok(())
     }
 
@@ -9450,6 +9904,9 @@ mod tests {
             },
         )?;
         revalidate_pressure_worktree(&run.manifest, &repo)?;
+        assert_eq!(pressure_worktree_head(&repo)?, None);
+        let prepared = pressure_worktree_source_baseline(&repo, &[])?;
+        revalidate_prepared_pressure_worktree_identity(&run.manifest, &repo, &prepared)?;
         refresh_planned_worktree_source(&mut run.manifest, &repo)?;
         Ok(())
     }
@@ -9600,6 +10057,7 @@ mod tests {
             ExecutionPass::PressureGenerated(0),
             Some(&first),
             Some(&snapshot),
+            None,
             None,
         )?;
         assert!(!first.exists());
