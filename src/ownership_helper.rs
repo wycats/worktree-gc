@@ -9,6 +9,8 @@ use anyhow::{bail, Result};
 #[cfg(any(unix, test))]
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "macos", test))]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[cfg(any(target_os = "macos", test))]
@@ -201,12 +203,16 @@ fn privileged_response_from_capture(
             ),
         );
     }
+    let root_indices = roots
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, root)| (root, index))
+        .collect::<HashMap<_, _>>();
     let mut observations = Vec::new();
     for observation in capture.observations {
-        for root in roots
-            .iter()
-            .filter(|root| observation.path.starts_with(root))
-        {
+        for root_index in matching_root_indices(&observation.path, &root_indices) {
+            let root = &roots[root_index];
             if observations.len() >= MAX_MATCHED_OBSERVATIONS {
                 return OwnershipResponse::refusal(
                     request_id,
@@ -241,6 +247,16 @@ fn privileged_response_from_capture(
         observations,
         service: None,
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn matching_root_indices(path: &Path, root_indices: &HashMap<PathBuf, usize>) -> Vec<usize> {
+    let mut matches = path
+        .ancestors()
+        .filter_map(|ancestor| root_indices.get(ancestor).copied())
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1235,6 +1251,29 @@ mod tests {
         assert!(peer_is_authorized(501, 501));
         assert!(!peer_is_authorized(502, 501));
         assert!(!peer_is_authorized(0, 501));
+    }
+
+    #[test]
+    fn ownership_matching_is_bounded_by_path_depth_not_root_count() {
+        let mut roots = (0..(MAX_REQUEST_ROOTS - 1))
+            .map(|index| PathBuf::from(format!("/allowed/sibling-{index}")))
+            .collect::<Vec<_>>();
+        roots.push(PathBuf::from("/allowed"));
+        let root_indices = roots
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, root)| (root, index))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            matching_root_indices(
+                Path::new("/allowed/sibling-1024/target/debug/app"),
+                &root_indices
+            ),
+            vec![1024, MAX_REQUEST_ROOTS - 1]
+        );
+        assert!(matching_root_indices(Path::new("/outside/target"), &root_indices).is_empty());
     }
 
     #[test]
