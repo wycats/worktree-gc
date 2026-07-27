@@ -97,14 +97,7 @@ impl OwnershipResponse {
 }
 
 pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> Result<()> {
-    let payload = serde_json::to_vec(message)?;
-    if payload.len() > MAX_PROTOCOL_MESSAGE_BYTES {
-        bail!(
-            "ownership helper message is {} bytes; limit is {}",
-            payload.len(),
-            MAX_PROTOCOL_MESSAGE_BYTES
-        );
-    }
+    let payload = serialize_message_with_limit(message, MAX_PROTOCOL_MESSAGE_BYTES)?;
     let length = u32::try_from(payload.len()).context("ownership helper message exceeds u32")?;
     writer.write_all(&length.to_be_bytes())?;
     writer.write_all(&payload)?;
@@ -123,6 +116,53 @@ pub fn read_message<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> Res
     let mut payload = vec![0_u8; length];
     reader.read_exact(&mut payload)?;
     Ok(serde_json::from_slice(&payload)?)
+}
+
+fn serialize_message_with_limit<T: Serialize>(message: &T, limit: usize) -> Result<Vec<u8>> {
+    let mut payload = BoundedPayload::new(limit);
+    serde_json::to_writer(&mut payload, message)
+        .context("ownership helper message exceeds limit")?;
+    Ok(payload.into_inner())
+}
+
+struct BoundedPayload {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedPayload {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedPayload {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let new_len = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("ownership helper message length overflow"))?;
+        if new_len > self.limit {
+            return Err(std::io::Error::other(format!(
+                "ownership helper message is larger than the {limit}-byte limit",
+                limit = self.limit
+            )));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -230,5 +270,13 @@ mod tests {
             .expect("protocol limit should fit in u32")
             .to_be_bytes();
         assert!(read_message::<OwnershipRequest>(&mut oversized.as_slice()).is_err());
+    }
+
+    #[test]
+    fn frame_writer_enforces_the_limit_during_serialization() -> Result<()> {
+        let message = serde_json::json!({"payload": "x".repeat(128)});
+        assert!(serialize_message_with_limit(&message, 64).is_err());
+        assert!(serialize_message_with_limit(&message, 256)?.len() <= 256);
+        Ok(())
     }
 }

@@ -69,7 +69,7 @@ pub struct HelperStatus {
     pub loaded: bool,
     pub protocol_version: u64,
     pub client_uid: Option<u32>,
-    pub roots: Vec<PathBuf>,
+    pub roots: Vec<WirePath>,
     pub socket: PathBuf,
     pub probe_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -462,20 +462,16 @@ pub fn install(options: HelperInstallOptions) -> Result<()> {
         "helper source binary {} is not a file",
         source_binary.display()
     );
+    let canonical_roots = canonical_install_roots(&options.roots)?;
     let config = HelperConfig {
         config_version: HELPER_CONFIG_VERSION,
         allowed_uid: options.client_uid,
         allowed_gid: options.client_gid,
-        roots: options
-            .roots
+        roots: canonical_roots
             .iter()
-            .map(|root| root.canonicalize())
-            .collect::<std::io::Result<Vec<_>>>()?
-            .into_iter()
-            .map(|root| WirePath::from_path(&root))
+            .map(|root| WirePath::from_path(root))
             .collect(),
     };
-    let canonical_roots = canonical_config_roots(&config)?;
 
     let helper_binary = Path::new(DEFAULT_HELPER_BINARY);
     let helper_config = Path::new(DEFAULT_HELPER_CONFIG);
@@ -553,6 +549,21 @@ pub fn install(options: HelperInstallOptions) -> Result<()> {
     }
     discard_installation_backup(&backup)?;
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn canonical_install_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut canonical = roots
+        .iter()
+        .map(|root| root.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    canonical.sort();
+    canonical.dedup();
+    ensure!(
+        !canonical.is_empty(),
+        "ownership helper requires at least one allowed root"
+    );
+    Ok(canonical)
 }
 
 #[cfg(target_os = "macos")]
@@ -678,13 +689,13 @@ fn status_from_response(
         .service
         .as_ref()
         .context("ownership helper status omitted service metadata")?;
-    let roots = service_metadata_paths(metadata)?;
+    service_metadata_paths(metadata)?;
     Ok(HelperStatus {
         installed,
         loaded,
         protocol_version: response.protocol_version,
         client_uid: Some(metadata.client_uid),
-        roots,
+        roots: metadata.roots.clone(),
         socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
         probe_complete: response.complete,
         error: response.error,
@@ -1013,9 +1024,9 @@ fn render_launchd_plist(binary: &Path, config: &Path) -> String {
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
-  <string>/var/log/worktree-gc-ownership-helper.log</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/worktree-gc-ownership-helper.log</string>
+  <string>/dev/null</string>
 </dict>
 </plist>
 "#,
@@ -1246,6 +1257,25 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn install_roots_are_canonical_and_deduplicated_before_persistence() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let alias = temp.path().join("alias");
+        symlink(&root, &alias)?;
+
+        assert_eq!(
+            canonical_install_roots(&[root.clone(), alias, root.clone()])?,
+            vec![root.canonicalize()?]
+        );
+        assert!(canonical_install_roots(&[]).is_err());
+        Ok(())
+    }
+
     #[test]
     fn helper_authentication_accepts_only_the_configured_uid() {
         assert!(peer_is_authorized(501, 501));
@@ -1306,8 +1336,33 @@ mod tests {
         validate_response(&request, &response)?;
         let status = status_from_response(true, true, response)?;
         assert_eq!(status.client_uid, Some(501));
-        assert_eq!(status.roots, vec![root]);
+        assert_eq!(status.roots, vec![WirePath::from_path(&root)]);
         assert!(status.probe_complete);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_serializes_non_utf8_roots_without_loss() -> Result<()> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = PathBuf::from(OsString::from_vec(b"/tmp/non-utf8-\xff".to_vec()));
+        let response = OwnershipResponse {
+            protocol_version: OWNERSHIP_PROTOCOL_VERSION,
+            request_id: 81,
+            backend: "macos_privileged_libproc".to_string(),
+            complete: true,
+            error: None,
+            observations: Vec::new(),
+            service: Some(OwnershipServiceMetadata {
+                client_uid: 501,
+                roots: vec![WirePath::from_path(&root)],
+            }),
+        };
+        let status = status_from_response(true, true, response)?;
+        let encoded = serde_json::to_vec(&status)?;
+        assert!(String::from_utf8(encoded)?.contains("2f746d702f6e6f6e2d757466382dff"));
         Ok(())
     }
 
@@ -1465,6 +1520,8 @@ mod tests {
             Path::new(DEFAULT_HELPER_CONFIG),
         );
         assert!(plist.contains("<string>serve</string>"));
+        assert!(plist.contains("<string>/dev/null</string>"));
+        assert!(!plist.contains("/var/log/"));
         assert!(!plist.contains("cleanup"));
         assert!(!plist.contains("execute"));
         assert!(!plist.contains("scheduled"));
