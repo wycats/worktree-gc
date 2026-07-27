@@ -707,6 +707,7 @@ struct GeneratedScanPolicy<'a> {
 #[derive(Debug)]
 pub(crate) enum OpenHandleSnapshot {
     Available(HashSet<PathBuf>),
+    #[cfg(any(not(unix), test))]
     Unavailable,
     Indeterminate,
 }
@@ -4240,18 +4241,20 @@ fn exact_sampled_mtime(path: &Path, depth: usize) -> Result<(i64, u32)> {
 
 // Best-effort open-handle probe. On macOS, planning captures process cwd/root
 // vnode paths, file-backed memory mappings, and vnode descriptors through one
-// bounded native `libproc` snapshot. Other Unix platforms, or a native
-// capability/API failure, use one global `lsof` snapshot. Native resource
+// bounded native `libproc` snapshot. Successful native observations survive
+// process-specific permission failures; one targeted `lsof` query completes
+// only those exact PIDs. Other Unix platforms, malformed native responses, or
+// incomplete targeted evidence use one global `lsof` snapshot. Native resource
 // budget exhaustion fails closed without cascading into a second global scan.
-// Every generated candidate is matched against the captured
-// paths in memory, avoiding repeated directory walks while observing ownership
-// at any depth beneath a candidate. Root execution supplies one fresh snapshot
-// per routine repository or bounded pressure epoch, while exact candidate
-// guards are still revalidated immediately before mutation. If no shared
-// snapshot is supplied, callers capture one fresh recursive global snapshot
-// rather than falling back to a descendant-blind path-scoped probe. If the
-// ownership backend is unavailable, an explicitly requested check keeps every
-// candidate rather than degrading to mtime-only deletion authority.
+// Every generated candidate is matched against the captured paths in memory,
+// avoiding repeated directory walks while observing ownership at any depth
+// beneath a candidate. Root execution supplies one fresh snapshot per routine
+// repository or bounded pressure epoch, while exact candidate guards are still
+// revalidated immediately before mutation. If no shared snapshot is supplied,
+// callers capture one fresh recursive snapshot rather than falling back to a
+// descendant-blind path-scoped probe. If the ownership backend is unavailable,
+// an explicitly requested check keeps every candidate rather than degrading to
+// mtime-only deletion authority.
 #[cfg(target_os = "macos")]
 pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
     capture_open_handle_snapshot_with_backend().0
@@ -4259,21 +4262,31 @@ pub(crate) fn capture_open_handle_snapshot() -> OpenHandleSnapshot {
 
 #[cfg(target_os = "macos")]
 fn capture_open_handle_snapshot_with_backend() -> (OpenHandleSnapshot, &'static str) {
-    match macos_open_handles::capture() {
-        Ok(paths) => (OpenHandleSnapshot::Available(paths), "macos_libproc"),
-        Err(error) if macos_open_handles::is_resource_limit(&error) => {
-            eprintln!(
-                "warning: native macOS open-handle snapshot exceeded its resource budget ({error}); keeping all generated paths protected"
-            );
-            (OpenHandleSnapshot::Indeterminate, "macos_libproc")
-        }
-        Err(error) => {
-            eprintln!(
-                "warning: native macOS open-handle snapshot failed ({error}); falling back to one global lsof snapshot"
-            );
-            (capture_lsof_open_handle_snapshot(), "lsof_global")
-        }
+    let capture = capture_macos_raw_ownership();
+    if !capture.complete {
+        eprintln!(
+            "warning: {} ownership snapshot was incomplete ({}); keeping all generated paths protected",
+            capture.backend,
+            capture.error.as_deref().unwrap_or("unknown error")
+        );
+        return (OpenHandleSnapshot::Indeterminate, capture.backend);
     }
+    if capture.backend == "lsof_global" {
+        eprintln!(
+            "warning: native macOS ownership snapshot failed ({}); used one complete global lsof fallback",
+            capture.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+    (
+        OpenHandleSnapshot::Available(
+            capture
+                .observations
+                .into_iter()
+                .map(|observation| observation.observed_path)
+                .collect(),
+        ),
+        capture.backend,
+    )
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -4286,39 +4299,26 @@ fn capture_open_handle_snapshot_with_backend() -> (OpenHandleSnapshot, &'static 
     (capture_lsof_open_handle_snapshot(), "lsof_global")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn capture_lsof_open_handle_snapshot() -> OpenHandleSnapshot {
-    let output = match Command::new("lsof")
-        .args(["-nP", "-F0n"])
-        .stdin(Stdio::null())
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return OpenHandleSnapshot::Unavailable;
-        }
-        Err(error) => {
-            eprintln!(
-                "warning: failed to capture global lsof snapshot ({error}); keeping all generated paths protected"
-            );
-            return OpenHandleSnapshot::Indeterminate;
-        }
-    };
-    if let Some(error) = lsof_probe_error(
-        output.status.success(),
-        output.status.code(),
-        &output.stderr,
-    ) {
+    let capture = capture_global_lsof_raw(None);
+    if !capture.complete {
         eprintln!(
-            "warning: global lsof snapshot failed ({error}); keeping all generated paths protected"
+            "warning: global lsof snapshot failed ({}); keeping all generated paths protected",
+            capture.error.as_deref().unwrap_or("unknown error")
         );
         return OpenHandleSnapshot::Indeterminate;
     }
-
-    OpenHandleSnapshot::Available(parse_lsof_snapshot_paths(&output.stdout))
+    OpenHandleSnapshot::Available(
+        capture
+            .observations
+            .into_iter()
+            .map(|observation| observation.observed_path)
+            .collect(),
+    )
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn parse_lsof_snapshot_paths(output: &[u8]) -> HashSet<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
 
@@ -4332,12 +4332,159 @@ fn parse_lsof_snapshot_paths(output: &[u8]) -> HashSet<PathBuf> {
 }
 
 #[cfg(unix)]
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RawProcessOwnershipObservation {
     pid: u32,
     command: Option<String>,
     evidence_kind: ProcessOwnershipEvidenceKind,
     observed_path: PathBuf,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct RawOwnershipCapture {
+    backend: &'static str,
+    complete: bool,
+    error: Option<String>,
+    observations: Vec<RawProcessOwnershipObservation>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum MacosNativeCapture {
+    Complete(macos_open_handles::Capture),
+    ResourceLimit(String),
+    Failed(String),
+}
+
+#[cfg(target_os = "macos")]
+fn capture_macos_raw_ownership() -> RawOwnershipCapture {
+    let native = match macos_open_handles::capture_with_evidence() {
+        Ok(capture) => MacosNativeCapture::Complete(capture),
+        Err(error) if macos_open_handles::is_resource_limit(&error) => {
+            MacosNativeCapture::ResourceLimit(error.to_string())
+        }
+        Err(error) => MacosNativeCapture::Failed(error.to_string()),
+    };
+    resolve_macos_ownership_capture(native, capture_targeted_lsof_raw, |prior| {
+        capture_global_lsof_raw(Some(prior))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_ownership_capture(
+    native: MacosNativeCapture,
+    targeted_lsof: impl FnOnce(&[u32]) -> io::Result<Vec<RawProcessOwnershipObservation>>,
+    global_lsof: impl FnOnce(String) -> RawOwnershipCapture,
+) -> RawOwnershipCapture {
+    let MacosNativeCapture::Complete(capture) = native else {
+        return match native {
+            MacosNativeCapture::ResourceLimit(error) => RawOwnershipCapture {
+                backend: "macos_libproc",
+                complete: false,
+                error: Some(error),
+                observations: Vec::new(),
+            },
+            MacosNativeCapture::Failed(error) => {
+                global_lsof(format!("native snapshot failed ({error})"))
+            }
+            MacosNativeCapture::Complete(_) => unreachable!(),
+        };
+    };
+    let mut observations = capture
+        .observations
+        .into_iter()
+        .map(raw_native_process_observation)
+        .collect::<Vec<_>>();
+    if capture.permission_denied_pids.is_empty() {
+        return RawOwnershipCapture {
+            backend: "macos_libproc",
+            complete: true,
+            error: None,
+            observations,
+        };
+    }
+    match targeted_lsof(&capture.permission_denied_pids) {
+        Ok(targeted) => {
+            observations.extend(targeted);
+            RawOwnershipCapture {
+                backend: "macos_libproc+lsof_pid",
+                complete: true,
+                error: None,
+                observations,
+            }
+        }
+        Err(error) => global_lsof(format!(
+            "targeted lsof failed for PIDs {:?} ({error})",
+            capture.permission_denied_pids
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn raw_native_process_observation(
+    observation: macos_open_handles::ProcessPathEvidence,
+) -> RawProcessOwnershipObservation {
+    RawProcessOwnershipObservation {
+        pid: observation.pid,
+        command: None,
+        evidence_kind: match observation.kind {
+            macos_open_handles::ProcessPathKind::Cwd => ProcessOwnershipEvidenceKind::ProcessCwd,
+            macos_open_handles::ProcessPathKind::Root => ProcessOwnershipEvidenceKind::ProcessRoot,
+            macos_open_handles::ProcessPathKind::MappedFile => {
+                ProcessOwnershipEvidenceKind::MappedFile
+            }
+            macos_open_handles::ProcessPathKind::OpenFile => ProcessOwnershipEvidenceKind::OpenFile,
+        },
+        observed_path: observation.path,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_targeted_lsof_raw(pids: &[u32]) -> io::Result<Vec<RawProcessOwnershipObservation>> {
+    let pid_list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    run_lsof_raw(&["-nP", "-a", "-p", &pid_list, "-F0pcfn"])
+}
+
+#[cfg(unix)]
+fn capture_global_lsof_raw(prior_error: Option<String>) -> RawOwnershipCapture {
+    match run_lsof_raw(&["-nP", "-F0pcfn"]) {
+        Ok(observations) => RawOwnershipCapture {
+            backend: "lsof_global",
+            complete: true,
+            error: prior_error,
+            observations,
+        },
+        Err(error) => RawOwnershipCapture {
+            backend: "lsof_global",
+            complete: false,
+            error: Some(match prior_error {
+                Some(prior) => format!("{prior}; global lsof failed ({error})"),
+                None => format!("global lsof failed ({error})"),
+            }),
+            observations: Vec::new(),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn run_lsof_raw(args: &[&str]) -> io::Result<Vec<RawProcessOwnershipObservation>> {
+    let output = Command::new("lsof")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()?;
+    if let Some(error) = lsof_probe_error(
+        output.status.success(),
+        output.status.code(),
+        &output.stderr,
+    ) {
+        return Err(error);
+    }
+    Ok(parse_lsof_process_ownership(&output.stdout))
 }
 
 #[cfg(unix)]
@@ -4446,47 +4593,7 @@ pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> Process
             observations: Vec::new(),
         };
     }
-    match macos_open_handles::capture_with_evidence() {
-        Ok(observations) => {
-            let observations =
-                observations
-                    .into_iter()
-                    .map(|observation| RawProcessOwnershipObservation {
-                        pid: observation.pid,
-                        command: None,
-                        evidence_kind: match observation.kind {
-                            macos_open_handles::ProcessPathKind::Cwd => {
-                                ProcessOwnershipEvidenceKind::ProcessCwd
-                            }
-                            macos_open_handles::ProcessPathKind::Root => {
-                                ProcessOwnershipEvidenceKind::ProcessRoot
-                            }
-                            macos_open_handles::ProcessPathKind::MappedFile => {
-                                ProcessOwnershipEvidenceKind::MappedFile
-                            }
-                            macos_open_handles::ProcessPathKind::OpenFile => {
-                                ProcessOwnershipEvidenceKind::OpenFile
-                            }
-                        },
-                        observed_path: observation.path,
-                    });
-            ProcessOwnershipEvidence {
-                observed_at_unix,
-                backend: "macos_libproc".to_string(),
-                complete: true,
-                error: None,
-                observations: match_process_ownership(paths, observations),
-            }
-        }
-        Err(error) if macos_open_handles::is_resource_limit(&error) => ProcessOwnershipEvidence {
-            observed_at_unix,
-            backend: "macos_libproc".to_string(),
-            complete: false,
-            error: Some(error.to_string()),
-            observations: Vec::new(),
-        },
-        Err(error) => capture_lsof_process_ownership(paths, observed_at_unix, Some(error)),
-    }
+    process_ownership_evidence_from_raw(paths, observed_at_unix, capture_macos_raw_ownership())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -4495,58 +4602,26 @@ pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> Process
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    capture_lsof_process_ownership(paths, observed_at_unix, None)
+    process_ownership_evidence_from_raw(paths, observed_at_unix, capture_global_lsof_raw(None))
 }
 
 #[cfg(unix)]
-fn capture_lsof_process_ownership(
+fn process_ownership_evidence_from_raw(
     paths: &[PathBuf],
     observed_at_unix: u64,
-    prior_error: Option<io::Error>,
+    capture: RawOwnershipCapture,
 ) -> ProcessOwnershipEvidence {
-    let output = match Command::new("lsof")
-        .args(["-nP", "-F0pcfn"])
-        .stdin(Stdio::null())
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => {
-            return ProcessOwnershipEvidence {
-                observed_at_unix,
-                backend: "lsof".to_string(),
-                complete: false,
-                error: Some(match prior_error {
-                    Some(prior) => {
-                        format!("native snapshot failed ({prior}); lsof failed ({error})")
-                    }
-                    None => error.to_string(),
-                }),
-                observations: Vec::new(),
-            };
-        }
+    let observations = if capture.complete {
+        match_process_ownership(paths, capture.observations)
+    } else {
+        Vec::new()
     };
-    if let Some(error) = lsof_probe_error(
-        output.status.success(),
-        output.status.code(),
-        &output.stderr,
-    ) {
-        return ProcessOwnershipEvidence {
-            observed_at_unix,
-            backend: "lsof".to_string(),
-            complete: false,
-            error: Some(match prior_error {
-                Some(prior) => format!("native snapshot failed ({prior}); lsof failed ({error})"),
-                None => error.to_string(),
-            }),
-            observations: Vec::new(),
-        };
-    }
     ProcessOwnershipEvidence {
         observed_at_unix,
-        backend: "lsof".to_string(),
-        complete: true,
-        error: prior_error.map(|error| error.to_string()),
-        observations: match_process_ownership(paths, parse_lsof_process_ownership(&output.stdout)),
+        backend: capture.backend.to_string(),
+        complete: capture.complete,
+        error: capture.error,
+        observations,
     }
 }
 
@@ -4617,6 +4692,7 @@ fn dirs_with_open_handles_using<'a>(
     };
     match snapshot {
         OpenHandleSnapshot::Available(open_paths) => match_open_handle_paths(&paths, open_paths),
+        #[cfg(any(not(unix), test))]
         OpenHandleSnapshot::Unavailable => paths.into_iter().collect(),
         OpenHandleSnapshot::Indeterminate => paths.into_iter().collect(),
     }
@@ -8159,6 +8235,162 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn targeted_pid_fallback_merges_complete_native_evidence() {
+        let targeted_calls = Cell::new(0);
+        let global_calls = Cell::new(0);
+        let capture = resolve_macos_ownership_capture(
+            MacosNativeCapture::Complete(macos_open_handles::Capture {
+                observations: vec![macos_open_handles::ProcessPathEvidence {
+                    pid: 41,
+                    path: PathBuf::from("/native/held"),
+                    kind: macos_open_handles::ProcessPathKind::OpenFile,
+                }],
+                permission_denied_pids: vec![42],
+            }),
+            |pids| {
+                targeted_calls.set(targeted_calls.get() + 1);
+                assert_eq!(pids, &[42]);
+                Ok(vec![RawProcessOwnershipObservation {
+                    pid: 42,
+                    command: Some("restricted".to_string()),
+                    evidence_kind: ProcessOwnershipEvidenceKind::MappedFile,
+                    observed_path: PathBuf::from("/targeted/mapped"),
+                }])
+            },
+            |_| {
+                global_calls.set(global_calls.get() + 1);
+                unreachable!("complete targeted evidence must avoid global lsof")
+            },
+        );
+
+        assert_eq!(capture.backend, "macos_libproc+lsof_pid");
+        assert!(capture.complete);
+        assert_eq!(capture.error, None);
+        assert_eq!(capture.observations.len(), 2);
+        assert_eq!(targeted_calls.get(), 1);
+        assert_eq!(global_calls.get(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn targeted_pid_failure_uses_one_global_fallback() {
+        let global_calls = Cell::new(0);
+        let capture = resolve_macos_ownership_capture(
+            MacosNativeCapture::Complete(macos_open_handles::Capture {
+                observations: vec![macos_open_handles::ProcessPathEvidence {
+                    pid: 41,
+                    path: PathBuf::from("/native/held"),
+                    kind: macos_open_handles::ProcessPathKind::OpenFile,
+                }],
+                permission_denied_pids: vec![42, 43],
+            }),
+            |pids| {
+                assert_eq!(pids, &[42, 43]);
+                Err(io::Error::other("targeted output was incomplete"))
+            },
+            |prior| {
+                global_calls.set(global_calls.get() + 1);
+                assert!(prior.contains("targeted output was incomplete"));
+                RawOwnershipCapture {
+                    backend: "lsof_global",
+                    complete: true,
+                    error: Some(prior),
+                    observations: vec![RawProcessOwnershipObservation {
+                        pid: 43,
+                        command: Some("global".to_string()),
+                        evidence_kind: ProcessOwnershipEvidenceKind::ProcessCwd,
+                        observed_path: PathBuf::from("/global/cwd"),
+                    }],
+                }
+            },
+        );
+
+        assert_eq!(capture.backend, "lsof_global");
+        assert!(capture.complete);
+        assert_eq!(capture.observations.len(), 1);
+        assert_eq!(global_calls.get(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn incomplete_global_fallback_rejects_the_snapshot() {
+        let capture = resolve_macos_ownership_capture(
+            MacosNativeCapture::Complete(macos_open_handles::Capture {
+                observations: Vec::new(),
+                permission_denied_pids: vec![42],
+            }),
+            |_| Err(io::Error::other("targeted output was incomplete")),
+            |prior| RawOwnershipCapture {
+                backend: "lsof_global",
+                complete: false,
+                error: Some(format!("{prior}; global output was incomplete")),
+                observations: Vec::new(),
+            },
+        );
+
+        assert_eq!(capture.backend, "lsof_global");
+        assert!(!capture.complete);
+        assert!(capture
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("global output was incomplete")));
+        assert!(capture.observations.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_resource_limit_fails_closed_without_lsof() {
+        let targeted_calls = Cell::new(0);
+        let global_calls = Cell::new(0);
+        let capture = resolve_macos_ownership_capture(
+            MacosNativeCapture::ResourceLimit("native budget exhausted".to_string()),
+            |_| {
+                targeted_calls.set(targeted_calls.get() + 1);
+                Ok(Vec::new())
+            },
+            |_| {
+                global_calls.set(global_calls.get() + 1);
+                unreachable!("resource exhaustion must not cascade into another scan")
+            },
+        );
+
+        assert_eq!(capture.backend, "macos_libproc");
+        assert!(!capture.complete);
+        assert_eq!(targeted_calls.get(), 0);
+        assert_eq!(global_calls.get(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn malformed_native_capture_preserves_global_fallback() {
+        let targeted_calls = Cell::new(0);
+        let global_calls = Cell::new(0);
+        let capture = resolve_macos_ownership_capture(
+            MacosNativeCapture::Failed("malformed native payload".to_string()),
+            |_| {
+                targeted_calls.set(targeted_calls.get() + 1);
+                Ok(Vec::new())
+            },
+            |prior| {
+                global_calls.set(global_calls.get() + 1);
+                assert!(prior.contains("malformed native payload"));
+                RawOwnershipCapture {
+                    backend: "lsof_global",
+                    complete: true,
+                    error: Some(prior),
+                    observations: Vec::new(),
+                }
+            },
+        );
+
+        assert_eq!(capture.backend, "lsof_global");
+        assert!(capture.complete);
+        assert_eq!(targeted_calls.get(), 0);
+        assert_eq!(global_calls.get(), 1);
+    }
+
     #[test]
     fn empty_open_handle_candidate_set_is_complete_without_a_snapshot() {
         let (open, complete) = open_handle_evidence_for_paths(&[]);
@@ -8281,6 +8513,11 @@ mod tests {
             .iter()
             .find(|dir| dir.path == idle)
             .context("missing idle .next entry")?;
+        if !idle.ownership_evidence_complete {
+            assert_eq!(idle.action, GeneratedDirAction::Skip);
+            assert!(idle.in_use);
+            return Ok(());
+        }
         assert_eq!(idle.action, GeneratedDirAction::Delete);
         assert!(!idle.in_use);
         Ok(())
