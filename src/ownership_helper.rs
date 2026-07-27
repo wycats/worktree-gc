@@ -1,13 +1,15 @@
+#[cfg(any(unix, test))]
 use crate::ownership_protocol::{
-    read_message, write_message, OwnershipRequest, OwnershipResponse, WirePath, MAX_REQUEST_ROOTS,
-    OWNERSHIP_PROTOCOL_VERSION,
+    read_message, write_message, OwnershipRequest, WirePath, MAX_REQUEST_ROOTS,
 };
 #[cfg(any(target_os = "macos", test))]
 use crate::ownership_protocol::{OwnershipObservation, OwnershipPathKind};
-use anyhow::{bail, ensure, Context, Result};
+use crate::ownership_protocol::{OwnershipResponse, OWNERSHIP_PROTOCOL_VERSION};
+use anyhow::{bail, Result};
+#[cfg(any(unix, test))]
+use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(any(target_os = "macos", test))]
 use std::fs;
@@ -21,6 +23,8 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const HELPER_LABEL: &str = "com.wycats.worktree-gc.ownership-helper";
 pub const DEFAULT_HELPER_BINARY: &str =
@@ -33,6 +37,7 @@ pub const DEFAULT_HELPER_SOCKET: &str =
     "/Library/Application Support/worktree-gc/run/ownership.sock";
 #[cfg(any(target_os = "macos", test))]
 const HELPER_CONFIG_VERSION: u64 = 1;
+#[cfg(unix)]
 const HELPER_IO_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(target_os = "macos")]
 const MAX_MATCHED_OBSERVATIONS: usize = 250_000;
@@ -324,6 +329,7 @@ fn canonical_config_roots(config: &HelperConfig) -> Result<Vec<PathBuf>> {
     Ok(roots)
 }
 
+#[cfg(unix)]
 fn validate_response(request: &OwnershipRequest, response: &OwnershipResponse) -> Result<()> {
     ensure!(
         response.protocol_version == OWNERSHIP_PROTOCOL_VERSION,
@@ -830,6 +836,7 @@ fn service_loaded() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+#[cfg(unix)]
 fn request_id() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
