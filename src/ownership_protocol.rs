@@ -13,6 +13,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 pub const OWNERSHIP_PROTOCOL_VERSION: u64 = 2;
 pub const MAX_REQUEST_ROOTS: usize = 2_048;
 pub const MAX_PROTOCOL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const PRIVILEGED_OWNERSHIP_BACKEND: &str = "macos_privileged_lsof_global";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WirePath {
@@ -92,7 +93,7 @@ impl OwnershipResponse {
         Self {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id,
-            backend: "macos_privileged_libproc".to_string(),
+            backend: PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
             helper_build_sha256: None,
             complete: false,
             error: Some(error.into()),

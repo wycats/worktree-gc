@@ -108,7 +108,11 @@ current user. Release archives for macOS therefore also contain
 cleanup command and cannot delete a generated tree. It accepts bounded
 ownership requests from one configured local UID, verifies every requested path
 against a root-owned canonical allowlist, and returns only matching cwd, root,
-mapped-file, and open-file observations.
+mapped-file, and open-file observations. The root-owned service captures one
+machine-readable global snapshot with `/usr/sbin/lsof`, rejects nonzero status
+or warning output, and filters the complete snapshot to the requested roots.
+This supplies evidence for processes that ordinary-user inspection cannot see
+without granting the cleanup controller root authority.
 
 Install the helper explicitly from an extracted release archive:
 
@@ -477,7 +481,8 @@ containing that snapshot's exact candidate and worktree roots. If the socket is
 unavailable, authentication or protocol validation fails, or the helper reports
 incomplete evidence, the corresponding routine repository is skipped or the
 pressure epoch stops. Strict helper mode never falls back to unprivileged
-`libproc` or `lsof`, and configuration requires `cleanup.check_in_use = true`.
+`libproc` or `lsof`; its root-owned global `lsof` snapshot is the required
+backend, and configuration requires `cleanup.check_in_use = true`.
 Aggregate execution metrics record the helper backend,
 protocol version, helper executable SHA-256, requested-root count, observation
 count, duration, completeness, and any refusal.

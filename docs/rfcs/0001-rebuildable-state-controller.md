@@ -364,9 +364,11 @@ an arbitrary TTL.
 
 The deletion controller remains unprivileged. On macOS, a separate minimal
 LaunchDaemon may provide process-path evidence that the current user cannot
-observe through `libproc`. Its protocol is versioned, bounded, scoped to
-canonical roots from a root-owned allowlist, and authenticated by peer UID. The
-helper returns only ownership evidence; it has no protection, planning,
+observe. The root-owned service captures one machine-readable global
+`/usr/sbin/lsof` snapshot and fails closed on nonzero status or warning output,
+then filters that complete evidence to canonical roots from a root-owned
+allowlist. Its protocol is versioned, bounded, and authenticated by peer UID.
+The helper returns only ownership evidence; it has no protection, planning,
 quarantine, or deletion operation.
 
 The helper ships independently of cleanup integration. Scheduled policy may
@@ -374,9 +376,9 @@ select `auto`, `privileged_helper`, or `global_lsof`. The backward-compatible
 `auto` mode retains native enumeration and its existing fallback. Required
 `privileged_helper` mode routes the initial plan, each routine-repository
 snapshot, and each bounded pressure epoch through one helper request and never
-falls back. If the helper is unavailable, rejects the roots, exceeds a bound,
-or returns incomplete evidence, the routine repository is skipped or the
-pressure epoch stops.
+falls back to ordinary-user evidence. If the helper is unavailable, rejects the
+roots, exceeds a bound, or returns incomplete evidence, the routine repository
+is skipped or the pressure epoch stops.
 
 The client still revalidates containment, tracked content, source identity,
 measurement, protection, mount boundaries, Cargo locks, quarantine, and source
