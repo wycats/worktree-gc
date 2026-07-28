@@ -946,7 +946,7 @@ fn plan_cleanup_with_protections_in_roots(
             generated_days: options.generated_days,
             generated_activity_only: options.generated_activity_only,
             check_in_use: options.check_in_use,
-            check_worktree_in_use: false,
+            check_worktree_in_use: options.check_in_use,
             open_handle_snapshot: open_handles,
             now: options.now,
             pressure: options.pressure.as_ref(),
@@ -4125,12 +4125,18 @@ fn scan_generated_dirs_for_worktree(
                 GeneratedDirAction::Skip,
                 "owner-free pressure cleanup requires complete ownership evidence".to_string(),
             )
+        } else if policy.check_worktree_in_use && !ownership_evidence_complete {
+            (
+                GeneratedDirAction::Skip,
+                "routine generated cleanup requires complete worktree ownership evidence"
+                    .to_string(),
+            )
         } else if in_use {
             (
                 GeneratedDirAction::Skip,
                 "a running process has open files in this directory".to_string(),
             )
-        } else if owner_free_pressure_candidate && worktree_in_use {
+        } else if worktree_in_use {
             if has_sweep_work {
                 let descriptions = sweeps
                     .iter()
@@ -5859,20 +5865,17 @@ fn execute_cleanup(
     } else {
         HashSet::new()
     };
-    let owner_free_worktrees = generated_deletions
+    let generated_worktrees = generated_deletions
         .iter()
-        .filter(|decision| decision.owner_free_pressure)
         .map(|decision| decision.worktree_path.clone())
         .collect::<HashSet<_>>();
     let execution_owned_worktrees = if manifest.check_in_use {
         dirs_with_open_handles(
-            owner_free_worktrees.iter().map(PathBuf::as_path),
+            generated_worktrees.iter().map(PathBuf::as_path),
             execution_open_handles,
         )
     } else {
-        // An owner-free decision must never survive a malformed or stale
-        // manifest that omitted the ownership recheck.
-        owner_free_worktrees
+        HashSet::new()
     };
 
     eprintln!(
@@ -5915,9 +5918,7 @@ fn execute_cleanup(
         if decision.action != GeneratedDirAction::Delete {
             continue;
         }
-        if decision.owner_free_pressure
-            && execution_owned_worktrees.contains(&decision.worktree_path)
-        {
+        if execution_owned_worktrees.contains(&decision.worktree_path) {
             eprintln!(
                 "  keeping {} because its worktree has current or incomplete ownership evidence",
                 decision.path.display()
@@ -9284,7 +9285,10 @@ mod tests {
         execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
 
         assert!(generated.exists());
-        assert!(!idle.exists());
+        assert!(
+            idle.exists(),
+            "routine cleanup must retain every whole-directory candidate in an owned worktree"
+        );
         Ok(())
     }
 
@@ -10872,7 +10876,7 @@ mod tests {
     }
 
     #[test]
-    fn routine_execution_retains_a_candidate_opened_during_refresh() -> Result<()> {
+    fn routine_execution_retains_a_candidate_when_its_worktree_becomes_owned() -> Result<()> {
         let (temp, repo) = init_repo()?;
         let repo = fs::canonicalize(repo)?;
         let candidate = repo.join(".turbo");
@@ -10885,14 +10889,16 @@ mod tests {
         set_mtime(&candidate, stale)?;
         let candidate = fs::canonicalize(candidate)?;
         let aggregate_manifest = temp.path().join("aggregate.json");
+        let owned_path = repo.join("src/held.rs");
+        let owned_worktree = repo.clone();
         let capture = |_: &[PathBuf], phase: &str, metrics: &mut ExecutionMetrics| {
             let observations = if phase.starts_with("routine_execute:") {
                 vec![ProcessOwnershipObservation {
                     pid: Some(42),
                     command: Some("fixture".to_string()),
                     evidence_kind: ProcessOwnershipEvidenceKind::ProcessCwd,
-                    observed_path: candidate.clone(),
-                    matched_path: candidate.clone(),
+                    observed_path: owned_path.clone(),
+                    matched_path: owned_worktree.clone(),
                 }]
             } else {
                 Vec::new()
@@ -12242,7 +12248,7 @@ mod tests {
     }
 
     #[test]
-    fn routine_pressure_does_not_evaluate_owner_free_worktree_ownership() -> Result<()> {
+    fn routine_cleanup_keeps_generated_dirs_in_owned_worktrees() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         fs::create_dir_all(repo.join("node_modules/pkg"))?;
         fs::write(repo.join("node_modules/pkg/index.js"), "recent\n")?;
@@ -12291,8 +12297,12 @@ mod tests {
             .iter()
             .find(|decision| decision.name == "node_modules")
             .context("missing node_modules decision")?;
-        assert!(!decision.worktree_in_use);
+        assert_eq!(decision.action, GeneratedDirAction::Skip);
+        assert!(decision.worktree_in_use);
         assert!(!decision.owner_free_pressure);
+        assert!(decision
+            .reason
+            .contains("worktree has current process ownership"));
         Ok(())
     }
 
@@ -12349,7 +12359,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_free_pressure_does_not_block_expired_generated_dirs_owned_elsewhere() -> Result<()> {
+    fn routine_cleanup_does_not_delete_expired_generated_dirs_from_owned_worktrees() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let package = repo.join("node_modules/pkg");
         fs::create_dir_all(&package)?;
@@ -12396,12 +12406,12 @@ mod tests {
             .iter()
             .find(|decision| decision.name == "node_modules")
             .context("missing node_modules decision")?;
-        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert_eq!(decision.action, GeneratedDirAction::Skip);
         assert_eq!(decision.cleanup_class, CleanupClass::Routine);
-        assert!(!decision.worktree_in_use);
+        assert!(decision.worktree_in_use);
         assert!(!decision.owner_free_pressure);
         execute_cleanup_manifest(&run.manifest, ExecutionPass::Routine)?;
-        assert!(!repo.join("node_modules").exists());
+        assert!(repo.join("node_modules").exists());
         Ok(())
     }
 
