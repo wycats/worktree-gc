@@ -5850,6 +5850,20 @@ fn execute_cleanup(
         })
         .collect::<Vec<_>>();
     sort_generated_deletions(&mut generated_deletions, pass);
+    let routine_sweep_candidates = if pass == ExecutionPass::Routine {
+        manifest
+            .generated_dirs
+            .iter()
+            .filter(|decision| {
+                decision.sweeps.iter().any(SweepDecision::has_work)
+                    && (decision.action == GeneratedDirAction::Sweep
+                        || (decision.action == GeneratedDirAction::Delete
+                            && decision.cleanup_class == CleanupClass::Pressure))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let run_id = format!(
         "{}-{}",
         manifest.generated_at.replace([':', '.'], "-"),
@@ -5864,11 +5878,18 @@ fn execute_cleanup(
     } else {
         None
     };
+    let execution_generated_paths = generated_deletions
+        .iter()
+        .map(|decision| decision.path.clone())
+        .chain(
+            routine_sweep_candidates
+                .iter()
+                .map(|decision| decision.path.clone()),
+        )
+        .collect::<HashSet<_>>();
     let execution_open_generated_dirs = if manifest.check_in_use {
         dirs_with_open_handles(
-            generated_deletions
-                .iter()
-                .map(|decision| decision.path.as_path()),
+            execution_generated_paths.iter().map(PathBuf::as_path),
             execution_open_handles,
         )
     } else {
@@ -5884,7 +5905,11 @@ fn execute_cleanup(
             execution_open_handles,
         )
     } else {
-        HashSet::new()
+        generated_deletions
+            .iter()
+            .filter(|decision| decision.owner_free_pressure)
+            .map(|decision| decision.worktree_path.clone())
+            .collect()
     };
     let generated_sweeps = if pass == ExecutionPass::Routine {
         manifest
@@ -5892,6 +5917,7 @@ fn execute_cleanup(
             .iter()
             .filter(|decision| {
                 decision.sweeps.iter().any(SweepDecision::has_work)
+                    && !execution_open_generated_dirs.contains(&decision.path)
                     && (decision.action == GeneratedDirAction::Sweep
                         || (decision.action == GeneratedDirAction::Delete
                             && (decision.cleanup_class == CleanupClass::Pressure
@@ -11111,6 +11137,163 @@ mod tests {
             incremental_root.exists(),
             "direct candidate ownership must suppress both wholesale deletion and fallback sweeps"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn routine_execution_suppresses_a_planned_sweep_that_becomes_owned() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let repo = fs::canonicalize(repo)?;
+        let (candidate, dep_graph) = create_stale_incremental_target(&repo)?;
+        let incremental_root = dep_graph
+            .parent()
+            .and_then(Path::parent)
+            .context("incremental fixture has no root directory")?
+            .to_path_buf();
+        let candidate = fs::canonicalize(candidate)?;
+        let incremental_root = fs::canonicalize(incremental_root)?;
+        let aggregate_manifest = temp.path().join("aggregate.json");
+        let owned_candidate = candidate.clone();
+        let capture = |_: &[PathBuf], phase: &str, metrics: &mut ExecutionMetrics| {
+            let observations = if phase.starts_with("routine_execute:") {
+                vec![ProcessOwnershipObservation {
+                    pid: Some(42),
+                    command: Some("fixture".to_string()),
+                    evidence_kind: ProcessOwnershipEvidenceKind::OpenFile,
+                    observed_path: dep_graph.clone(),
+                    matched_path: owned_candidate.clone(),
+                }]
+            } else {
+                Vec::new()
+            };
+            record_execution_ownership(
+                phase,
+                1,
+                ProcessOwnershipEvidence {
+                    observed_at_unix: 1_800_000_000,
+                    backend: "fixture".to_string(),
+                    protocol_version: None,
+                    helper_build_sha256: None,
+                    complete: true,
+                    error: None,
+                    observations,
+                },
+                Duration::from_millis(1),
+                metrics,
+            )
+        };
+        let run = cleanup_repositories_with_capture(
+            std::slice::from_ref(&repo),
+            std::slice::from_ref(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::from_names_with_default_sweeps(
+                    false,
+                    false,
+                    vec!["target".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                    vec![SweepStrategy {
+                        name: "target".to_string(),
+                        tool: SweepTool::RustcIncremental,
+                        limit: SweepLimit::AgeDays { days: 7 },
+                    }],
+                ),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+            &capture,
+            &|manifest| {
+                fs::write(&aggregate_manifest, serde_json::to_vec_pretty(manifest)?)?;
+                Ok(aggregate_manifest.clone())
+            },
+        )?;
+
+        assert!(candidate.exists());
+        assert!(
+            incremental_root.exists(),
+            "a planned sweep must be suppressed when its candidate becomes directly owned"
+        );
+        assert_eq!(
+            run.manifest
+                .execution_metrics
+                .as_ref()
+                .context("execution metrics are absent")?
+                .ownership_snapshots,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn owner_free_execution_fails_closed_when_ownership_checks_are_disabled() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let candidate = repo.join("node_modules/pkg");
+        fs::create_dir_all(&candidate)?;
+        fs::write(candidate.join("index.js"), "fixture")?;
+        let stale = unix_days_before_now(30);
+        for path in [
+            candidate.join("index.js"),
+            candidate,
+            repo.join("node_modules"),
+        ] {
+            set_mtime(&path, stale)?;
+        }
+        let repo = fs::canonicalize(repo)?;
+        let mut run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: false,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: Some(PressurePolicy {
+                    enter_bytes: u64::MAX - 1,
+                    target_bytes: u64::MAX,
+                    generated_days: 1,
+                    stale_days: 14,
+                    owner_free_generated: false,
+                    active: true,
+                    entered_filesystems: Vec::new(),
+                }),
+                pull_requests: None,
+                now: now(),
+            },
+            &[],
+            None,
+        )?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter_mut()
+            .find(|decision| decision.name == "node_modules")
+            .context("missing node_modules decision")?;
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        decision.cleanup_class = CleanupClass::Pressure;
+        decision.owner_free_pressure = true;
+        run.manifest
+            .pressure
+            .as_mut()
+            .context("missing pressure policy")?
+            .owner_free_generated = true;
+
+        execute_cleanup_manifest(
+            &run.manifest,
+            ExecutionPass::PressureGenerated(generated_rebuild_rank("node_modules")),
+        )?;
+
+        assert!(repo.join("node_modules").exists());
         Ok(())
     }
 
