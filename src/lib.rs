@@ -4095,21 +4095,34 @@ fn scan_generated_dirs_for_worktree(
             && candidate.action == GeneratedCandidateAction::Delete
             && !has_tracked_files;
         let sweep_strategies = config.sweep_strategies_for(&candidate.path, &candidate.name);
+        let fallback_sweep_only = policy.check_worktree_in_use
+            && !routine_active
+            && candidate.action != GeneratedCandidateAction::SweepOnly;
         let sweeps = if candidate.action != GeneratedCandidateAction::ReportOnly
             && protection.is_none()
             && (routine_active
                 || candidate.action == GeneratedCandidateAction::SweepOnly
-                || policy.check_worktree_in_use)
+                || fallback_sweep_only)
             && !has_tracked_files
             && !sweep_strategies.is_empty()
         {
-            plan_sweep_decisions(
+            match plan_sweep_decisions(
                 &candidate.path,
                 &worktree.path,
                 sweep_strategies,
                 policy.now,
                 policy.open_handle_snapshot,
-            )?
+            ) {
+                Ok(sweeps) => sweeps,
+                Err(error) if fallback_sweep_only => {
+                    eprintln!(
+                        "warning: could not prepare an optional execution-time sweep fallback for {}: {error:#}",
+                        candidate.path.display()
+                    );
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             Vec::new()
         };
@@ -5882,7 +5895,8 @@ fn execute_cleanup(
                     && (decision.action == GeneratedDirAction::Sweep
                         || (decision.action == GeneratedDirAction::Delete
                             && (decision.cleanup_class == CleanupClass::Pressure
-                                || execution_owned_worktrees.contains(&decision.worktree_path))))
+                                || (execution_owned_worktrees.contains(&decision.worktree_path)
+                                    && !execution_open_generated_dirs.contains(&decision.path)))))
             })
             .collect::<Vec<_>>()
     } else {
@@ -10996,6 +11010,160 @@ mod tests {
                 .ownership_snapshots,
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn routine_execution_does_not_sweep_a_directly_owned_candidate() -> Result<()> {
+        let (temp, repo) = init_repo()?;
+        let repo = fs::canonicalize(repo)?;
+        let (candidate, dep_graph) = create_stale_incremental_target(&repo)?;
+        let incremental_session = dep_graph
+            .parent()
+            .context("incremental fixture has no session directory")?
+            .to_path_buf();
+        let incremental_root = incremental_session
+            .parent()
+            .context("incremental fixture has no root directory")?
+            .to_path_buf();
+        let stale = system_time_to_unix(SystemTime::now())
+            .context("system time does not fit in Unix time")?
+            - 30 * 86_400;
+        for path in [
+            dep_graph.clone(),
+            incremental_session,
+            incremental_root.clone(),
+            candidate.join("debug/incremental"),
+            candidate.join("debug/.cargo-lock"),
+            candidate.join("debug"),
+            candidate.clone(),
+        ] {
+            set_mtime(&path, stale)?;
+        }
+        let candidate = fs::canonicalize(candidate)?;
+        let incremental_root = fs::canonicalize(incremental_root)?;
+        let aggregate_manifest = temp.path().join("aggregate.json");
+        let owned_candidate = candidate.clone();
+        let capture = |_: &[PathBuf], phase: &str, metrics: &mut ExecutionMetrics| {
+            let observations = if phase.starts_with("routine_execute:") {
+                vec![ProcessOwnershipObservation {
+                    pid: Some(42),
+                    command: Some("fixture".to_string()),
+                    evidence_kind: ProcessOwnershipEvidenceKind::OpenFile,
+                    observed_path: dep_graph.clone(),
+                    matched_path: owned_candidate.clone(),
+                }]
+            } else {
+                Vec::new()
+            };
+            record_execution_ownership(
+                phase,
+                1,
+                ProcessOwnershipEvidence {
+                    observed_at_unix: 1_800_000_000,
+                    backend: "fixture".to_string(),
+                    protocol_version: None,
+                    helper_build_sha256: None,
+                    complete: true,
+                    error: None,
+                    observations,
+                },
+                Duration::from_millis(1),
+                metrics,
+            )
+        };
+        cleanup_repositories_with_capture(
+            std::slice::from_ref(&repo),
+            std::slice::from_ref(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 14,
+                generated_days: 0,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::from_names_with_default_sweeps(
+                    false,
+                    false,
+                    vec!["target".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                    vec![SweepStrategy {
+                        name: "target".to_string(),
+                        tool: SweepTool::RustcIncremental,
+                        limit: SweepLimit::AgeDays { days: 7 },
+                    }],
+                ),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+            &capture,
+            &|manifest| {
+                fs::write(&aggregate_manifest, serde_json::to_vec_pretty(manifest)?)?;
+                Ok(aggregate_manifest.clone())
+            },
+        )?;
+
+        assert!(candidate.exists());
+        assert!(
+            incremental_root.exists(),
+            "direct candidate ownership must suppress both wholesale deletion and fallback sweeps"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn optional_fallback_sweep_failure_does_not_block_stale_deletion() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        fs::write(repo.join("Cargo.toml"), "not valid TOML")?;
+        let target = repo.join("target/debug");
+        fs::create_dir_all(&target)?;
+        fs::write(target.join("artifact"), "fixture")?;
+        let stale = unix_days_before_now(30);
+        for path in [target.join("artifact"), target.clone(), repo.join("target")] {
+            set_mtime(&path, stale)?;
+        }
+        let repo = fs::canonicalize(repo)?;
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: false,
+                stale_days: 14,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::from_names_with_default_sweeps(
+                    false,
+                    false,
+                    vec!["target".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                    vec![SweepStrategy {
+                        name: "target".to_string(),
+                        tool: SweepTool::RustcIncremental,
+                        limit: SweepLimit::AgeDays { days: 7 },
+                    }],
+                ),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+        )?;
+        let decision = run
+            .manifest
+            .generated_dirs
+            .iter()
+            .find(|decision| decision.name == "target")
+            .context("missing target decision")?;
+
+        assert_eq!(decision.action, GeneratedDirAction::Delete);
+        assert!(decision.sweeps.is_empty());
         Ok(())
     }
 
