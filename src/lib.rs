@@ -25,7 +25,9 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -100,6 +102,10 @@ const GENERATED_MEASUREMENT_MAX_ENTRIES: u64 = 2_000_000;
 const GENERATED_MEASUREMENT_MAX_ENTRIES_PER_CANDIDATE: u64 = 250_000;
 const PRESSURE_EPOCH_MAX_CANDIDATES: usize = 25;
 const PRESSURE_EPOCH_MAX_DURATION: Duration = Duration::from_secs(30);
+#[cfg(unix)]
+const LSOF_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
+const MAX_LSOF_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct TriageOptions {
@@ -4635,7 +4641,7 @@ fn capture_privileged_helper_raw_with(
     }
 
     RawOwnershipCapture {
-        backend: "macos_privileged_libproc",
+        backend: ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND,
         protocol_version,
         helper_build_sha256,
         complete: true,
@@ -4648,7 +4654,7 @@ fn capture_privileged_helper_raw_with(
 fn privileged_helper_response_to_raw(
     response: ownership_protocol::OwnershipResponse,
 ) -> RawOwnershipCapture {
-    if response.backend != "macos_privileged_libproc" {
+    if response.backend != ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND {
         return incomplete_privileged_helper_capture(format!(
             "privileged ownership helper returned unexpected backend {:?}",
             response.backend
@@ -4667,7 +4673,7 @@ fn privileged_helper_response_to_raw(
         Vec::new()
     };
     RawOwnershipCapture {
-        backend: "macos_privileged_libproc",
+        backend: ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND,
         protocol_version: Some(response.protocol_version),
         helper_build_sha256: response.helper_build_sha256,
         complete: response.complete,
@@ -4679,7 +4685,7 @@ fn privileged_helper_response_to_raw(
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn incomplete_privileged_helper_capture(error: String) -> RawOwnershipCapture {
     RawOwnershipCapture {
-        backend: "macos_privileged_libproc",
+        backend: ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND,
         protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
         helper_build_sha256: None,
         complete: false,
@@ -4830,18 +4836,132 @@ fn capture_global_lsof_raw(prior_error: Option<String>) -> RawOwnershipCapture {
 
 #[cfg(unix)]
 fn run_lsof_raw(args: &[&str]) -> io::Result<Vec<RawProcessOwnershipObservation>> {
-    let output = Command::new("lsof")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()?;
-    if let Some(error) = lsof_probe_error(
-        output.status.success(),
-        output.status.code(),
-        &output.stderr,
-    ) {
+    #[cfg(target_os = "macos")]
+    let executable = "/usr/sbin/lsof";
+    #[cfg(not(target_os = "macos"))]
+    let executable = "lsof";
+    let (status, stdout, stderr) = run_bounded_command_capture(
+        executable,
+        args,
+        LSOF_CAPTURE_TIMEOUT,
+        MAX_LSOF_CAPTURE_BYTES,
+    )?;
+    if let Some(error) = lsof_probe_error(status.success(), status.code(), &stderr) {
         return Err(error);
     }
-    Ok(parse_lsof_process_ownership(&output.stdout))
+    Ok(parse_lsof_process_ownership(&stdout))
+}
+
+#[cfg(unix)]
+fn run_bounded_command_capture(
+    executable: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_bytes: u64,
+) -> io::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let mut stdout = anonymous_command_capture_file()?;
+    let mut stderr = anonymous_command_capture_file()?;
+    let mut child = Command::new(executable)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .spawn()?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some((stream, length)) = oversized_command_capture(&stdout, &stderr, max_bytes)? {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!(
+                "command {stream} was {length} bytes; limit is {max_bytes}"
+            )));
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{executable} exceeded its {timeout:?} time limit"),
+            ));
+        }
+        std::thread::sleep((timeout - elapsed).min(Duration::from_millis(10)));
+    };
+    let stdout = read_bounded_command_file(&mut stdout, "stdout", max_bytes)?;
+    let stderr = read_bounded_command_file(&mut stderr, "stderr", max_bytes)?;
+    Ok((status, stdout, stderr))
+}
+
+#[cfg(unix)]
+fn oversized_command_capture(
+    stdout: &fs::File,
+    stderr: &fs::File,
+    max_bytes: u64,
+) -> io::Result<Option<(&'static str, u64)>> {
+    let stdout_length = stdout.metadata()?.len();
+    if stdout_length > max_bytes {
+        return Ok(Some(("stdout", stdout_length)));
+    }
+    let stderr_length = stderr.metadata()?.len();
+    if stderr_length > max_bytes {
+        return Ok(Some(("stderr", stderr_length)));
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn anonymous_command_capture_file() -> io::Result<fs::File> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..128 {
+        let path = std::env::temp_dir().join(format!(
+            ".worktree-gc-command-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                fs::remove_file(path)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "failed to create a unique anonymous command capture file",
+    ))
+}
+
+#[cfg(unix)]
+fn read_bounded_command_file(
+    file: &mut fs::File,
+    stream: &str,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    let length = file.metadata()?.len();
+    if length > max_bytes {
+        return Err(io::Error::other(format!(
+            "command {stream} was {length} bytes; limit is {max_bytes}"
+        )));
+    }
+    file.rewind()?;
+    let capacity = usize::try_from(length)
+        .map_err(|_| io::Error::other("command output length exceeds usize"))?;
+    let mut contents = Vec::with_capacity(capacity);
+    file.read_to_end(&mut contents)?;
+    Ok(contents)
 }
 
 #[cfg(unix)]
@@ -4954,7 +5074,9 @@ fn process_ownership_evidence_for_paths_with_policy(
             observed_at_unix,
             backend: match policy.macos_backend {
                 MacosOwnershipBackend::Auto => "macos_libproc",
-                MacosOwnershipBackend::PrivilegedHelper => "macos_privileged_libproc",
+                MacosOwnershipBackend::PrivilegedHelper => {
+                    ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND
+                }
                 MacosOwnershipBackend::GlobalLsof => "lsof_global",
             }
             .to_string(),
@@ -4991,7 +5113,7 @@ fn process_ownership_evidence_for_paths_with_policy(
         .as_secs();
     let capture = match policy.macos_backend {
         MacosOwnershipBackend::PrivilegedHelper => RawOwnershipCapture {
-            backend: "macos_privileged_libproc",
+            backend: ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND,
             protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
             helper_build_sha256: None,
             complete: false,
@@ -5043,7 +5165,9 @@ fn process_ownership_evidence_for_paths_with_policy(
             .unwrap_or_default()
             .as_secs(),
         backend: match policy.macos_backend {
-            MacosOwnershipBackend::PrivilegedHelper => "macos_privileged_libproc",
+            MacosOwnershipBackend::PrivilegedHelper => {
+                ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND
+            }
             MacosOwnershipBackend::Auto | MacosOwnershipBackend::GlobalLsof => "unsupported",
         }
         .to_string(),
@@ -8667,7 +8791,7 @@ mod tests {
             || {
                 helper_calls.set(helper_calls.get() + 1);
                 RawOwnershipCapture {
-                    backend: "macos_privileged_libproc",
+                    backend: ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND,
                     protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
                     helper_build_sha256: None,
                     complete: false,
@@ -8681,7 +8805,10 @@ mod tests {
             },
         );
 
-        assert_eq!(capture.backend, "macos_privileged_libproc");
+        assert_eq!(
+            capture.backend,
+            ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND
+        );
         assert!(!capture.complete);
         assert_eq!(automatic_calls.get(), 0);
         assert_eq!(helper_calls.get(), 1);
@@ -8734,7 +8861,7 @@ mod tests {
                 Ok(OwnershipResponse {
                     protocol_version: ownership_protocol::OWNERSHIP_PROTOCOL_VERSION,
                     request_id: calls.get(),
-                    backend: "macos_privileged_libproc".to_string(),
+                    backend: ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
                     helper_build_sha256: Some(
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                             .to_string(),
@@ -8789,7 +8916,7 @@ mod tests {
                 Ok(OwnershipResponse {
                     protocol_version: ownership_protocol::OWNERSHIP_PROTOCOL_VERSION,
                     request_id: 1,
-                    backend: "macos_privileged_libproc".to_string(),
+                    backend: ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
                     helper_build_sha256: Some(
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                             .to_string(),
@@ -9182,6 +9309,48 @@ mod tests {
         )
         .is_some());
         assert!(lsof_probe_error(true, Some(0), b"").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ownership_command_kills_and_reaps_a_timeout() {
+        let error = run_bounded_command_capture(
+            "/bin/sh",
+            &["-c", "sleep 1"],
+            Duration::from_millis(10),
+            1024,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ownership_command_rejects_oversized_output() {
+        let error = run_bounded_command_capture(
+            "/bin/sh",
+            &["-c", "printf 12345; while :; do :; done"],
+            Duration::from_secs(1),
+            4,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("stdout was 5 bytes; limit is 4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ownership_command_rejects_oversized_stderr_while_running() {
+        let error = run_bounded_command_capture(
+            "/bin/sh",
+            &["-c", "printf 12345 >&2; while :; do :; done"],
+            Duration::from_secs(1),
+            4,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("stderr was 5 bytes; limit is 4"));
     }
 
     #[test]
@@ -10479,7 +10648,7 @@ mod tests {
             25,
             ProcessOwnershipEvidence {
                 observed_at_unix: 1_800_000_000,
-                backend: "macos_privileged_libproc".to_string(),
+                backend: ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
                 protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
                 helper_build_sha256: Some(helper_hash.to_string()),
                 complete: true,
@@ -10655,7 +10824,7 @@ mod tests {
                 paths.len(),
                 ProcessOwnershipEvidence {
                     observed_at_unix: 1_800_000_000,
-                    backend: "macos_privileged_libproc".to_string(),
+                    backend: ownership_protocol::PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
                     protocol_version: Some(ownership_protocol::OWNERSHIP_PROTOCOL_VERSION),
                     helper_build_sha256: complete.then(|| {
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

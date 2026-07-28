@@ -1,6 +1,7 @@
 #[cfg(any(unix, test))]
 use crate::ownership_protocol::{
     read_message, write_message, OwnershipRequest, OwnershipServiceMetadata, MAX_REQUEST_ROOTS,
+    PRIVILEGED_OWNERSHIP_BACKEND,
 };
 #[cfg(any(target_os = "macos", test))]
 use crate::ownership_protocol::{OwnershipObservation, OwnershipPathKind};
@@ -183,7 +184,7 @@ fn handle_connection(stream: &mut UnixStream, config: &HelperConfig) -> Result<(
         Ok(roots) if roots.is_empty() => OwnershipResponse {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: request.request_id,
-            backend: "macos_privileged_libproc".to_string(),
+            backend: PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
             helper_build_sha256: Some(helper_build_sha256),
             complete: true,
             error: None,
@@ -243,31 +244,32 @@ fn capture_privileged_ownership(
     roots: &[PathBuf],
     helper_build_sha256: String,
 ) -> OwnershipResponse {
-    let capture = match crate::macos_open_handles::capture_with_evidence() {
-        Ok(capture) => capture,
-        Err(error) => {
-            return OwnershipResponse::refusal(
-                request_id,
-                format!("privileged libproc capture failed: {error}"),
-            );
-        }
-    };
+    let capture = crate::capture_global_lsof_raw(None);
     privileged_response_from_capture(request_id, roots, capture, helper_build_sha256)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn privileged_response_from_capture(
     request_id: u64,
     roots: &[PathBuf],
-    capture: crate::macos_open_handles::Capture,
+    capture: crate::RawOwnershipCapture,
     helper_build_sha256: String,
 ) -> OwnershipResponse {
-    if !capture.permission_denied_pids.is_empty() {
+    if !capture.complete {
         return OwnershipResponse::refusal(
             request_id,
             format!(
-                "privileged libproc capture was incomplete for PIDs {:?}",
-                capture.permission_denied_pids
+                "privileged global lsof capture was incomplete: {}",
+                capture.error.as_deref().unwrap_or("unknown error")
+            ),
+        );
+    }
+    if capture.backend != "lsof_global" {
+        return OwnershipResponse::refusal(
+            request_id,
+            format!(
+                "privileged ownership capture returned unexpected backend {:?}",
+                capture.backend
             ),
         );
     }
@@ -279,7 +281,7 @@ fn privileged_response_from_capture(
         .collect::<HashMap<_, _>>();
     let mut observations = Vec::new();
     for observation in capture.observations {
-        for root_index in matching_root_indices(&observation.path, &root_indices) {
+        for root_index in matching_root_indices(&observation.observed_path, &root_indices) {
             let root = &roots[root_index];
             if observations.len() >= MAX_MATCHED_OBSERVATIONS {
                 return OwnershipResponse::refusal(
@@ -291,17 +293,22 @@ fn privileged_response_from_capture(
             }
             observations.push(OwnershipObservation {
                 pid: observation.pid,
-                kind: match observation.kind {
-                    crate::macos_open_handles::ProcessPathKind::Cwd => OwnershipPathKind::Cwd,
-                    crate::macos_open_handles::ProcessPathKind::Root => OwnershipPathKind::Root,
-                    crate::macos_open_handles::ProcessPathKind::MappedFile => {
+                kind: match observation.evidence_kind {
+                    crate::ProcessOwnershipEvidenceKind::ProcessCwd => OwnershipPathKind::Cwd,
+                    crate::ProcessOwnershipEvidenceKind::ProcessRoot => OwnershipPathKind::Root,
+                    crate::ProcessOwnershipEvidenceKind::MappedFile => {
                         OwnershipPathKind::MappedFile
                     }
-                    crate::macos_open_handles::ProcessPathKind::OpenFile => {
-                        OwnershipPathKind::OpenFile
+                    crate::ProcessOwnershipEvidenceKind::OpenFile
+                    | crate::ProcessOwnershipEvidenceKind::LsofPath => OwnershipPathKind::OpenFile,
+                    crate::ProcessOwnershipEvidenceKind::TestOverride => {
+                        return OwnershipResponse::refusal(
+                            request_id,
+                            "privileged ownership capture returned test-only evidence",
+                        );
                     }
                 },
-                observed_path: WirePath::from_path(&observation.path),
+                observed_path: WirePath::from_path(&observation.observed_path),
                 matched_root: WirePath::from_path(root),
             });
         }
@@ -309,7 +316,7 @@ fn privileged_response_from_capture(
     OwnershipResponse {
         protocol_version: OWNERSHIP_PROTOCOL_VERSION,
         request_id,
-        backend: "macos_privileged_libproc".to_string(),
+        backend: PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
         helper_build_sha256: Some(helper_build_sha256),
         complete: true,
         error: None,
@@ -433,6 +440,11 @@ fn validate_response(request: &OwnershipRequest, response: &OwnershipResponse) -
     ensure!(
         response.request_id == request.request_id,
         "ownership helper response id does not match request"
+    );
+    ensure!(
+        response.backend == PRIVILEGED_OWNERSHIP_BACKEND,
+        "ownership helper returned unexpected backend {:?}",
+        response.backend
     );
     if !response.complete {
         ensure!(
@@ -620,6 +632,7 @@ pub fn install(options: HelperInstallOptions) -> Result<()> {
             if service_loaded()? {
                 bootout_service()?;
             }
+            remove_helper_socket_if_present()?;
             restore_installation(&backup)?;
             if was_loaded {
                 bootstrap_service(helper_plist)?;
@@ -722,6 +735,23 @@ pub fn uninstall() -> Result<()> {
         }
     }
     remove_all_installation_backups()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_helper_socket_if_present() -> Result<()> {
+    let socket = Path::new(DEFAULT_HELPER_SOCKET);
+    let metadata = match fs::symlink_metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.file_type().is_socket() && metadata.uid() == 0,
+        "refusing to remove unexpected helper socket {}",
+        socket.display()
+    );
+    fs::remove_file(socket)?;
     Ok(())
 }
 
@@ -1182,37 +1212,60 @@ fn wait_for_service_socket(
     expected_roots: &[PathBuf],
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut last_probe_error = None;
     loop {
         if let Ok(metadata) = fs::symlink_metadata(socket) {
-            ensure!(
-                metadata.file_type().is_socket()
-                    && metadata.uid() == 0
-                    && metadata.mode() & 0o777 == 0o660,
-                "ownership helper created an unexpected socket at {}",
-                socket.display()
-            );
-            if let Ok(response) = probe_service_as_client(
-                helper_binary,
-                socket,
-                client_uid,
-                client_gid,
-                expected_roots,
-            ) {
-                ensure!(
-                    response.complete,
-                    "ownership helper readiness probe was incomplete: {}",
-                    response.error.as_deref().unwrap_or("unspecified error")
-                );
-                return Ok(());
+            if helper_socket_is_ready(
+                metadata.file_type().is_socket(),
+                metadata.uid(),
+                metadata.mode() & 0o777,
+            )? {
+                match probe_service_as_client(
+                    helper_binary,
+                    socket,
+                    client_uid,
+                    client_gid,
+                    expected_roots,
+                ) {
+                    Ok(response) => {
+                        ensure!(
+                            response.complete,
+                            "ownership helper readiness probe was incomplete: {}",
+                            response.error.as_deref().unwrap_or("unspecified error")
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => last_probe_error = Some(error),
+                }
+            } else {
+                last_probe_error = Some(anyhow::anyhow!(
+                    "ownership helper socket {} has transient mode {:o}, expected 660",
+                    socket.display(),
+                    metadata.mode() & 0o777
+                ));
             }
         }
-        ensure!(
-            std::time::Instant::now() < deadline,
-            "ownership helper did not become ready at {} within 5 seconds",
-            socket.display()
-        );
+        if std::time::Instant::now() >= deadline {
+            let mut error = anyhow::anyhow!(
+                "ownership helper did not become ready at {} within 5 seconds",
+                socket.display()
+            );
+            if let Some(last_probe_error) = last_probe_error {
+                error = error.context(format!("last readiness probe: {last_probe_error:#}"));
+            }
+            return Err(error);
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn helper_socket_is_ready(is_socket: bool, uid: u32, mode: u32) -> Result<bool> {
+    ensure!(
+        is_socket && uid == 0,
+        "ownership helper created an unexpected socket"
+    );
+    Ok(mode == 0o660)
 }
 
 #[cfg(target_os = "macos")]
@@ -1223,15 +1276,16 @@ fn probe_service_as_client(
     client_gid: u32,
     expected_roots: &[PathBuf],
 ) -> Result<OwnershipResponse> {
-    let output = Command::new(helper_binary)
+    let mut command = Command::new(helper_binary);
+    command
         .arg("probe")
         .arg("--socket")
         .arg(socket)
-        .uid(client_uid)
-        .gid(client_gid)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_client_identity(&mut command, client_uid, client_gid);
+    let output = command
         .output()
         .context("failed to run ownership helper readiness probe as the configured client")?;
     ensure!(
@@ -1265,6 +1319,58 @@ fn probe_service_as_client(
         "ownership helper readiness probe returned a different root allowlist"
     );
     Ok(response)
+}
+
+#[cfg(target_os = "macos")]
+fn configure_client_identity(command: &mut Command, client_uid: u32, client_gid: u32) {
+    // macOS setgid(2) can leave the effective GID unchanged, and CommandExt::uid
+    // clears supplementary groups. Drop every credential explicitly so the
+    // readiness child can authenticate as the configured client and access the
+    // root:group 0660 helper socket without retaining root authority.
+    unsafe {
+        command.pre_exec(move || drop_client_credentials(client_uid, client_gid));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn drop_client_credentials(client_uid: u32, client_gid: u32) -> std::io::Result<()> {
+    drop_client_credentials_with(
+        client_uid,
+        client_gid,
+        |groups| {
+            let result = unsafe {
+                libc::setgroups(
+                    groups.len().try_into().expect("one group fits in c_int"),
+                    groups.as_ptr(),
+                )
+            };
+            cvt_identity_call(result)
+        },
+        |real, effective| cvt_identity_call(unsafe { libc::setregid(real, effective) }),
+        |real, effective| cvt_identity_call(unsafe { libc::setreuid(real, effective) }),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn drop_client_credentials_with(
+    client_uid: u32,
+    client_gid: u32,
+    set_groups: impl FnOnce(&[u32]) -> std::io::Result<()>,
+    set_gids: impl FnOnce(u32, u32) -> std::io::Result<()>,
+    set_uids: impl FnOnce(u32, u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    set_groups(std::slice::from_ref(&client_gid))?;
+    set_gids(client_gid, client_gid)?;
+    set_uids(client_uid, client_uid)
+}
+
+#[cfg(target_os = "macos")]
+fn cvt_identity_call(result: libc::c_int) -> std::io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1358,6 +1464,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn readiness_child_sets_group_authority_before_dropping_user_identity() -> Result<()> {
+        let calls = std::cell::RefCell::new(Vec::new());
+        drop_client_credentials_with(
+            501,
+            20,
+            |groups| {
+                calls.borrow_mut().push(format!("groups:{groups:?}"));
+                Ok(())
+            },
+            |real, effective| {
+                calls.borrow_mut().push(format!("gids:{real}:{effective}"));
+                Ok(())
+            },
+            |real, effective| {
+                calls.borrow_mut().push(format!("uids:{real}:{effective}"));
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(
+            calls.into_inner(),
+            ["groups:[20]", "gids:20:20", "uids:501:501"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_retries_a_root_socket_until_owner_only_group_access_is_set() -> Result<()> {
+        assert!(!helper_socket_is_ready(true, 0, 0o755)?);
+        assert!(helper_socket_is_ready(true, 0, 0o660)?);
+        assert!(helper_socket_is_ready(false, 0, 0o660).is_err());
+        assert!(helper_socket_is_ready(true, 501, 0o660).is_err());
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_roots_are_canonical_and_deduplicated_before_persistence() -> Result<()> {
@@ -1425,7 +1567,7 @@ mod tests {
         let response = OwnershipResponse {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: 8,
-            backend: "macos_privileged_libproc".to_string(),
+            backend: PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
             helper_build_sha256: Some(TEST_HELPER_BUILD_SHA256.to_string()),
             complete: true,
             error: None,
@@ -1453,7 +1595,7 @@ mod tests {
         let response = OwnershipResponse {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: 82,
-            backend: "macos_privileged_libproc".to_string(),
+            backend: PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
             helper_build_sha256: None,
             complete: true,
             error: None,
@@ -1472,6 +1614,25 @@ mod tests {
         let response = OwnershipResponse {
             protocol_version: 1,
             request_id: 83,
+            backend: PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
+            helper_build_sha256: Some(TEST_HELPER_BUILD_SHA256.to_string()),
+            complete: true,
+            error: None,
+            observations: Vec::new(),
+            service: Some(OwnershipServiceMetadata {
+                client_uid: 501,
+                roots: vec![WirePath::from_path(Path::new("/tmp/allowed"))],
+            }),
+        };
+        assert!(validate_response(&request, &response).is_err());
+    }
+
+    #[test]
+    fn client_rejects_an_unexpected_helper_backend() {
+        let request = OwnershipRequest::new(84, &[]);
+        let response = OwnershipResponse {
+            protocol_version: OWNERSHIP_PROTOCOL_VERSION,
+            request_id: 84,
             backend: "macos_privileged_libproc".to_string(),
             helper_build_sha256: Some(TEST_HELPER_BUILD_SHA256.to_string()),
             complete: true,
@@ -1495,7 +1656,7 @@ mod tests {
         let response = OwnershipResponse {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: 81,
-            backend: "macos_privileged_libproc".to_string(),
+            backend: PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
             helper_build_sha256: Some(TEST_HELPER_BUILD_SHA256.to_string()),
             complete: true,
             error: None,
@@ -1570,7 +1731,7 @@ mod tests {
         let response = OwnershipResponse {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: 12,
-            backend: "macos_privileged_libproc".to_string(),
+            backend: PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
             helper_build_sha256: Some(TEST_HELPER_BUILD_SHA256.to_string()),
             complete: true,
             error: None,
@@ -1593,7 +1754,7 @@ mod tests {
         let response = OwnershipResponse {
             protocol_version: OWNERSHIP_PROTOCOL_VERSION,
             request_id: 13,
-            backend: "macos_privileged_libproc".to_string(),
+            backend: PRIVILEGED_OWNERSHIP_BACKEND.to_string(),
             helper_build_sha256: None,
             complete: false,
             error: Some("incomplete".to_string()),
@@ -1608,48 +1769,55 @@ mod tests {
         assert!(validate_response(&request, &response).is_err());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
     fn privileged_capture_returns_only_allowlisted_matches() {
-        use crate::macos_open_handles::{Capture, ProcessPathEvidence, ProcessPathKind};
-
         let roots = vec![PathBuf::from("/allowed/repo/target")];
         let response = privileged_response_from_capture(
             14,
             &roots,
-            Capture {
+            crate::RawOwnershipCapture {
+                backend: "lsof_global",
+                protocol_version: None,
+                helper_build_sha256: None,
+                complete: true,
+                error: None,
                 observations: vec![
-                    ProcessPathEvidence {
+                    crate::RawProcessOwnershipObservation {
                         pid: 7,
-                        path: roots[0].join("debug/app"),
-                        kind: ProcessPathKind::MappedFile,
+                        command: Some("fixture".to_string()),
+                        observed_path: roots[0].join("debug/app"),
+                        evidence_kind: crate::ProcessOwnershipEvidenceKind::MappedFile,
                     },
-                    ProcessPathEvidence {
+                    crate::RawProcessOwnershipObservation {
                         pid: 8,
-                        path: PathBuf::from("/outside/secret"),
-                        kind: ProcessPathKind::OpenFile,
+                        command: Some("fixture".to_string()),
+                        observed_path: PathBuf::from("/outside/secret"),
+                        evidence_kind: crate::ProcessOwnershipEvidenceKind::OpenFile,
                     },
                 ],
-                permission_denied_pids: Vec::new(),
             },
             TEST_HELPER_BUILD_SHA256.to_string(),
         );
         assert!(response.complete);
+        assert_eq!(response.backend, PRIVILEGED_OWNERSHIP_BACKEND);
         assert_eq!(response.observations.len(), 1);
         assert_eq!(response.observations[0].pid, 7);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
-    fn privileged_capture_rejects_any_permission_denial() {
-        use crate::macos_open_handles::Capture;
-
+    fn privileged_capture_rejects_incomplete_global_lsof_evidence() {
         let response = privileged_response_from_capture(
             15,
             &[PathBuf::from("/allowed")],
-            Capture {
+            crate::RawOwnershipCapture {
+                backend: "lsof_global",
+                protocol_version: None,
+                helper_build_sha256: None,
+                complete: false,
+                error: Some("permission warning".to_string()),
                 observations: Vec::new(),
-                permission_denied_pids: vec![1],
             },
             TEST_HELPER_BUILD_SHA256.to_string(),
         );
@@ -1658,7 +1826,31 @@ mod tests {
         assert!(response
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("PIDs [1]")));
+            .is_some_and(|error| error.contains("permission warning")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privileged_capture_rejects_an_unexpected_capture_backend() {
+        let response = privileged_response_from_capture(
+            16,
+            &[PathBuf::from("/allowed")],
+            crate::RawOwnershipCapture {
+                backend: "macos_libproc",
+                protocol_version: None,
+                helper_build_sha256: None,
+                complete: true,
+                error: None,
+                observations: Vec::new(),
+            },
+            TEST_HELPER_BUILD_SHA256.to_string(),
+        );
+        assert!(!response.complete);
+        assert!(response.observations.is_empty());
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unexpected backend")));
     }
 
     #[cfg(target_os = "macos")]
