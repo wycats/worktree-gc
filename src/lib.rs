@@ -4869,6 +4869,13 @@ fn run_bounded_command_capture(
         .spawn()?;
     let started = Instant::now();
     let status = loop {
+        if let Some((stream, length)) = oversized_command_capture(&stdout, &stderr, max_bytes)? {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!(
+                "command {stream} was {length} bytes; limit is {max_bytes}"
+            )));
+        }
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -4886,6 +4893,23 @@ fn run_bounded_command_capture(
     let stdout = read_bounded_command_file(&mut stdout, "stdout", max_bytes)?;
     let stderr = read_bounded_command_file(&mut stderr, "stderr", max_bytes)?;
     Ok((status, stdout, stderr))
+}
+
+#[cfg(unix)]
+fn oversized_command_capture(
+    stdout: &fs::File,
+    stderr: &fs::File,
+    max_bytes: u64,
+) -> io::Result<Option<(&'static str, u64)>> {
+    let stdout_length = stdout.metadata()?.len();
+    if stdout_length > max_bytes {
+        return Ok(Some(("stdout", stdout_length)));
+    }
+    let stderr_length = stderr.metadata()?.len();
+    if stderr_length > max_bytes {
+        return Ok(Some(("stderr", stderr_length)));
+    }
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -9306,13 +9330,27 @@ mod tests {
     fn bounded_ownership_command_rejects_oversized_output() {
         let error = run_bounded_command_capture(
             "/bin/sh",
-            &["-c", "printf 12345"],
+            &["-c", "printf 12345; while :; do :; done"],
             Duration::from_secs(1),
             4,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("stdout was 5 bytes; limit is 4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ownership_command_rejects_oversized_stderr_while_running() {
+        let error = run_bounded_command_capture(
+            "/bin/sh",
+            &["-c", "printf 12345 >&2; while :; do :; done"],
+            Duration::from_secs(1),
+            4,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("stderr was 5 bytes; limit is 4"));
     }
 
     #[test]
