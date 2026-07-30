@@ -7,17 +7,18 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use worktree_gc::{
     add_protection, cleanup, cleanup_repositories_with_ownership, cleanup_roots,
-    collect_codex_sessions, collect_generated, discover_repositories, execute_approved_generated,
-    gateway_storage_report, inventory, list_protections, print_cleanup,
-    print_codex_sessions_collect, print_gateway_storage_report, print_generated_collect,
-    print_inventory, print_root_cleanup, print_root_triage, print_triage, remove_protection,
-    renew_protection, triage, triage_roots, CleanupOptions, CodexSessionCollectOptions,
-    GatewayStorageOptions, GeneratedCollectOptions, GeneratedDirConfig, InventoryOptions,
-    OwnershipPolicy, PressurePolicy, PullRequestPolicy, SweepLimit, SweepStrategy, SweepTool,
-    TriageOptions, DEFAULT_CODEX_SESSION_MAX_ENTRIES, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES,
-    DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT, DEFAULT_GENERATED_DAYS,
-    DEFAULT_GENERATED_DELETE_NAMES, DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
-    DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS, MAX_PROTECTION_TTL_DAYS,
+    collect_codex_sessions, collect_generated, discover_repositories,
+    execute_approved_generated_with_ownership_policy, gateway_storage_report, inventory,
+    list_protections, print_cleanup, print_codex_sessions_collect, print_gateway_storage_report,
+    print_generated_collect, print_inventory, print_root_cleanup, print_root_triage, print_triage,
+    remove_protection, renew_protection, triage, triage_roots, CleanupOptions,
+    CodexSessionCollectOptions, GatewayStorageOptions, GeneratedCollectOptions, GeneratedDirConfig,
+    InventoryOptions, OwnershipPolicy, PressurePolicy, PullRequestPolicy, SweepLimit,
+    SweepStrategy, SweepTool, TriageOptions, DEFAULT_CODEX_SESSION_MAX_ENTRIES,
+    DEFAULT_GATEWAY_EXACT_MAX_ENTRIES, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT,
+    DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
+    DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    MAX_PROTECTION_TTL_DAYS,
 };
 
 #[derive(Debug, Parser)]
@@ -156,6 +157,13 @@ enum Command {
     },
     /// Execute exactly one approved owner-free generated candidate
     ExecuteGenerated {
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Use only this config's ownership backend for live execution checks"
+        )]
+        config: Option<PathBuf>,
+
         #[arg(long, value_name = "PATH")]
         manifest: PathBuf,
 
@@ -645,6 +653,16 @@ fn scheduled_ownership_policy(
     })
 }
 
+fn exact_execution_ownership_policy(config_path: Option<&Path>) -> Result<OwnershipPolicy> {
+    match config_path {
+        Some(path) => {
+            let (_, scheduled) = config::load(Some(path))?;
+            scheduled_ownership_policy(&scheduled.ownership, true)
+        }
+        None => Ok(OwnershipPolicy::default()),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let now = SystemTime::now();
@@ -803,6 +821,7 @@ fn main() -> Result<()> {
             }
         }
         Command::ExecuteGenerated {
+            config,
             manifest,
             approval_digest,
             candidate,
@@ -812,11 +831,13 @@ fn main() -> Result<()> {
                 repo.is_none() && roots.is_empty(),
                 "execute-generated consumes an approved manifest directly; do not pass --repo or --root"
             );
-            let run = execute_approved_generated(
+            let ownership_policy = exact_execution_ownership_policy(config.as_deref())?;
+            let run = execute_approved_generated_with_ownership_policy(
                 &manifest,
                 &approval_digest,
                 &candidate,
                 result.as_deref(),
+                &ownership_policy,
             )?;
             serde_json::to_writer_pretty(std::io::stdout().lock(), &run)?;
             println!();
@@ -1235,6 +1256,63 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn exact_generated_execution_accepts_an_ownership_config() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "execute-generated",
+            "--config",
+            "/tmp/worktree-gc.toml",
+            "--manifest",
+            "/tmp/manifest.json",
+            "--approval-digest",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--candidate",
+            "/tmp/repo/target",
+        ])
+        .expect("exact execution config should parse");
+
+        match cli.command {
+            Command::ExecuteGenerated {
+                config,
+                manifest,
+                candidate,
+                ..
+            } => {
+                assert_eq!(config, Some(PathBuf::from("/tmp/worktree-gc.toml")));
+                assert_eq!(manifest, PathBuf::from("/tmp/manifest.json"));
+                assert_eq!(candidate, PathBuf::from("/tmp/repo/target"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn exact_generated_execution_loads_only_the_configured_ownership_backend() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[cleanup]
+check_in_use = false
+
+[ownership]
+macos_backend = "global_lsof"
+helper_socket = "unused-helper.sock"
+"#,
+        )?;
+
+        let policy = exact_execution_ownership_policy(Some(&config_path))?;
+
+        assert_eq!(
+            policy.macos_backend,
+            worktree_gc::MacosOwnershipBackend::GlobalLsof
+        );
+        assert_eq!(policy.helper_socket, PathBuf::from("unused-helper.sock"));
+        Ok(())
     }
 
     #[test]

@@ -578,10 +578,17 @@ command. The approval digest is the SHA-256 of the manifest bytes:
 
 ```sh
 worktree-gc execute-generated \
+  --config /absolute/path/to/config.toml \
   --manifest /absolute/path/to/dry-run.json \
   --approval-digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --candidate /absolute/path/to/worktree/chat/.next
 ```
+
+The optional `--config` selects only the configured ownership backend for the
+fresh execution snapshots. It does not import roots, pressure thresholds,
+retention policy, or candidate authority from the config: the digest-bound
+manifest and exact candidate remain the complete deletion boundary. Omitting
+`--config` preserves the automatic backend.
 
 The command accepts a measured owner-free routine or pressure deletion. It requires
 complete ownership and APFS-private evidence, revalidates the candidate's

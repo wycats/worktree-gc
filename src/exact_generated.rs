@@ -1,8 +1,9 @@
 use crate::inventory::inventory_with_root_limit;
 use crate::{
-    cargo_profile_locks_present, generated_dir_identity, process_ownership_evidence_for_paths,
-    with_cargo_profile_locks_timeout, with_protection_guard_for_paths, CleanupClass, CleanupMode,
-    GeneratedDirAction, GeneratedDirIdentity, GeneratedDirMeasurement, InventoryOptions,
+    cargo_profile_locks_present, generated_dir_identity,
+    process_ownership_evidence_for_paths_with_policy, with_cargo_profile_locks_timeout,
+    with_protection_guard_for_paths, CleanupClass, CleanupMode, GeneratedDirAction,
+    GeneratedDirIdentity, GeneratedDirMeasurement, InventoryOptions, OwnershipPolicy,
     ProcessOwnershipEvidence, ProcessOwnershipEvidenceKind, ProcessOwnershipObservation,
     ProtectionGuardOutcome, MANIFEST_VERSION,
 };
@@ -20,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const APPROVAL_DIGEST_PREFIX: &str = "sha256:";
+type OwnershipOverride<'a> = dyn Fn(&OwnershipPolicy) -> (HashSet<PathBuf>, bool) + 'a;
 
 #[derive(Debug, Serialize)]
 pub struct ApprovedGeneratedExecutionRun {
@@ -165,11 +167,28 @@ pub fn execute_approved_generated(
     candidate: &Path,
     result_path: Option<&Path>,
 ) -> Result<ApprovedGeneratedExecutionRun> {
+    execute_approved_generated_with_ownership_policy(
+        manifest_path,
+        approval_digest,
+        candidate,
+        result_path,
+        &OwnershipPolicy::default(),
+    )
+}
+
+pub fn execute_approved_generated_with_ownership_policy(
+    manifest_path: &Path,
+    approval_digest: &str,
+    candidate: &Path,
+    result_path: Option<&Path>,
+    ownership_policy: &OwnershipPolicy,
+) -> Result<ApprovedGeneratedExecutionRun> {
     execute_approved_generated_with_ownership(
         manifest_path,
         approval_digest,
         candidate,
         result_path,
+        ownership_policy,
         None,
         None,
     )
@@ -180,7 +199,8 @@ fn execute_approved_generated_with_ownership(
     approval_digest: &str,
     candidate: &Path,
     result_path: Option<&Path>,
-    ownership_override: Option<&dyn Fn() -> (HashSet<PathBuf>, bool)>,
+    ownership_policy: &OwnershipPolicy,
+    ownership_override: Option<&OwnershipOverride<'_>>,
     measurement_override: Option<&GeneratedDirMeasurement>,
 ) -> Result<ApprovedGeneratedExecutionRun> {
     anyhow::ensure!(
@@ -377,6 +397,7 @@ fn execute_approved_generated_with_ownership(
     let ownership_paths = exact_ownership_paths(&worktree, active_path, &decision.name);
     validate_current_ownership(
         &ownership_paths,
+        ownership_policy,
         ownership_override,
         OwnershipRefusalContext {
             manifest_path,
@@ -414,6 +435,7 @@ fn execute_approved_generated_with_ownership(
         if let Some(lock_timeout) = target_lock_timeout {
             validate_current_ownership(
                 &ownership_paths,
+                ownership_policy,
                 ownership_override,
                 OwnershipRefusalContext {
                     manifest_path,
@@ -439,6 +461,7 @@ fn execute_approved_generated_with_ownership(
                     pressure_target_bytes,
                     recheck_ownership: true,
                     ownership_paths: &ownership_paths,
+                    ownership_policy,
                     ownership_override,
                     measurement_override,
                     manifest_path,
@@ -462,6 +485,7 @@ fn execute_approved_generated_with_ownership(
                 pressure_target_bytes,
                 recheck_ownership: true,
                 ownership_paths: &ownership_paths,
+                ownership_policy,
                 ownership_override,
                 measurement_override,
                 manifest_path,
@@ -884,13 +908,14 @@ struct OwnershipRefusalContext<'a> {
 
 fn validate_current_ownership(
     paths: &[PathBuf],
-    ownership_override: Option<&dyn Fn() -> (HashSet<PathBuf>, bool)>,
+    ownership_policy: &OwnershipPolicy,
+    ownership_override: Option<&OwnershipOverride<'_>>,
     context: OwnershipRefusalContext<'_>,
 ) -> Result<()> {
     let mut ownership = match ownership_override {
         Some(capture) => {
             let observed_at_unix = unix_seconds(SystemTime::now());
-            let (owned_paths, complete) = capture();
+            let (owned_paths, complete) = capture(ownership_policy);
             let mut observations = owned_paths
                 .into_iter()
                 .filter_map(|observed_path| {
@@ -919,7 +944,7 @@ fn validate_current_ownership(
                 observations,
             }
         }
-        None => process_ownership_evidence_for_paths(paths),
+        None => process_ownership_evidence_for_paths_with_policy(paths, ownership_policy),
     };
     ignore_executor_cargo_lock_ownership(&mut ownership, context.ignored_pid, context.candidate);
     if ownership.complete && ownership.observations.is_empty() {
@@ -1039,7 +1064,8 @@ struct CandidateExecution<'a> {
     pressure_target_bytes: Option<u64>,
     recheck_ownership: bool,
     ownership_paths: &'a [PathBuf],
-    ownership_override: Option<&'a dyn Fn() -> (HashSet<PathBuf>, bool)>,
+    ownership_policy: &'a OwnershipPolicy,
+    ownership_override: Option<&'a OwnershipOverride<'a>>,
     measurement_override: Option<&'a GeneratedDirMeasurement>,
     manifest_path: &'a Path,
     approval_digest: &'a str,
@@ -1096,6 +1122,7 @@ impl CandidateExecution<'_> {
         if self.recheck_ownership {
             validate_current_ownership(
                 self.ownership_paths,
+                self.ownership_policy,
                 self.ownership_override,
                 OwnershipRefusalContext {
                     manifest_path: self.manifest_path,
@@ -1339,11 +1366,11 @@ mod tests {
         measurement: GeneratedDirMeasurement,
     }
 
-    fn unowned_ownership() -> (HashSet<PathBuf>, bool) {
+    fn unowned_ownership(_: &OwnershipPolicy) -> (HashSet<PathBuf>, bool) {
         (HashSet::new(), true)
     }
 
-    fn incomplete_ownership() -> (HashSet<PathBuf>, bool) {
+    fn incomplete_ownership(_: &OwnershipPolicy) -> (HashSet<PathBuf>, bool) {
         (HashSet::new(), false)
     }
 
@@ -1354,6 +1381,7 @@ mod tests {
                 &self.digest,
                 &self.candidate,
                 None,
+                &OwnershipPolicy::default(),
                 Some(&unowned_ownership),
                 Some(&self.measurement),
             )
@@ -1536,6 +1564,7 @@ mod tests {
             &format!("sha256:{}", "0".repeat(64)),
             &fixture.candidate,
             None,
+            &OwnershipPolicy::default(),
             Some(&unowned_ownership),
             Some(&fixture.measurement),
         )
@@ -1711,6 +1740,7 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             Some(&result_dir.join("execution.json")),
+            &OwnershipPolicy::default(),
             Some(&unowned_ownership),
             Some(&fixture.measurement),
         )
@@ -1861,6 +1891,7 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             None,
+            &OwnershipPolicy::default(),
             Some(&incomplete_ownership),
             Some(&fixture.measurement),
         )
@@ -1874,6 +1905,38 @@ mod tests {
     }
 
     #[test]
+    fn exact_execution_uses_the_requested_ownership_policy_for_every_snapshot() -> Result<()> {
+        let fixture = fixture(false)?;
+        let snapshots = std::cell::Cell::new(0);
+        let ownership = |policy: &OwnershipPolicy| {
+            assert_eq!(
+                policy.macos_backend,
+                crate::MacosOwnershipBackend::GlobalLsof
+            );
+            snapshots.set(snapshots.get() + 1);
+            (HashSet::new(), true)
+        };
+        let policy = OwnershipPolicy {
+            macos_backend: crate::MacosOwnershipBackend::GlobalLsof,
+            ..OwnershipPolicy::default()
+        };
+
+        execute_approved_generated_with_ownership(
+            &fixture.manifest,
+            &fixture.digest,
+            &fixture.candidate,
+            None,
+            &policy,
+            Some(&ownership),
+            Some(&fixture.measurement),
+        )?;
+
+        assert_eq!(snapshots.get(), 2);
+        assert!(!fixture.candidate.exists());
+        Ok(())
+    }
+
+    #[test]
     fn exact_execution_rejects_current_process_ownership() -> Result<()> {
         let fixture = fixture(false)?;
         let error = execute_approved_generated_with_ownership(
@@ -1881,7 +1944,8 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             None,
-            Some(&|| (HashSet::from([fixture.candidate.clone()]), true)),
+            &OwnershipPolicy::default(),
+            Some(&|_| (HashSet::from([fixture.candidate.clone()]), true)),
             Some(&fixture.measurement),
         )
         .expect_err("current ownership must fail closed");
@@ -1938,7 +2002,8 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             None,
-            Some(&|| (HashSet::from([worktree_owned_path.clone()]), true)),
+            &OwnershipPolicy::default(),
+            Some(&|_| (HashSet::from([worktree_owned_path.clone()]), true)),
             Some(&fixture.measurement),
         )?;
 
@@ -1957,7 +2022,8 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             None,
-            Some(&|| (HashSet::from([worktree_owned_path.clone()]), true)),
+            &OwnershipPolicy::default(),
+            Some(&|_| (HashSet::from([worktree_owned_path.clone()]), true)),
             Some(&fixture.measurement),
         )
         .expect_err("non-target generated cleanup must retain worktree-wide ownership");
@@ -2038,7 +2104,7 @@ mod tests {
         fs::write(fixture.candidate.join("debug/.cargo-lock"), "")?;
         let snapshots = std::cell::Cell::new(0);
         let candidate = fixture.candidate.clone();
-        let ownership = || {
+        let ownership = |_: &OwnershipPolicy| {
             let snapshot = snapshots.get() + 1;
             snapshots.set(snapshot);
             if snapshot >= 3 {
@@ -2053,6 +2119,7 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             None,
+            &OwnershipPolicy::default(),
             Some(&ownership),
             Some(&fixture.measurement),
         )
@@ -2089,6 +2156,7 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             Some(&fixture.repo.join("execution.json")),
+            &OwnershipPolicy::default(),
             Some(&unowned_ownership),
             Some(&fixture.measurement),
         )
@@ -2147,6 +2215,7 @@ mod tests {
             &fixture.digest,
             &fixture.candidate,
             Some(&result_path),
+            &OwnershipPolicy::default(),
             Some(&unowned_ownership),
             Some(&fixture.measurement),
         )
