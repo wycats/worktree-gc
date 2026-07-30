@@ -42,8 +42,9 @@ pub use codex_sessions::{
     CodexSessionCollectOptions, CodexSessionCollectRun, DEFAULT_CODEX_SESSION_MAX_ENTRIES,
 };
 pub use exact_generated::{
-    execute_approved_generated, ApprovedGeneratedExecutionRefusal,
-    ApprovedGeneratedExecutionResult, ApprovedGeneratedExecutionRun,
+    execute_approved_generated, execute_approved_generated_with_ownership_policy,
+    ApprovedGeneratedExecutionRefusal, ApprovedGeneratedExecutionResult,
+    ApprovedGeneratedExecutionRun,
 };
 pub use gateway_storage::{
     gateway_storage_report, print_gateway_storage_report, GatewayStorageOptions,
@@ -5090,7 +5091,7 @@ pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> Process
 }
 
 #[cfg(target_os = "macos")]
-fn process_ownership_evidence_for_paths_with_policy(
+pub(crate) fn process_ownership_evidence_for_paths_with_policy(
     paths: &[PathBuf],
     policy: &OwnershipPolicy,
 ) -> ProcessOwnershipEvidence {
@@ -5132,7 +5133,7 @@ pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> Process
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn process_ownership_evidence_for_paths_with_policy(
+pub(crate) fn process_ownership_evidence_for_paths_with_policy(
     paths: &[PathBuf],
     policy: &OwnershipPolicy,
 ) -> ProcessOwnershipEvidence {
@@ -5184,7 +5185,7 @@ pub(crate) fn process_ownership_evidence_for_paths(paths: &[PathBuf]) -> Process
 }
 
 #[cfg(not(unix))]
-fn process_ownership_evidence_for_paths_with_policy(
+pub(crate) fn process_ownership_evidence_for_paths_with_policy(
     paths: &[PathBuf],
     policy: &OwnershipPolicy,
 ) -> ProcessOwnershipEvidence {
