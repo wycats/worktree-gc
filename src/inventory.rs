@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -79,6 +79,11 @@ pub struct InventoryEntry {
     /// rather than silently upgrading unproven evidence.
     #[serde(default)]
     pub traversal: InventoryTraversalStatus,
+    /// Entry-local causes that made this retained aggregate incomplete. Old
+    /// inventory v1 reports omit this additive evidence and deserialize it as
+    /// empty, which keeps their measurement qualifier conservative.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub traversal_incomplete_reasons: Vec<InventoryTraversalIncompleteReason>,
     pub metrics: InventoryMetrics,
 }
 
@@ -104,11 +109,12 @@ pub enum InventoryTraversalStatus {
     Incomplete,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum InventoryTraversalIncompleteReason {
     EntryBudgetExhausted,
     ScanErrors,
+    UnresolvedHardlinkAttribution,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -359,7 +365,8 @@ fn scan_root(
     let mut pending_hardlinks: HashMap<(u64, u64), PendingHardlink> = HashMap::new();
     let mut aggregates = BTreeMap::new();
     aggregates.insert(root.clone(), MetricsAccumulator::default());
-    let mut incomplete_aggregates = HashSet::new();
+    let mut incomplete_aggregates: BTreeMap<PathBuf, BTreeSet<InventoryTraversalIncompleteReason>> =
+        BTreeMap::new();
     add_directory(&mut aggregates, &root);
     let mut visited_entries = 0u64;
     let mut complete = true;
@@ -367,20 +374,26 @@ fn scan_root(
     let mut errors = Vec::new();
     loop {
         if *remaining_entries == 0 {
-            let pending_paths = unopened_directories
-                .iter()
-                .chain(open_directory_readers.iter())
-                .map(|pending| pending.path.clone())
-                .collect::<Vec<_>>();
-            if !pending_paths.is_empty() {
+            let pending_directories = unopened_directories
+                .len()
+                .saturating_add(open_directory_readers.len());
+            if pending_directories > 0 {
                 complete = false;
-                for path in &pending_paths {
-                    mark_traversal_incomplete(&aggregates, &mut incomplete_aggregates, path);
+                for pending in unopened_directories
+                    .iter()
+                    .chain(open_directory_readers.iter())
+                {
+                    mark_traversal_incomplete(
+                        &aggregates,
+                        &mut incomplete_aggregates,
+                        &pending.path,
+                        InventoryTraversalIncompleteReason::EntryBudgetExhausted,
+                    );
                 }
                 entry_budget_exhaustion = Some(InventoryEntryBudgetExhaustion {
                     configured_entries: configured_entry_budget,
                     consumed_entries: visited_entries,
-                    pending_directories: u64::try_from(pending_paths.len()).unwrap_or(u64::MAX),
+                    pending_directories: u64::try_from(pending_directories).unwrap_or(u64::MAX),
                 });
             }
             break;
@@ -395,7 +408,12 @@ fn scan_root(
                 Ok(metadata) => metadata,
                 Err(error) => {
                     record_error(&mut aggregates, directory, &error.to_string());
-                    mark_traversal_incomplete(&aggregates, &mut incomplete_aggregates, directory);
+                    mark_traversal_incomplete(
+                        &aggregates,
+                        &mut incomplete_aggregates,
+                        directory,
+                        InventoryTraversalIncompleteReason::ScanErrors,
+                    );
                     push_error(&mut errors, directory, error.to_string());
                     complete = false;
                     continue;
@@ -404,7 +422,12 @@ fn scan_root(
             if !directory_metadata.is_dir() {
                 let message = "queued inventory directory is no longer a directory";
                 record_error(&mut aggregates, directory, message);
-                mark_traversal_incomplete(&aggregates, &mut incomplete_aggregates, directory);
+                mark_traversal_incomplete(
+                    &aggregates,
+                    &mut incomplete_aggregates,
+                    directory,
+                    InventoryTraversalIncompleteReason::ScanErrors,
+                );
                 push_error(&mut errors, directory, message.to_string());
                 complete = false;
                 continue;
@@ -417,7 +440,12 @@ fn scan_root(
                 Ok(reader) => Some(reader),
                 Err(error) => {
                     record_error(&mut aggregates, directory, &error.to_string());
-                    mark_traversal_incomplete(&aggregates, &mut incomplete_aggregates, directory);
+                    mark_traversal_incomplete(
+                        &aggregates,
+                        &mut incomplete_aggregates,
+                        directory,
+                        InventoryTraversalIncompleteReason::ScanErrors,
+                    );
                     push_error(&mut errors, directory, error.to_string());
                     complete = false;
                     continue;
@@ -457,6 +485,7 @@ fn scan_root(
                             &aggregates,
                             &mut incomplete_aggregates,
                             directory,
+                            InventoryTraversalIncompleteReason::ScanErrors,
                         );
                         push_error(&mut errors, directory, error.to_string());
                         complete = false;
@@ -525,6 +554,7 @@ fn scan_root(
                                 &aggregates,
                                 &mut incomplete_aggregates,
                                 &path,
+                                InventoryTraversalIncompleteReason::ScanErrors,
                             );
                             push_error(&mut errors, &path, message.to_string());
                             complete = false;
@@ -543,7 +573,12 @@ fn scan_root(
             Ok(visit) => visit,
             Err(error) => {
                 record_error(&mut aggregates, directory, &error.to_string());
-                mark_traversal_incomplete(&aggregates, &mut incomplete_aggregates, directory);
+                mark_traversal_incomplete(
+                    &aggregates,
+                    &mut incomplete_aggregates,
+                    directory,
+                    InventoryTraversalIncompleteReason::ScanErrors,
+                );
                 push_error(&mut errors, directory, error.to_string());
                 complete = false;
                 continue;
@@ -555,6 +590,14 @@ fn scan_root(
     }
 
     for pending in pending_hardlinks.into_values() {
+        if !complete && pending.observed_links < pending.expected_links {
+            mark_traversal_incomplete(
+                &aggregates,
+                &mut incomplete_aggregates,
+                &pending.common_parent,
+                InventoryTraversalIncompleteReason::UnresolvedHardlinkAttribution,
+            );
+        }
         let private_reclaimable_bytes = if pending.observed_links >= pending.expected_links {
             pending.file.private_reclaimable_bytes
         } else {
@@ -725,10 +768,13 @@ fn record_error(
 
 fn mark_traversal_incomplete(
     aggregates: &BTreeMap<PathBuf, MetricsAccumulator>,
-    incomplete_aggregates: &mut HashSet<PathBuf>,
+    incomplete_aggregates: &mut BTreeMap<PathBuf, BTreeSet<InventoryTraversalIncompleteReason>>,
     path: &Path,
+    reason: InventoryTraversalIncompleteReason,
 ) {
-    incomplete_aggregates.extend(aggregate_keys(aggregates, path));
+    for key in aggregate_keys(aggregates, path) {
+        incomplete_aggregates.entry(key).or_default().insert(reason);
+    }
 }
 
 fn traversal_evidence(
@@ -775,7 +821,7 @@ fn push_error(errors: &mut Vec<InventoryScanError>, path: &Path, message: String
 fn retained_entries(
     root: &Path,
     aggregates: BTreeMap<PathBuf, MetricsAccumulator>,
-    incomplete_aggregates: &HashSet<PathBuf>,
+    incomplete_aggregates: &BTreeMap<PathBuf, BTreeSet<InventoryTraversalIncompleteReason>>,
     top: usize,
 ) -> Vec<InventoryEntry> {
     let mut by_parent: BTreeMap<PathBuf, Vec<InventoryEntry>> = BTreeMap::new();
@@ -786,17 +832,23 @@ fn retained_entries(
         let Some(parent) = path.parent().map(Path::to_path_buf) else {
             continue;
         };
+        let traversal_incomplete_reasons: Vec<InventoryTraversalIncompleteReason> =
+            incomplete_aggregates
+                .get(&path)
+                .map(|reasons| reasons.iter().copied().collect())
+                .unwrap_or_default();
         by_parent
             .entry(parent.clone())
             .or_default()
             .push(InventoryEntry {
                 relative_path: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
                 depth: relative_depth(root, &path),
-                traversal: if incomplete_aggregates.contains(&path) {
-                    InventoryTraversalStatus::Incomplete
-                } else {
+                traversal: if traversal_incomplete_reasons.is_empty() {
                     InventoryTraversalStatus::Complete
+                } else {
+                    InventoryTraversalStatus::Incomplete
                 },
+                traversal_incomplete_reasons,
                 path,
                 parent,
                 metrics: metrics.finish(),
@@ -878,6 +930,7 @@ fn write_inventory(writer: &mut impl Write, report: &InventoryReport) -> io::Res
             )?;
         }
         for entry in &root.entries {
+            let traversal_lower_bound = entry_traversal_is_lower_bound(entry);
             writeln!(
                 writer,
                 "  {:indent$}{} private{} | {} allocated{} | {} logical{} | {}",
@@ -885,22 +938,13 @@ fn write_inventory(writer: &mut impl Write, report: &InventoryReport) -> io::Res
                 format_bytes(entry.metrics.private_reclaimable_bytes),
                 private_measurement_qualifier(
                     entry.traversal,
-                    entry.traversal == InventoryTraversalStatus::Incomplete
-                        && traversal_is_lower_bound(&root.traversal),
+                    traversal_lower_bound,
                     entry.metrics.private_reclaimable_complete,
                 ),
                 format_bytes(entry.metrics.allocated_bytes),
-                traversal_measurement_qualifier(
-                    entry.traversal,
-                    entry.traversal == InventoryTraversalStatus::Incomplete
-                        && traversal_is_lower_bound(&root.traversal),
-                ),
+                traversal_measurement_qualifier(entry.traversal, traversal_lower_bound,),
                 format_bytes(entry.metrics.logical_bytes),
-                traversal_measurement_qualifier(
-                    entry.traversal,
-                    entry.traversal == InventoryTraversalStatus::Incomplete
-                        && traversal_is_lower_bound(&root.traversal),
-                ),
+                traversal_measurement_qualifier(entry.traversal, traversal_lower_bound,),
                 entry.relative_path.display(),
                 indent = entry.depth.saturating_sub(1) * 2
             )?;
@@ -910,6 +954,16 @@ fn write_inventory(writer: &mut impl Write, report: &InventoryReport) -> io::Res
         }
     }
     Ok(())
+}
+
+fn entry_traversal_is_lower_bound(entry: &InventoryEntry) -> bool {
+    entry.traversal == InventoryTraversalStatus::Incomplete
+        && entry.metrics.errors == 0
+        && !entry.traversal_incomplete_reasons.is_empty()
+        && entry
+            .traversal_incomplete_reasons
+            .iter()
+            .all(|reason| *reason == InventoryTraversalIncompleteReason::EntryBudgetExhausted)
 }
 
 fn traversal_is_lower_bound(traversal: &InventoryTraversalEvidence) -> bool {
@@ -1031,6 +1085,7 @@ mod portable {
     #[derive(Debug)]
     pub(super) struct DirectoryReader {
         entries: fs::ReadDir,
+        pending: Option<io::Result<Box<fs::DirEntry>>>,
         exhausted: bool,
     }
 
@@ -1038,6 +1093,7 @@ mod portable {
         pub(super) fn open(path: &Path) -> io::Result<Self> {
             Ok(Self {
                 entries: fs::read_dir(path)?,
+                pending: None,
                 exhausted: false,
             })
         }
@@ -1052,7 +1108,12 @@ mod portable {
         {
             let mut visited_entries = 0;
             while visited_entries < max_entries {
-                let Some(result) = self.entries.next() else {
+                let Some(result) = self
+                    .pending
+                    .take()
+                    .map(|result| result.map(|entry| *entry))
+                    .or_else(|| self.entries.next())
+                else {
                     self.exhausted = true;
                     break;
                 };
@@ -1092,6 +1153,12 @@ mod portable {
                         private_reclaimable_bytes: None,
                     }),
                 }));
+            }
+            if visited_entries == max_entries && self.pending.is_none() && !self.exhausted {
+                match self.entries.next() {
+                    Some(result) => self.pending = Some(result.map(Box::new)),
+                    None => self.exhausted = true,
+                }
             }
             Ok(DirectoryVisit {
                 visited_entries,
@@ -1305,6 +1372,9 @@ mod macos {
                 if self.exhausted {
                     break;
                 }
+                self.fill_pending()?;
+            }
+            if visited_entries == max_entries && self.pending.is_empty() && !self.exhausted {
                 self.fill_pending()?;
             }
             Ok(DirectoryVisit {
@@ -1605,6 +1675,30 @@ mod tests {
     }
 
     #[test]
+    fn inventory_completes_when_the_entry_count_exactly_matches_the_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..3 {
+            write_bytes(&temp.path().join(format!("file-{index}")), 1);
+        }
+
+        let report = inventory(
+            &[temp.path().to_path_buf()],
+            InventoryOptions {
+                max_entries: 3,
+                ..InventoryOptions::default()
+            },
+        )
+        .unwrap();
+        let root = &report.roots[0];
+
+        assert!(root.complete);
+        assert_eq!(root.visited_entries, 3);
+        assert_eq!(root.metrics.files, 3);
+        assert_eq!(root.traversal.status, InventoryTraversalStatus::Complete);
+        assert!(root.traversal.entry_budget_exhaustion.is_none());
+    }
+
+    #[test]
     fn capped_inventory_marks_only_affected_retained_branches_incomplete() {
         let temp = tempfile::tempdir().unwrap();
         let wide = temp.path().join("wide");
@@ -1652,7 +1746,9 @@ mod tests {
         let root = legacy["roots"][0].as_object_mut().unwrap();
         root.remove("traversal");
         for entry in root["entries"].as_array_mut().unwrap() {
-            entry.as_object_mut().unwrap().remove("traversal");
+            let entry = entry.as_object_mut().unwrap();
+            entry.remove("traversal");
+            entry.remove("traversal_incomplete_reasons");
         }
 
         let report: InventoryReport = serde_json::from_value(legacy).unwrap();
@@ -1663,7 +1759,8 @@ mod tests {
         assert!(report.roots[0]
             .entries
             .iter()
-            .all(|entry| entry.traversal == InventoryTraversalStatus::Unknown));
+            .all(|entry| entry.traversal == InventoryTraversalStatus::Unknown
+                && entry.traversal_incomplete_reasons.is_empty()));
     }
 
     #[test]
@@ -1728,6 +1825,81 @@ mod tests {
             traversal_measurement_qualifier(traversal.status, traversal_is_lower_bound(&traversal),),
             " (incomplete observation)"
         );
+    }
+
+    #[test]
+    fn retained_entry_qualifiers_use_entry_local_incomplete_causes() {
+        let report = InventoryReport {
+            inventory_version: INVENTORY_VERSION,
+            generated_at_unix: 0,
+            options: InventoryReportOptions {
+                display_depth: 1,
+                top: 2,
+                max_entries: 3,
+                one_filesystem: true,
+            },
+            roots: vec![InventoryRoot {
+                path: PathBuf::from("/mixed"),
+                filesystem: "device:1".to_string(),
+                complete: false,
+                traversal: traversal_evidence(
+                    false,
+                    Some(InventoryEntryBudgetExhaustion {
+                        configured_entries: 3,
+                        consumed_entries: 3,
+                        pending_directories: 1,
+                    }),
+                    1,
+                ),
+                visited_entries: 3,
+                metrics: InventoryMetrics {
+                    errors: 1,
+                    ..InventoryMetrics::default()
+                },
+                entries: vec![
+                    InventoryEntry {
+                        path: PathBuf::from("/mixed/budget-only"),
+                        relative_path: PathBuf::from("budget-only"),
+                        parent: PathBuf::from("/mixed"),
+                        depth: 1,
+                        traversal: InventoryTraversalStatus::Incomplete,
+                        traversal_incomplete_reasons: vec![
+                            InventoryTraversalIncompleteReason::EntryBudgetExhausted,
+                        ],
+                        metrics: InventoryMetrics::default(),
+                    },
+                    InventoryEntry {
+                        path: PathBuf::from("/mixed/scan-error"),
+                        relative_path: PathBuf::from("scan-error"),
+                        parent: PathBuf::from("/mixed"),
+                        depth: 1,
+                        traversal: InventoryTraversalStatus::Incomplete,
+                        traversal_incomplete_reasons: vec![
+                            InventoryTraversalIncompleteReason::ScanErrors,
+                        ],
+                        metrics: InventoryMetrics {
+                            errors: 1,
+                            ..InventoryMetrics::default()
+                        },
+                    },
+                ],
+                errors: Vec::new(),
+            }],
+        };
+        let mut output = Vec::new();
+        write_inventory(&mut output, &report).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let budget = output
+            .lines()
+            .find(|line| line.ends_with("budget-only"))
+            .unwrap();
+        let scan_error = output
+            .lines()
+            .find(|line| line.ends_with("scan-error"))
+            .unwrap();
+
+        assert!(budget.contains("allocated (observed lower bound)"));
+        assert!(scan_error.contains("allocated (incomplete observation)"));
     }
 
     #[test]
@@ -1981,6 +2153,43 @@ mod tests {
             assert_eq!(child.metrics.logical_bytes, 0);
             assert_eq!(child.metrics.allocated_bytes, 0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_scan_marks_unresolved_hardlink_attribution_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_dir = temp.path().join("first-dir");
+        let second_dir = temp.path().join("second-dir");
+        fs::create_dir(&first_dir).unwrap();
+        fs::create_dir(&second_dir).unwrap();
+        let first = first_dir.join("blob");
+        write_bytes(&first, 4096);
+        fs::hard_link(&first, second_dir.join("blob")).unwrap();
+
+        let report = inventory(
+            &[temp.path().to_path_buf()],
+            InventoryOptions {
+                display_depth: 1,
+                top: 2,
+                max_entries: 3,
+                ..InventoryOptions::default()
+            },
+        )
+        .unwrap();
+        let root = &report.roots[0];
+        let measured = root
+            .entries
+            .iter()
+            .find(|entry| entry.metrics.files == 1)
+            .expect("one sibling contains the observed hardlink");
+
+        assert_eq!(root.traversal.status, InventoryTraversalStatus::Incomplete);
+        assert_eq!(measured.traversal, InventoryTraversalStatus::Incomplete);
+        assert!(measured
+            .traversal_incomplete_reasons
+            .contains(&InventoryTraversalIncompleteReason::UnresolvedHardlinkAttribution));
+        assert!(!entry_traversal_is_lower_bound(measured));
     }
 
     #[cfg(target_os = "macos")]

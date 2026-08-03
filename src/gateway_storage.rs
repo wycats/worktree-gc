@@ -2164,6 +2164,7 @@ mod tests {
                     parent: root_path,
                     depth: 1,
                     traversal: InventoryTraversalStatus::Complete,
+                    traversal_incomplete_reasons: Vec::new(),
                     metrics: InventoryMetrics {
                         private_reclaimable_complete: true,
                         ..InventoryMetrics::default()
@@ -2225,6 +2226,7 @@ mod tests {
                         parent: parent_path,
                         depth: 1,
                         traversal: InventoryTraversalStatus::Complete,
+                        traversal_incomplete_reasons: Vec::new(),
                         metrics: InventoryMetrics {
                             logical_bytes: 99,
                             allocated_bytes: 100,

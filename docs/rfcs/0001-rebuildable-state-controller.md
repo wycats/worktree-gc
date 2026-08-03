@@ -213,11 +213,13 @@ granting authority beyond it. A precise APFS-private measurement of the visited
 files does not make a partial traversal complete.
 
 Coverage reporting therefore preserves traversal completion independently
-from byte-measurement completion. It also retains file and directory counts
-and first-level family totals so millions of small paths remain visible even
-when no single child dominates the report. Worktree containers are discovery
-domains rather than reclaim estimates; owner-mediated and unclassified domains
-remain visible without receiving deletion authority.
+from byte-measurement completion, including entry-local causes that distinguish
+a budget-only lower bound from scan errors or unresolved hardlink attribution.
+It also retains file and directory counts and first-level family totals so
+millions of small paths remain visible even when no single child dominates the
+report. Worktree containers are discovery domains rather than reclaim
+estimates; owner-mediated and unclassified domains remain visible without
+receiving deletion authority.
 
 If the eligible safe pool cannot close a configured pressure deficit, the
 controller must distinguish a durable-space limit from a coverage gap. A

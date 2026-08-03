@@ -47,25 +47,29 @@ Traversal completeness and byte-measurement completeness answer different
 questions. A scan that exhausts `max_entries` has measured the files it visited
 correctly, but it has not measured the whole requested root. An exhausted root
 records a structured completion reason, its configured and consumed fair-share
-entry budget, and the number of directories still pending. Retained
-aggregates record whether their own descendant traversal completed, so a
-completed sibling can remain exact while the capped branch and its ancestors
-are partial.
+entry budget, and the number of directories still pending. Retained aggregates
+record both whether their own descendant traversal completed and the
+entry-local causes when it did not, so a completed sibling can remain exact
+while the capped branch and its ancestors are partial.
 
-Every logical, allocated, and private-reclaimable total attached to a
-budget-capped aggregate is an observed lower bound. Scan-error totals are
-incomplete observations because concurrent change can move them in either
-direction. A private-byte total is independently a lower bound when the
-platform cannot provide complete private-size attributes. Human and JSON
-reports preserve these completeness dimensions instead of allowing an exact
-measurement of a partial traversal to look like a complete census.
+Every logical, allocated, and private-reclaimable total whose only incomplete
+cause is an exhausted entry budget is an observed lower bound. Scan errors and
+unresolved cross-branch hardlink attribution are incomplete observations
+because a complete scan can move their totals in either direction. A
+private-byte total is independently a lower bound when the platform cannot
+provide complete private-size attributes. Human and JSON reports preserve
+these completeness dimensions instead of allowing an exact measurement of a
+partial traversal to look like a complete census.
 
 Allocated path size is not a deletion estimate on a copy-on-write filesystem.
 APFS clones can share most extents, while pnpm worktrees can expose many paths
 backed by a shared content store. `ATTR_CMNEXT_PRIVATESIZE` gives the scanner a
 direct, low-cost reclaim floor. Hard-linked data is attributed only to the
 lowest reported ancestor containing every link observed for that inode; a link
-whose siblings remain outside the root contributes no reclaimable bytes.
+whose siblings remain outside the root contributes no reclaimable bytes. If a
+bounded scan cannot determine whether another link lies in an unvisited
+branch, the observed branch is explicitly incomplete until an exact subpass
+settles the common ancestor.
 
 The macOS backend uses `getattrlistbulk`, which returns directory names, types,
 file IDs, logical/allocated sizes, link counts, and APFS private size in batches.
