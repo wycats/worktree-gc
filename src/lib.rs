@@ -63,8 +63,10 @@ pub use github_pr::{
     PullRequestState,
 };
 pub use inventory::{
-    inventory, print_inventory, InventoryEntry, InventoryMetrics, InventoryOptions,
-    InventoryReport, InventoryReportOptions, InventoryRoot, InventoryScanError, INVENTORY_VERSION,
+    inventory, print_inventory, InventoryEntry, InventoryEntryBudgetExhaustion, InventoryMetrics,
+    InventoryOptions, InventoryReport, InventoryReportOptions, InventoryRoot, InventoryScanError,
+    InventoryTraversalEvidence, InventoryTraversalIncompleteReason, InventoryTraversalStatus,
+    INVENTORY_VERSION,
 };
 pub use protection::{
     active_protections, add_protection, list_protections, protection_for_path,

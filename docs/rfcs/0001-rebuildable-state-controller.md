@@ -24,19 +24,21 @@ state.
 | Measured pressure candidates and exact execution manifests | Landed | Retain |
 | Report-only owner adapters for durable domains | Landed | Retain |
 | Bounded scheduling and pressure waves | Landed | Retain |
-| Bounded generated-root discovery and opportunity coverage | In delivery | Publish as the machine coverage ledger before activation |
+| Bounded generated-root discovery and opportunity coverage | Landed | Extend coverage with completion-aware, resumable census evidence |
+| Completion-aware broad inventory evidence | In delivery | Qualify capped roots and affected aggregates as lower bounds |
 | Workday-aware artifact age | Validated on an unpublished stack | Retain as evidence and optional cooldown; remove as primary eligibility authority |
 | Scoped source, artifact, runtime, and legacy protections | Not implemented | Build before weakening broad worktree protection |
-| Owner-free coarse cleanup independent of source recency | Exact routine and pressure execution landed; coverage in delivery | Complete supervised activation without weakening broad protections |
+| Owner-free coarse cleanup independent of source recency | Landed | Expand explained machine coverage without weakening broad protections |
 | Granular active Cargo-target pruning | Partially landed | Extend with measured size policy after owner-free coarse cleanup |
-| Exact-head PR lifecycle retention | In delivery | Retain open PR worktrees and reclaim clean merged-PR worktrees after a short grace period |
-| Unattended 100–150 GiB controller | Not active | Gate on supervised cycles and acceptance criteria |
+| Exact-head PR lifecycle retention | Landed | Retain open PR worktrees and reclaim clean merged-PR worktrees after a short grace period |
+| Unattended 100–150 GiB controller | Running on partial coverage; acceptance unmet | Calibrate against a completion-aware machine ledger and target-band evidence |
 
-The generated-retention stack is being selectively reconciled against this
-table rather than published wholesale. Its discovery, measurement, reporting,
-and bounded scheduling foundations remain useful. Its hard three-workday
-retention direction does not become policy merely because the implementation
-was validated.
+The generated-retention stack has been selectively reconciled against this
+table. Discovery, measurement, reporting, exact owner-free execution, PR
+lifecycle evidence, bounded scheduling, and privileged ownership evidence are
+landed. Owner-free pressure cleanup does not depend on source recency. Routine
+generated cleanup still uses configured age windows while the migration moves
+age toward cooldown and ranking evidence rather than durability authority.
 
 ## Summary
 
@@ -84,6 +86,27 @@ The design goal is therefore not to reproduce a more precise seven-day TTL.
 It is to automate the judgment behind the effective manual workflow while
 retaining stronger safety evidence and exact execution boundaries.
 
+### Measured machine evidence
+
+The first bounded `~/Code` census on 2026-08-03 reached its 2,000,000-entry
+limit after observing 1,207,830 files and 526,988 directories. The reported
+89.46 GiB private, 98.18 GiB allocated, and 95.12 GiB logical totals are
+therefore lower bounds rather than a complete baseline.
+
+Even that partial traversal changed the priority picture. Four worktree-family
+containers accounted for at least 38.23 GiB private: `v0.worktrees`
+17.36 GiB, `local-sandbox.worktrees` 10.69 GiB, `locald.worktrees` 6.87 GiB,
+and `v0-worktree-gc.worktrees` 3.31 GiB. The generated
+`locald-b23-generated-json-files-recovery/target` accounted for at least
+16.53 GiB, while `vscode-ai-gateway/.logs` accounted for at least 7.94 GiB.
+
+These observations route work to the appropriate authority. A worktree-family
+container is a discovery domain whose generated descendants and source
+worktrees have different authority. The large `target/` routes to granular or
+owner-free generated cleanup according to current ownership. The log tree
+remains owner-mediated until its producer supplies a retention and recovery
+contract.
+
 ## Goals
 
 - Keep the Data volume in a healthy free-space band, initially 100–150 GiB,
@@ -98,6 +121,12 @@ retaining stronger safety evidence and exact execution boundaries.
 - Revalidate ownership, containment, locks, and protection immediately before
   mutation and stop when the live free-space target is reached.
 - Keep every destructive action attributable to a domain recovery contract.
+- Make bounded or failed traversal explicit in every affected aggregate, so
+  no lower-bound total is presented as a complete machine census.
+- Account for long-tail entry counts and first-level storage families, not
+  only the largest retained paths.
+- Classify every material machine domain as managed, report-only, excluded, or
+  unclassified before calling controller coverage sufficient.
 
 ## Non-goals
 
@@ -172,6 +201,29 @@ better ordering than a binary age threshold.
 Pressure may admit younger or more expensive rebuildable candidates. It never
 bypasses source containment, tracked-file checks, ownership completeness,
 locks, protections, or execution-time revalidation.
+
+### Coverage precedes control claims
+
+The controller can govern only the storage domains it has both observed and
+routed to an authority contract. Entry-budget exhaustion leaves the affected
+totals as observed lower bounds. A scan error leaves an incomplete observation
+because concurrent change can move a total in either direction. The default
+one-filesystem boundary defines the requested scope rather than silently
+granting authority beyond it. A precise APFS-private measurement of the visited
+files does not make a partial traversal complete.
+
+Coverage reporting therefore preserves traversal completion independently
+from byte-measurement completion, including entry-local causes that distinguish
+a budget-only lower bound from scan errors or unresolved hardlink attribution.
+It also retains file and directory counts and first-level family totals so
+millions of small paths remain visible even when no single child dominates the
+report. Worktree containers are discovery domains rather than reclaim
+estimates; owner-mediated and unclassified domains remain visible without
+receiving deletion authority.
+
+If the eligible safe pool cannot close a configured pressure deficit, the
+controller must distinguish a durable-space limit from a coverage gap. A
+capped census cannot prove that the remaining space is durable.
 
 ## Three-tier cleanup strategy
 
@@ -280,7 +332,8 @@ artifact leases separately so source safety does not pin unrelated caches.
 Routine operation prevents accretion before pressure becomes urgent:
 
 1. inventory configured repository roots with a bounded worker and entry
-   budget;
+   budget, retaining completion and lower-bound evidence for every displayed
+   aggregate;
 2. granularly prune superseded state in actively owned artifacts;
 3. rank owner-free generated roots by rebuild-cost class, APFS-private reclaim,
    artifact activity, and age;
@@ -303,6 +356,12 @@ the target, initially 150 GiB:
 4. consider conservatively stale whole worktrees only after rebuildable state;
 5. stop and report the remaining owner-mediated or durable domains rather than
    widening deletion authority automatically.
+
+If traversal was incomplete, the stop report records a coverage gap rather
+than describing the observed eligible pool as exhaustive. The next measurement
+slice may subdivide and resume the affected root, but it cannot turn cached
+inventory into mutation authority; exact execution still performs its own
+fresh guards.
 
 Candidates are processed in bounded waves. Each wave refreshes the repository
 plan and ownership evidence; each exact path retains its own measurement,
@@ -342,6 +401,22 @@ They can continue to supply evidence or cooldowns, but should not be the sole
 authority for owner-free rebuildable-state retention.
 
 ## Observability and learning
+
+Every generic inventory observation should record:
+
+- requested root, observation time, and consumed entry budget;
+- configured fair-share budget and pending directories when the budget is
+  exhausted;
+- structured traversal outcome and scan errors;
+- per-aggregate traversal completeness, independently from private-byte
+  measurement completeness;
+- observed file and directory counts plus logical, allocated, and
+  APFS-private totals with their completion semantics.
+
+The composed machine coverage ledger and owner collectors should additionally
+classify material families as managed, report-only, excluded, or unclassified.
+Generic inventory supplies physical evidence and never assigns cleanup
+authority.
 
 Every planned or executed action should record:
 
@@ -405,6 +480,14 @@ the main near-term reclaim mechanism. Tier 1 granular pruning keeps active
 trees from rebuilding the same long tail. Tier 3 whole-worktree deletion is
 already conservative and is not the first place to spend implementation risk.
 
+The current bet is measurement closure. This delivery makes capped and failed
+inventory visibly partial at the root and retained-aggregate levels. The next
+slice should segment oversized roots into resumable, non-overlapping census
+units and reconcile their family totals. Classification and targeted adapters
+then turn material managed regions into candidates without treating inventory
+size as deletion authority. Active-target size budgets remain the next cleanup
+capability after the census can explain where the long tail lives.
+
 ### Phase 1: separate policy domains
 
 - Model source retention independently from generated-artifact retention.
@@ -415,18 +498,18 @@ already conservative and is not the first place to spend implementation risk.
 
 ### Phase 2: complete the generated-root controller
 
-- Retain bounded discovery, Git containment checks, APFS measurement, and
-  machine-wide pressure ordering.
-- Replace hard three-/seven-day eligibility with owner-free classification,
-  rebuild-cost ordering, and optional cooldown evidence.
-- Include project-local `node_modules/` in coarse recovery after lower-cost
-  classes.
-- Preserve per-path execution guards while sharing expensive revalidation in
-  bounded waves.
-- Route supervised deletion through the manifest/digest-bound single-candidate
-  executor, including exact source and inode identity, a fresh ownership and
-  protection check, atomic quarantine, Cargo profile locks for `target/`, and
-  a durable realized-reclaim result.
+- Landed: bounded generated discovery, Git containment checks, APFS
+  measurement, owner-free classification, rebuild-cost ordering, exact
+  manifest execution, bounded ownership epochs, and privileged ownership
+  evidence.
+- Landed: project-local `node_modules/` follows higher rebuild-cost classes;
+  execution retains exact source/inode identity, ownership, protection,
+  quarantine, Cargo-lock, and realized-reclaim evidence.
+- In delivery: distinguish traversal completion from private-measurement
+  completion at the root and retained-aggregate levels.
+- Next: segment and resume oversized inventory roots without double-counting,
+  then classify their material generated descendants through existing exact
+  execution contracts.
 
 ### Phase 3: strengthen active-target pruning
 
@@ -437,14 +520,22 @@ already conservative and is not the first place to spend implementation risk.
   profile boundaries. Keep shared, custom-profile, and otherwise unclassified
   layouts fail-closed until their current working set can be identified safely.
 
-### Phase 4: supervised controller activation
+### Phase 4: machine coverage closure and controller calibration
 
-- Run report-only classification across all configured roots.
-- Compare proposed actions with manual disk-map judgments.
-- Execute one approved recovery cycle and verify source integrity, realized
-  reclaim, and rebuild behavior.
-- Enable scheduled execution only after repeated supervised cycles preserve
-  active work and stop at the configured target.
+- The daily controller is running against its configured partial root set;
+  preserve that operation while measuring whether its managed safe pool can
+  plausibly close the 100–150 GiB target deficit.
+- Run completion-aware report-only census across every configured root and
+  record material domains as managed, report-only, excluded, or unclassified.
+- Compare proposed actions and unexplained regions with manual disk-map
+  judgments, including both large paths and high-count long tails.
+- Segment capped roots and reconcile completed segments before treating a
+  family total as a machine baseline.
+- Keep Parallels excluded and untouched. Its running state is not a standing
+  machine lock; unrelated inventory may proceed while concrete disk contention
+  can serialize a broad scan.
+- Treat repeated target-band recovery without manual large-directory cleanup
+  as the remaining controller acceptance proof.
 
 ### Phase 5: owner-mediated domains
 
@@ -455,7 +546,8 @@ already conservative and is not the first place to spend implementation risk.
 
 ## Acceptance criteria
 
-The design is ready for unattended activation when all of the following hold:
+Full machine-wide controller acceptance holds when all of the following are
+true:
 
 - a dirty worktree is never automatically removed;
 - an ignored generated root inside a dirty worktree can be independently
@@ -470,6 +562,15 @@ The design is ready for unattended activation when all of the following hold:
   longer pin unrelated generated roots;
 - execution refuses incomplete ownership, tracked content, symlink escapes,
   changed identities, or protected candidates;
+- a capped inventory marks the root and every affected retained aggregate as
+  an observed lower bound, a failed scan marks incomplete observations, and
+  completed siblings remain exact;
+- the coverage ledger explains each material storage family as managed,
+  report-only, excluded, or unclassified, without counting worktree
+  containers themselves as reclaim;
+- pressure reporting distinguishes an exhausted safe pool from incomplete
+  discovery and shows whether the managed pool can plausibly close the target
+  deficit;
 - pressure recovery stops from live `df` evidence at the configured target;
 - repeated scheduled cycles keep free space inside the target band without
   recurring manual large-directory cleanup;
