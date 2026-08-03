@@ -1,6 +1,7 @@
 use crate::inventory::inventory_with_root_limit;
+use crate::InventoryTraversalStatus;
 #[cfg(test)]
-use crate::InventoryEntry;
+use crate::{InventoryEntry, InventoryTraversalEvidence};
 use crate::{
     InventoryMetrics, InventoryOptions, InventoryReport, InventoryReportOptions, INVENTORY_VERSION,
 };
@@ -1199,10 +1200,10 @@ fn index_inventory_measurements(
                     source: GatewayMeasurementSource::InventoryManifestExact,
                     inventory_generated_at_unix: inventory.generated_at_unix,
                     filesystem: root.filesystem.clone(),
-                    traversal_complete: root.complete && root.errors.is_empty(),
+                    traversal_complete: entry.traversal == InventoryTraversalStatus::Complete,
                     private_measurement_complete: entry.metrics.private_reclaimable_complete,
                     visited_entries: None,
-                    scan_error_count: root.metrics.errors,
+                    scan_error_count: entry.metrics.errors,
                     metrics: entry.metrics.clone(),
                 },
             );
@@ -1818,6 +1819,7 @@ mod tests {
                 path: fs::canonicalize(&root).unwrap(),
                 filesystem: "testfs".to_string(),
                 complete: true,
+                traversal: InventoryTraversalEvidence::default(),
                 visited_entries: 2,
                 metrics: InventoryMetrics {
                     logical_bytes: 999_999,
@@ -1926,6 +1928,7 @@ mod tests {
                 path: fs::canonicalize(&workspace).unwrap(),
                 filesystem: "testfs".to_string(),
                 complete: true,
+                traversal: InventoryTraversalEvidence::default(),
                 visited_entries: 1,
                 metrics,
                 entries: Vec::new(),
@@ -1992,6 +1995,7 @@ mod tests {
                     path: fs::canonicalize(&workspace).unwrap(),
                     filesystem: "cross-filesystem".to_string(),
                     complete: true,
+                    traversal: InventoryTraversalEvidence::default(),
                     visited_entries: 1,
                     metrics: InventoryMetrics {
                         logical_bytes: 99_999,
@@ -2111,6 +2115,7 @@ mod tests {
                 path: root_path.clone(),
                 filesystem: "testfs".to_string(),
                 complete: false,
+                traversal: InventoryTraversalEvidence::default(),
                 visited_entries: 100,
                 metrics: InventoryMetrics {
                     errors: 143,
@@ -2123,6 +2128,55 @@ mod tests {
 
         let measurements = index_inventory_measurements(&report);
         assert_eq!(measurements[&root_path].scan_error_count, 143);
+    }
+
+    #[test]
+    fn completed_retained_entry_does_not_inherit_a_sibling_scan_error() {
+        let root_path = PathBuf::from("/gateway/root");
+        let unit_path = root_path.join("unit");
+        let report = InventoryReport {
+            inventory_version: INVENTORY_VERSION,
+            generated_at_unix: 123,
+            options: InventoryReportOptions {
+                display_depth: 1,
+                top: 1,
+                max_entries: 100,
+                one_filesystem: true,
+            },
+            roots: vec![InventoryRoot {
+                path: root_path.clone(),
+                filesystem: "testfs".to_string(),
+                complete: false,
+                traversal: InventoryTraversalEvidence {
+                    status: InventoryTraversalStatus::Incomplete,
+                    incomplete_reasons: vec![crate::InventoryTraversalIncompleteReason::ScanErrors],
+                    entry_budget_exhaustion: None,
+                    scan_error_count: 143,
+                },
+                visited_entries: 100,
+                metrics: InventoryMetrics {
+                    errors: 143,
+                    ..InventoryMetrics::default()
+                },
+                entries: vec![InventoryEntry {
+                    path: unit_path.clone(),
+                    relative_path: PathBuf::from("unit"),
+                    parent: root_path,
+                    depth: 1,
+                    traversal: InventoryTraversalStatus::Complete,
+                    metrics: InventoryMetrics {
+                        private_reclaimable_complete: true,
+                        ..InventoryMetrics::default()
+                    },
+                }],
+                errors: Vec::new(),
+            }],
+        };
+
+        let measurements = index_inventory_measurements(&report);
+        let unit = &measurements[&unit_path];
+        assert!(unit.traversal_complete);
+        assert_eq!(unit.scan_error_count, 0);
     }
 
     #[test]
@@ -2143,6 +2197,7 @@ mod tests {
                     path: unit_path.clone(),
                     filesystem: "testfs".to_string(),
                     complete: true,
+                    traversal: InventoryTraversalEvidence::default(),
                     visited_entries: 4,
                     metrics: InventoryMetrics {
                         logical_bytes: 10,
@@ -2161,6 +2216,7 @@ mod tests {
                     path: parent_path.clone(),
                     filesystem: "testfs".to_string(),
                     complete: true,
+                    traversal: InventoryTraversalEvidence::default(),
                     visited_entries: 5,
                     metrics: InventoryMetrics::default(),
                     entries: vec![InventoryEntry {
@@ -2168,6 +2224,7 @@ mod tests {
                         relative_path: PathBuf::from("unit"),
                         parent: parent_path,
                         depth: 1,
+                        traversal: InventoryTraversalStatus::Complete,
                         metrics: InventoryMetrics {
                             logical_bytes: 99,
                             allocated_bytes: 100,
@@ -2205,6 +2262,7 @@ mod tests {
                 path: fs::canonicalize(&logs).unwrap(),
                 filesystem: "testfs".to_string(),
                 complete: false,
+                traversal: InventoryTraversalEvidence::default(),
                 visited_entries: 1,
                 metrics: InventoryMetrics {
                     logical_bytes: 77,

@@ -14,8 +14,11 @@ tool understands.
 
 The accepted [source-safe rebuildable-state controller RFC](docs/rfcs/0001-rebuildable-state-controller.md)
 separates conservative worktree retention from aggressive generated-artifact
-recovery. Current releases still contain TTL-first behavior in places; the
-implementation plan below identifies the migration to ownership-first policy.
+recovery. Current releases execute owner-free pressure cleanup independently
+of source recency; routine generated cleanup still uses configured age windows.
+The migration keeps age as cooldown and ranking evidence rather than durability
+authority. The implementation plan below now centers complete machine evidence
+and active-target control.
 
 ## Inventory contract
 
@@ -36,7 +39,26 @@ Each aggregate reports:
 - allocated bytes: blocks charged to the file paths, deduplicated by inode;
 - private reclaimable bytes: on APFS, the conservative bytes private to the
   files that would be unlinked together;
-- completeness, file/directory/error counts, and hard-link duplicates.
+- traversal completeness, file/directory/error counts, and hard-link
+  duplicates;
+- private-measurement completeness, independently of traversal completeness.
+
+Traversal completeness and byte-measurement completeness answer different
+questions. A scan that exhausts `max_entries` has measured the files it visited
+correctly, but it has not measured the whole requested root. An exhausted root
+records a structured completion reason, its configured and consumed fair-share
+entry budget, and the number of directories still pending. Retained
+aggregates record whether their own descendant traversal completed, so a
+completed sibling can remain exact while the capped branch and its ancestors
+are partial.
+
+Every logical, allocated, and private-reclaimable total attached to a
+budget-capped aggregate is an observed lower bound. Scan-error totals are
+incomplete observations because concurrent change can move them in either
+direction. A private-byte total is independently a lower bound when the
+platform cannot provide complete private-size attributes. Human and JSON
+reports preserve these completeness dimensions instead of allowing an exact
+measurement of a partial traversal to look like a complete census.
 
 Allocated path size is not a deletion estimate on a copy-on-write filesystem.
 APFS clones can share most extents, while pnpm worktrees can expose many paths
@@ -152,7 +174,46 @@ Generic inventory may expose these domains' physical size but cannot infer
 liveness, pin/export state, eligibility, or deletion authority. Parallels is
 explicitly excluded from this controller. Any other large inventory domain
 remains unclassified until a repository or owner adapter gives it a recovery
-contract.
+contract. Unrelated inventory may proceed while a Parallels VM runs; concrete
+disk contention can serialize a broad scan without granting this controller
+authority over the VM.
+
+Coverage precedes control claims. The machine ledger must distinguish a
+complete census from a bounded lower bound before the controller describes how
+much space it can govern. For each requested root and useful first-level
+family, the ledger retains the observation time, entry limit and consumption,
+traversal completion, file and directory counts, logical/allocated/private
+currencies with their completeness, and one of these authority classes:
+
+- **managed:** an owner or repository adapter can issue exact cleanup
+  candidates;
+- **report-only:** the domain is measured but its owner retains mutation
+  authority;
+- **excluded:** the domain is outside this controller, including Parallels;
+- **unclassified:** inventory exposed material usage but no recovery contract
+  exists yet.
+
+Worktree-family containers such as `v0.worktrees` and
+`local-sandbox.worktrees` serve as discovery domains. Cleanup authority
+attaches only to their independently classified generated roots or source
+worktrees. Generated roots can route to granular active cleanup or owner-free
+coarse cleanup, while source worktrees remain under conservative source
+retention. Large log trees remain report-only until the producing application
+defines retention, export, and recovery behavior.
+
+The first bounded `~/Code` census on 2026-08-03 demonstrates why this
+distinction is operationally important. It exhausted the 2,000,000-entry cap
+after observing 1,207,830 files and 526,988 directories. Its 89.46 GiB private,
+98.18 GiB allocated, and 95.12 GiB logical totals are therefore lower bounds,
+not a complete machine baseline. Within that partial traversal,
+`v0.worktrees` accounted for at least 17.36 GiB private,
+`local-sandbox.worktrees` 10.69 GiB, `locald.worktrees` 6.87 GiB, and
+`v0-worktree-gc.worktrees` 3.31 GiB. The generated
+`locald-b23-generated-json-files-recovery/target` accounted for at least
+16.53 GiB, while `vscode-ai-gateway/.logs` accounted for at least 7.94 GiB.
+The worktree families route into generated discovery; the `target/` needs
+current ownership to choose granular or coarse cleanup; the log tree remains
+owner-mediated.
 
 ### Codex task-store adapter
 
@@ -244,6 +305,10 @@ the configured target. APFS-private bytes improve ordering; realized
 filesystem availability remains authoritative. If safe rebuildable candidates
 cannot reach the target, the controller reports the remaining durable or
 owner-mediated domains rather than widening deletion authority automatically.
+That outcome must also say whether the safe pool is genuinely exhausted or
+whether incomplete coverage prevented the controller from seeing enough of
+the rebuildable pool. Reaching the end of a capped scan records a coverage gap
+and leaves the unvisited bytes unresolved.
 
 ## Incremental delivery
 
@@ -263,32 +328,43 @@ revision.
    source lease must be able to protect worktree context without indefinitely
    retaining rebuildable descendants. Existing recursive leases stay broad
    until explicitly migrated.
-4. **In delivery: owner-free coarse generated cleanup and machine coverage.**
-   Current ownership and recoverability are the eligibility boundary for
-   complete generated-tree deletion. The report-only coverage pass explains
-   each requested repository root before supervised pressure activation.
-   Elapsed/workday age remains cooldown and ranking evidence; project-local
-   `node_modules` follows lower rebuild-cost classes.
-5. **Next: active-target granular budgets.** Extend incremental pruning and
+4. **Landed: owner-free coarse generated cleanup and bounded machine
+   coverage.** Current ownership and recoverability are the eligibility
+   boundary for complete generated-tree deletion. Generated discovery covers
+   configured repository roots, exact execution is manifest-bound, and
+   bounded ownership epochs can use complete privileged evidence. The daily
+   controller is running against a partial root set; machine-wide acceptance
+   remains pending.
+5. **In delivery: completion-aware machine evidence.** Preserve structured
+   cap/error reasons, budgets, pending-directory counts, and per-aggregate
+   traversal completeness so capped currencies are visibly lower bounds and
+   error-affected currencies are visibly incomplete observations.
+   Next, segment oversized roots into resumable census units and reconcile
+   their non-overlapping results into family and long-tail totals.
+6. **Next: active-target granular budgets.** Extend incremental pruning and
    coherent Cargo profile reset with a reviewed active-target size policy so
    current worktrees do not accrete indefinitely.
-6. **Controller activation.** Retain bounded repository concurrency, global
+7. **Controller calibration.** Retain bounded repository concurrency, global
    measurement budgets, bounded pressure waves, per-path safety guards, and
    live free-space stop checks. Compare supervised plans with manual disk-map
-   judgments before enabling unattended execution.
-7. **Shared package-store collectors.** Discover pnpm's canonical content store
+   judgments and require the explained safe pool to plausibly close the
+   configured pressure deficit.
+8. **Shared package-store collectors.** Discover pnpm's canonical content store
    through pnpm and wrap official prune semantics with preflight, protections,
    measurement, and verification. Keep store, metadata, and `dlx` contracts
    separate from project-local `node_modules` cleanup.
-8. **Other owner-mediated domains.** Docker/OrbStack, IDE diagnostics, browser
+9. **Other owner-mediated domains.** Docker/OrbStack, IDE diagnostics, browser
    state, and similar domains use owner operations. Application databases,
    evidence, and VM storage remain report-only until explicit retention or
    export contracts exist. Parallels deletion is outside generic cleanup.
 
-The immediate center of gravity is step 4: deleting whole rebuildable trees
-from owner-free worktrees without spending source-state risk. Step 5 prevents
-the same long tail from regrowing inside active worktrees. Whole-worktree
-removal remains conservative and is not the primary disk-recovery mechanism.
+The immediate center of gravity is steps 5 and 6: make the machine census
+complete enough to explain the long tail, then keep large active targets from
+rebuilding it. Owner-free coarse deletion remains the fastest recovery path,
+while whole-worktree removal stays conservative and separate.
 
-Inventory caches can later make discovery incremental, but cached evidence
-must retain its observation time and be revalidated before mutation.
+Resumable inventory is the next measurement slice. It should partition
+oversized roots into stable non-overlapping segments, persist observation time
+and completion state, resume without recounting finished segments, and
+revalidate any cached evidence before mutation. Exact cleanup authority
+continues to come from a fresh domain manifest and execution guards.
