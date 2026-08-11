@@ -1370,15 +1370,14 @@ fn reconcile_measured_cleanup_authority(manifest: &mut CleanupManifest) -> Resul
         if !present {
             continue;
         }
-        let complete = decision.measurement.as_ref().is_some_and(|measurement| {
-            measurement.complete
-                && measurement.metrics.private_reclaimable_complete
-                && measurement.metrics.errors == 0
-        });
+        let complete = decision
+            .measurement
+            .as_ref()
+            .is_some_and(|measurement| measurement.complete && measurement.metrics.errors == 0);
         if !complete {
             decision.action = GeneratedDirAction::Skip;
             decision.reason =
-                "generated directory has no complete physical measurement".to_string();
+                "generated directory has no complete error-free measurement".to_string();
         }
     }
     reconcile_structural_cleanup_authority(manifest);
@@ -12568,14 +12567,14 @@ mod tests {
         assert!(measurements.iter().any(|measurement| !measurement.complete));
         assert!(decisions.iter().any(|decision| {
             decision.action == GeneratedDirAction::Skip
-                && decision.reason.contains("no complete physical measurement")
+                && decision
+                    .reason
+                    .contains("no complete error-free measurement")
         }));
         assert!(decisions.iter().all(|decision| {
             decision.action != GeneratedDirAction::Delete
                 || decision.measurement.as_ref().is_some_and(|measurement| {
-                    measurement.complete
-                        && measurement.metrics.private_reclaimable_complete
-                        && measurement.metrics.errors == 0
+                    measurement.complete && measurement.metrics.errors == 0
                 })
         }));
         Ok(())
@@ -12660,7 +12659,7 @@ mod tests {
         assert_eq!(manifest.generated_dirs[0].action, GeneratedDirAction::Skip);
         assert!(manifest.generated_dirs[0]
             .reason
-            .contains("no complete physical measurement"));
+            .contains("no complete error-free measurement"));
         manifest.worktrees[0].action = WorktreeAction::Remove;
         reconcile_structural_cleanup_authority(&mut manifest);
         assert_eq!(manifest.worktrees[0].action, WorktreeAction::Keep);
@@ -12671,6 +12670,25 @@ mod tests {
         manifest.generated_dirs.truncate(1);
         manifest.generated_dirs[0].action = GeneratedDirAction::Delete;
         manifest.generated_dirs[0].reason = "fixture".to_string();
+        manifest.generated_dirs[0].measurement = Some(GeneratedDirMeasurement {
+            measured_at_unix: 1_800_000_000,
+            filesystem: "fixture".to_string(),
+            complete: true,
+            visited_entries: 1,
+            metrics: InventoryMetrics {
+                errors: 0,
+                private_reclaimable_complete: false,
+                ..InventoryMetrics::default()
+            },
+        });
+
+        reconcile_measured_cleanup_authority(&mut manifest)?;
+
+        assert_eq!(
+            manifest.generated_dirs[0].action,
+            GeneratedDirAction::Delete
+        );
+
         manifest.generated_dirs[0].sweeps = vec![SweepDecision {
             tool: SweepTool::CargoProfileReset,
             limit: SweepLimit::AgeDays { days: 7 },
