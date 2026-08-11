@@ -1337,6 +1337,22 @@ fn reconcile_structural_cleanup_authority(manifest: &mut CleanupManifest) {
     }
 }
 
+fn generated_measurement_has_execution_authority(measurement: &GeneratedDirMeasurement) -> bool {
+    measurement.complete
+        && measurement.metrics.errors == 0
+        && private_reclaimable_measurement_has_execution_authority(&measurement.metrics)
+}
+
+#[cfg(target_os = "macos")]
+fn private_reclaimable_measurement_has_execution_authority(metrics: &InventoryMetrics) -> bool {
+    metrics.private_reclaimable_complete
+}
+
+#[cfg(not(target_os = "macos"))]
+fn private_reclaimable_measurement_has_execution_authority(_metrics: &InventoryMetrics) -> bool {
+    true
+}
+
 fn reconcile_measured_cleanup_authority(manifest: &mut CleanupManifest) -> Result<()> {
     let routine_worktree_removals = manifest
         .worktrees
@@ -1373,7 +1389,7 @@ fn reconcile_measured_cleanup_authority(manifest: &mut CleanupManifest) -> Resul
         let complete = decision
             .measurement
             .as_ref()
-            .is_some_and(|measurement| measurement.complete && measurement.metrics.errors == 0);
+            .is_some_and(generated_measurement_has_execution_authority);
         if !complete {
             decision.action = GeneratedDirAction::Skip;
             decision.reason =
@@ -3030,11 +3046,8 @@ fn pressure_generated_candidate_order(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, decision)| {
         let measurement = decision.measurement.as_ref();
-        let measurement_complete = measurement.is_some_and(|measurement| {
-            measurement.complete
-                && measurement.metrics.private_reclaimable_complete
-                && measurement.metrics.errors == 0
-        });
+        let measurement_complete =
+            measurement.is_some_and(generated_measurement_has_execution_authority);
         let private_per_entry = measurement
             .map(|measurement| {
                 measurement
@@ -5923,11 +5936,7 @@ fn sort_generated_deletions(
     generated_deletions.sort_by_key(|decision| {
         let measurement = decision.measurement.as_ref();
         let measurement_incomplete = pass != ExecutionPass::Routine
-            && !measurement.is_some_and(|measurement| {
-                measurement.complete
-                    && measurement.metrics.private_reclaimable_complete
-                    && measurement.metrics.errors == 0
-            });
+            && !measurement.is_some_and(generated_measurement_has_execution_authority);
         let pressure_private_per_entry = if pass == ExecutionPass::Routine {
             0
         } else {
@@ -6368,9 +6377,7 @@ pub(crate) fn revalidate_generated_candidate_boundary(
         validate_git_generated_boundary(&canonical_worktree, &canonical_active)?;
     }
     anyhow::ensure!(
-        measurement.complete
-            && measurement.metrics.private_reclaimable_complete
-            && measurement.metrics.errors == 0
+        generated_measurement_has_execution_authority(measurement)
             && measurement.visited_entries <= GENERATED_MEASUREMENT_MAX_ENTRIES_PER_CANDIDATE
             && measurement.filesystem == identity.filesystem,
         "candidate has no complete physical measurement"
@@ -10659,6 +10666,27 @@ mod tests {
             .context("fixture measurement is absent")?
             .complete = true;
 
+        decision
+            .measurement
+            .as_mut()
+            .context("fixture measurement is absent")?
+            .metrics
+            .private_reclaimable_complete = false;
+        #[cfg(target_os = "macos")]
+        {
+            let error = revalidate_generated_candidate(&decision, Some(&first_epoch), Some(&[]))
+                .expect_err("incomplete APFS-private evidence must retain the candidate");
+            assert!(error.to_string().contains("complete physical measurement"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        revalidate_generated_candidate(&decision, Some(&first_epoch), Some(&[]))?;
+        decision
+            .measurement
+            .as_mut()
+            .context("fixture measurement is absent")?
+            .metrics
+            .private_reclaimable_complete = true;
+
         fs::remove_dir_all(&candidate)?;
         fs::create_dir(&candidate)?;
         fs::write(candidate.join("artifact"), "replacement")?;
@@ -12684,11 +12712,22 @@ mod tests {
 
         reconcile_measured_cleanup_authority(&mut manifest)?;
 
+        #[cfg(target_os = "macos")]
+        assert_eq!(manifest.generated_dirs[0].action, GeneratedDirAction::Skip);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             manifest.generated_dirs[0].action,
             GeneratedDirAction::Delete
         );
 
+        manifest.generated_dirs[0].action = GeneratedDirAction::Delete;
+        manifest.generated_dirs[0].reason = "fixture".to_string();
+        manifest.generated_dirs[0]
+            .measurement
+            .as_mut()
+            .context("fixture measurement is absent")?
+            .metrics
+            .private_reclaimable_complete = true;
         manifest.generated_dirs[0].sweeps = vec![SweepDecision {
             tool: SweepTool::CargoProfileReset,
             limit: SweepLimit::AgeDays { days: 7 },
