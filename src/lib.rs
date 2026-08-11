@@ -13004,12 +13004,10 @@ mod tests {
         assert_eq!(candidate.action, GeneratedDirAction::Delete);
         assert_eq!(candidate.cleanup_class, CleanupClass::Pressure);
         assert_eq!(candidate.effective_days, 1);
-        let private_measurement_complete =
-            candidate.measurement.as_ref().is_some_and(|measurement| {
-                measurement.complete
-                    && measurement.metrics.private_reclaimable_complete
-                    && measurement.metrics.errors == 0
-            });
+        let measurement_has_execution_authority = candidate
+            .measurement
+            .as_ref()
+            .is_some_and(generated_measurement_has_execution_authority);
         assert!(repo.join("node_modules").is_dir());
 
         cleanup(
@@ -13030,8 +13028,8 @@ mod tests {
         )?;
         assert_eq!(
             repo.join("node_modules").exists(),
-            !private_measurement_complete,
-            "pressure deletion must require complete private-reclaim evidence"
+            !measurement_has_execution_authority,
+            "pressure deletion must require complete platform measurement authority"
         );
         Ok(())
     }
@@ -13642,15 +13640,12 @@ mod tests {
             .measurement
             .as_ref()
             .context("missing refreshed target measurement")?;
-        if measurement.complete
-            && measurement.metrics.private_reclaimable_complete
-            && measurement.metrics.errors == 0
-        {
+        if generated_measurement_has_execution_authority(measurement) {
             revalidate_generated_candidate(refreshed, None, Some(&system_mount_points()?))?;
         } else {
             let error =
                 revalidate_generated_candidate(refreshed, None, Some(&system_mount_points()?))
-                    .expect_err("incomplete private evidence must remain fail-closed");
+                    .expect_err("incomplete platform measurement must remain fail-closed");
             assert!(error.to_string().contains("complete physical measurement"));
         }
         Ok(())
