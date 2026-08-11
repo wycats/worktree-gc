@@ -6588,10 +6588,15 @@ fn execute_worktree_removals(
         {
             continue;
         }
+        if manifest.check_in_use
+            && !execution_snapshot_allows_worktree_removal(decision, open_handles)
+        {
+            continue;
+        }
         if pull_request_revalidation_required(
             manifest.pull_requests.as_ref(),
             decision.removal_trigger,
-        ) && !revalidate_pull_request_removal(manifest, decision, open_handles)?
+        ) && !revalidate_pull_request_removal(manifest, decision)?
         {
             continue;
         }
@@ -6623,6 +6628,21 @@ fn execute_worktree_removals(
     Ok(())
 }
 
+fn execution_snapshot_allows_worktree_removal(
+    decision: &WorktreeDecision,
+    open_handles: Option<&OpenHandleSnapshot>,
+) -> bool {
+    let owned = dirs_with_open_handles(std::iter::once(decision.path.as_path()), open_handles);
+    if !owned.is_empty() {
+        eprintln!(
+            "  keeping {} because the shared execution snapshot is incomplete or has active ownership",
+            decision.path.display()
+        );
+        return false;
+    }
+    true
+}
+
 fn pull_request_revalidation_required(
     policy: Option<&PullRequestPolicy>,
     trigger: Option<WorktreeRemovalTrigger>,
@@ -6633,7 +6653,6 @@ fn pull_request_revalidation_required(
 fn revalidate_pull_request_removal(
     manifest: &CleanupManifest,
     decision: &WorktreeDecision,
-    open_handles: Option<&OpenHandleSnapshot>,
 ) -> Result<bool> {
     let Some(policy) = manifest.pull_requests.as_ref() else {
         eprintln!(
@@ -6711,14 +6730,6 @@ fn revalidate_pull_request_removal(
         return Ok(false);
     }
 
-    let owned = dirs_with_open_handles(std::iter::once(decision.path.as_path()), open_handles);
-    if !owned.is_empty() {
-        eprintln!(
-            "  keeping {} because the shared execution snapshot is incomplete or has active ownership",
-            decision.path.display()
-        );
-        return Ok(false);
-    }
     let fresh_ownership =
         process_ownership_evidence_for_paths(std::slice::from_ref(&decision.path));
     if !fresh_ownership_allows_removal(&fresh_ownership) {
@@ -9968,6 +9979,54 @@ mod tests {
             owner_free.removal_trigger,
             Some(WorktreeRemovalTrigger::Age)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn age_based_worktree_removal_rechecks_the_execution_ownership_snapshot() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree_path = repo.with_file_name("stale-owned-at-execution");
+        add_worktree(&repo, &worktree_path, "stale-owned-at-execution")?;
+        let worktree_path = fs::canonicalize(worktree_path)?;
+        let run = plan_cleanup_with_protections(
+            Some(&repo),
+            CleanupOptions {
+                execute: true,
+                stale_days: 30,
+                generated_days: 7,
+                generated_activity_only: true,
+                check_in_use: true,
+                generated_config: GeneratedDirConfig::default(),
+                cargo_lock_timeout: None,
+                defer_lock_timeouts: false,
+                pressure: None,
+                pull_requests: None,
+                now: now(),
+            },
+            &[],
+            Some(&OpenHandleSnapshot::Available(HashSet::new())),
+        )?;
+        let decision = run
+            .manifest
+            .worktrees
+            .iter()
+            .find(|decision| decision.path == worktree_path)
+            .context("missing stale worktree decision")?;
+        assert_eq!(decision.action, WorktreeAction::Remove);
+        assert_eq!(decision.removal_trigger, Some(WorktreeRemovalTrigger::Age));
+        assert!(run.manifest.pull_requests.is_none());
+
+        execute_worktree_removals(
+            &run.manifest,
+            ExecutionPass::Routine,
+            &[decision],
+            &mut HashSet::new(),
+            Some(&OpenHandleSnapshot::Available(HashSet::from([
+                worktree_path.join("src/held.rs"),
+            ]))),
+        )?;
+
+        assert!(worktree_path.exists());
         Ok(())
     }
 
