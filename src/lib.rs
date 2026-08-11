@@ -527,6 +527,16 @@ impl SweepDecision {
                 )
             })
     }
+
+    fn has_refused_candidate(&self) -> bool {
+        self.candidates
+            .iter()
+            .any(|candidate| candidate.action == SweepCandidateAction::Skip)
+            || self
+                .profile_candidates
+                .iter()
+                .any(|candidate| candidate.action == SweepCandidateAction::Skip)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -936,9 +946,9 @@ fn plan_cleanup_with_protections_in_roots(
             github_pr::observe_pull_requests(&context.current_worktree, &worktrees, options.now)
         })
         .unwrap_or_default();
-    let pull_request_ownership_complete = options.pull_requests.is_none()
-        || matches!(open_handles, Some(OpenHandleSnapshot::Available(_)));
-    let pull_request_owned_worktrees = if options.pull_requests.is_some() {
+    let worktree_ownership_complete =
+        !options.check_in_use || matches!(open_handles, Some(OpenHandleSnapshot::Available(_)));
+    let owned_worktrees = if options.check_in_use {
         dirs_with_open_handles(
             worktrees
                 .iter()
@@ -971,8 +981,8 @@ fn plan_cleanup_with_protections_in_roots(
         options.pressure.as_ref(),
         options.pull_requests.as_ref(),
         &pull_request_evidence,
-        pull_request_ownership_complete,
-        &pull_request_owned_worktrees,
+        worktree_ownership_complete,
+        &owned_worktrees,
     )?;
     if roots.is_some() {
         for decision in &mut worktree_decisions {
@@ -1016,7 +1026,7 @@ fn plan_cleanup_with_protections_in_roots(
         })
         .collect::<Vec<_>>();
 
-    let manifest = CleanupManifest {
+    let mut manifest = CleanupManifest {
         manifest_version: MANIFEST_VERSION,
         mode: if options.execute {
             CleanupMode::Execute
@@ -1044,6 +1054,8 @@ fn plan_cleanup_with_protections_in_roots(
         worktrees: worktree_decisions,
         generated_dirs: generated_decisions,
     };
+
+    reconcile_structural_cleanup_authority(&mut manifest);
 
     let manifest_path = write_manifest(&context.git_common_dir, &manifest)?;
 
@@ -1181,6 +1193,10 @@ fn measure_cleanup_runs_matching_paths(
     }
 
     if targets.is_empty() {
+        for run in runs {
+            reconcile_measured_cleanup_authority(&mut run.manifest)?;
+            run.manifest_path = write_manifest(&run.manifest.git_common_dir, &run.manifest)?;
+        }
         return Ok(());
     }
 
@@ -1246,8 +1262,126 @@ fn measure_cleanup_runs_matching_paths(
     }
 
     for run in runs {
+        reconcile_measured_cleanup_authority(&mut run.manifest)?;
         run.manifest_path = write_manifest(&run.manifest.git_common_dir, &run.manifest)?;
     }
+    Ok(())
+}
+
+fn reconcile_structural_cleanup_authority(manifest: &mut CleanupManifest) {
+    for decision in &mut manifest.generated_dirs {
+        if decision.action == GeneratedDirAction::Delete
+            && decision
+                .sweeps
+                .iter()
+                .any(SweepDecision::has_refused_candidate)
+        {
+            decision.action = GeneratedDirAction::Skip;
+            decision.reason = "generated directory contains a refused sweep candidate".to_string();
+        }
+    }
+
+    loop {
+        let retained_paths = manifest
+            .generated_dirs
+            .iter()
+            .filter(|decision| {
+                matches!(
+                    decision.action,
+                    GeneratedDirAction::Skip | GeneratedDirAction::Sweep
+                )
+            })
+            .map(|decision| decision.path.clone())
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for decision in &mut manifest.generated_dirs {
+            if decision.action == GeneratedDirAction::Delete
+                && retained_paths.iter().any(|retained| {
+                    retained != &decision.path && retained.starts_with(&decision.path)
+                })
+            {
+                decision.action = GeneratedDirAction::Skip;
+                decision.reason =
+                    "generated directory contains a nested candidate that must be retained"
+                        .to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let retained_generated_paths = manifest
+        .generated_dirs
+        .iter()
+        .filter(|decision| {
+            matches!(
+                decision.action,
+                GeneratedDirAction::Skip | GeneratedDirAction::Sweep
+            )
+        })
+        .map(|decision| decision.path.clone())
+        .collect::<Vec<_>>();
+    for decision in &mut manifest.worktrees {
+        if decision.action == WorktreeAction::Remove
+            && retained_generated_paths
+                .iter()
+                .any(|path| path.starts_with(&decision.path))
+        {
+            decision.action = WorktreeAction::Keep;
+            decision.removal_trigger = None;
+            decision.reason =
+                "worktree contains a generated candidate that must be retained".to_string();
+        }
+    }
+}
+
+fn reconcile_measured_cleanup_authority(manifest: &mut CleanupManifest) -> Result<()> {
+    let routine_worktree_removals = manifest
+        .worktrees
+        .iter()
+        .filter(|decision| {
+            decision.action == WorktreeAction::Remove
+                && decision.cleanup_class == CleanupClass::Routine
+        })
+        .map(|decision| decision.path.clone())
+        .collect::<Vec<_>>();
+    for decision in &mut manifest.generated_dirs {
+        if decision.action != GeneratedDirAction::Delete
+            || routine_worktree_removals
+                .iter()
+                .any(|worktree| decision.path.starts_with(worktree))
+        {
+            continue;
+        }
+        let present = match fs::symlink_metadata(&decision.path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to recheck generated measurement candidate {}",
+                        decision.path.display()
+                    )
+                });
+            }
+        };
+        if !present {
+            continue;
+        }
+        let complete = decision.measurement.as_ref().is_some_and(|measurement| {
+            measurement.complete
+                && measurement.metrics.private_reclaimable_complete
+                && measurement.metrics.errors == 0
+        });
+        if !complete {
+            decision.action = GeneratedDirAction::Skip;
+            decision.reason =
+                "generated directory has no complete physical measurement".to_string();
+        }
+    }
+    reconcile_structural_cleanup_authority(manifest);
     Ok(())
 }
 
@@ -2870,6 +3004,7 @@ fn carry_generated_measurements(previous: &CleanupRun, refreshed: &mut CleanupRu
             }
         }
     }
+    reconcile_measured_cleanup_authority(&mut refreshed.manifest)?;
     Ok(())
 }
 
@@ -5702,11 +5837,26 @@ fn plan_worktree_cleanup_with_pull_requests(
                     None,
                 )
             } else if age.is_some_and(|days| days >= effective_days) {
-                (
-                    WorktreeAction::Remove,
-                    format!("clean worktree last committed at least {effective_days} days ago"),
-                    Some(WorktreeRemovalTrigger::Age),
-                )
+                if !ownership_evidence_complete {
+                    (
+                        WorktreeAction::Keep,
+                        "age-based cleanup requires complete process ownership evidence"
+                            .to_string(),
+                        None,
+                    )
+                } else if owned_worktrees.contains(&worktree.path) {
+                    (
+                        WorktreeAction::Keep,
+                        "age-based worktree is currently owned by a running process".to_string(),
+                        None,
+                    )
+                } else {
+                    (
+                        WorktreeAction::Remove,
+                        format!("clean worktree last committed at least {effective_days} days ago"),
+                        Some(WorktreeRemovalTrigger::Age),
+                    )
+                }
             } else {
                 (
                     WorktreeAction::Keep,
@@ -9764,6 +9914,58 @@ mod tests {
     }
 
     #[test]
+    fn age_based_worktree_removal_requires_complete_owner_free_evidence() -> Result<()> {
+        let (_temp, repo) = init_repo()?;
+        let worktree_path = repo.with_file_name("stale-owned-worktree");
+        add_worktree(&repo, &worktree_path, "stale-owned-worktree")?;
+        let report = audit(Some(&repo), 7, now())?;
+        let worktree = report
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == fs::canonicalize(&worktree_path).unwrap())
+            .context("missing stale worktree")?;
+
+        let plan = |ownership_complete, owned: bool| {
+            let owned_worktrees = owned
+                .then(|| worktree.path.clone())
+                .into_iter()
+                .collect::<HashSet<_>>();
+            plan_worktree_cleanup_with_pull_requests(
+                std::slice::from_ref(worktree),
+                0,
+                now(),
+                &[],
+                None,
+                None,
+                &BTreeMap::new(),
+                ownership_complete,
+                &owned_worktrees,
+            )
+            .map(|decisions| decisions.into_iter().next().unwrap())
+        };
+
+        let incomplete = plan(false, false)?;
+        assert_eq!(incomplete.action, WorktreeAction::Keep);
+        assert!(incomplete
+            .reason
+            .contains("complete process ownership evidence"));
+
+        let owned = plan(true, true)?;
+        assert_eq!(owned.action, WorktreeAction::Keep);
+        assert!(owned
+            .reason
+            .contains("currently owned by a running process"));
+
+        let owner_free = plan(true, false)?;
+        assert_eq!(owner_free.action, WorktreeAction::Remove);
+        assert_eq!(
+            owner_free.removal_trigger,
+            Some(WorktreeRemovalTrigger::Age)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn merged_pr_evidence_does_not_cross_between_branches_at_the_same_head() -> Result<()> {
         let (_temp, repo) = init_repo()?;
         let merged_path = repo.with_file_name("merged-pr-branch-a");
@@ -12345,11 +12547,14 @@ mod tests {
             .all(|decision| decision.measurement.is_none()));
 
         measure_cleanup_runs(std::slice::from_mut(&mut run), 1)?;
-        let measurements = run
+        let decisions = run
             .manifest
             .generated_dirs
             .iter()
-            .filter(|decision| decision.action == GeneratedDirAction::Delete)
+            .filter(|decision| matches!(decision.name.as_str(), ".next" | "node_modules"))
+            .collect::<Vec<_>>();
+        let measurements = decisions
+            .iter()
             .map(|decision| decision.measurement.as_ref())
             .collect::<Option<Vec<_>>>()
             .context("delete candidate was not measured")?;
@@ -12361,6 +12566,137 @@ mod tests {
             1
         );
         assert!(measurements.iter().any(|measurement| !measurement.complete));
+        assert!(decisions.iter().any(|decision| {
+            decision.action == GeneratedDirAction::Skip
+                && decision.reason.contains("no complete physical measurement")
+        }));
+        assert!(decisions.iter().all(|decision| {
+            decision.action != GeneratedDirAction::Delete
+                || decision.measurement.as_ref().is_some_and(|measurement| {
+                    measurement.complete
+                        && measurement.metrics.private_reclaimable_complete
+                        && measurement.metrics.errors == 0
+                })
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_generated_measurement_blocks_ancestor_and_worktree_removal() -> Result<()> {
+        let temp = TempDir::new()?;
+        let worktree = temp.path().join("worktree");
+        let target = worktree.join("target");
+        let retained = target.join("custom-profile");
+        fs::create_dir_all(&retained)?;
+
+        let generated =
+            |path: PathBuf, action: GeneratedDirAction, measurement| GeneratedDirDecision {
+                path,
+                worktree_path: worktree.clone(),
+                name: "target".to_string(),
+                mtime: None,
+                mtime_unix: None,
+                mtime_nanos: None,
+                effective_days: 7,
+                in_use: false,
+                ownership_evidence_complete: true,
+                worktree_in_use: false,
+                owner_free_pressure: false,
+                protection: None,
+                cleanup_class: CleanupClass::Routine,
+                identity: None,
+                measurement,
+                source_dirty_count_without_candidate: None,
+                source_status_sha256_without_candidate: None,
+                sweeps: Vec::new(),
+                action,
+                reason: "fixture".to_string(),
+            };
+        let mut manifest = CleanupManifest {
+            manifest_version: MANIFEST_VERSION,
+            mode: CleanupMode::DryRun,
+            generated_at: "fixture".to_string(),
+            repo_root: worktree.clone(),
+            current_worktree: worktree.clone(),
+            git_common_dir: worktree.join(".git"),
+            stale_days: 14,
+            generated_days: 7,
+            generated_activity_only: true,
+            check_in_use: true,
+            cargo_lock_timeout_secs: None,
+            defer_lock_timeouts: false,
+            pressure: None,
+            pull_requests: None,
+            generated_delete_names: vec!["target".to_string()],
+            generated_report_only_names: Vec::new(),
+            generated_sweep_paths: Vec::new(),
+            protections: Vec::new(),
+            metadata_prune_enabled: false,
+            prune_output: String::new(),
+            worktrees: vec![WorktreeDecision {
+                path: worktree.clone(),
+                head: Some("fixture".to_string()),
+                branch: Some("fixture".to_string()),
+                metadata_prunable: false,
+                action: WorktreeAction::Keep,
+                cleanup_class: CleanupClass::Routine,
+                removal_trigger: Some(WorktreeRemovalTrigger::Age),
+                reason: "fixture".to_string(),
+                protection: None,
+                dirty_count: Some(0),
+                status_sha256: Some("fixture".to_string()),
+                last_commit: None,
+                activity_age_days: Some(30),
+                pull_request: None,
+            }],
+            generated_dirs: vec![
+                generated(target.clone(), GeneratedDirAction::Delete, None),
+                generated(retained, GeneratedDirAction::Skip, None),
+            ],
+        };
+
+        reconcile_measured_cleanup_authority(&mut manifest)?;
+
+        assert_eq!(manifest.generated_dirs[0].action, GeneratedDirAction::Skip);
+        assert!(manifest.generated_dirs[0]
+            .reason
+            .contains("no complete physical measurement"));
+        manifest.worktrees[0].action = WorktreeAction::Remove;
+        reconcile_structural_cleanup_authority(&mut manifest);
+        assert_eq!(manifest.worktrees[0].action, WorktreeAction::Keep);
+        assert!(manifest.worktrees[0]
+            .reason
+            .contains("generated candidate that must be retained"));
+
+        manifest.generated_dirs.truncate(1);
+        manifest.generated_dirs[0].action = GeneratedDirAction::Delete;
+        manifest.generated_dirs[0].reason = "fixture".to_string();
+        manifest.generated_dirs[0].sweeps = vec![SweepDecision {
+            tool: SweepTool::CargoProfileReset,
+            limit: SweepLimit::AgeDays { days: 7 },
+            delegated: false,
+            project_dir: None,
+            reason: "fixture".to_string(),
+            candidates: Vec::new(),
+            profile_candidates: vec![CargoProfileCandidateDecision {
+                path: target.join("custom-profile"),
+                lock_path: target.join("custom-profile/.cargo-lock"),
+                cargo_profile: None,
+                cargo_target: None,
+                last_activity_unix: None,
+                last_activity: None,
+                activity_age_days: None,
+                action: SweepCandidateAction::Skip,
+                reason: "custom profile is unsupported".to_string(),
+            }],
+        }];
+
+        reconcile_structural_cleanup_authority(&mut manifest);
+
+        assert_eq!(manifest.generated_dirs[0].action, GeneratedDirAction::Skip);
+        assert!(manifest.generated_dirs[0]
+            .reason
+            .contains("refused sweep candidate"));
         Ok(())
     }
 
