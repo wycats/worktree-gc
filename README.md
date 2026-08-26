@@ -373,13 +373,15 @@ worktree-gc collect generated ~/.codex/worktrees \
   --max-entries-per-artifact 2000000
 ```
 
-A version-compatible resume manifest contributes identity-matching complete
-observations without rescanning them and carries incomplete private-byte lower
-bounds forward as completion-priority hints. Every artifact records its
-measurement source and observation time. Changed identities are measured
-fresh. These resumed observations remain report-only prioritization evidence;
-cleanup always creates a fresh manifest and repeats exact identity,
-measurement, ownership, protection, tracked-content, and lock checks.
+A version-compatible resume manifest carries identity-matching incomplete
+observations forward as completion-priority hints. Complete observations are
+measured again because a bounded activity sample cannot prove that every deep
+descendant is unchanged. Every artifact records its measurement source,
+traversal evidence, and observation time; scan failures remain distinct from
+clean entry-budget lower bounds. These resumed observations remain report-only
+prioritization evidence; cleanup always creates a fresh manifest and repeats
+exact identity, measurement, ownership, protection, tracked-content, and lock
+checks.
 
 Use `--json` for the complete structured opportunity run. `--top` affects only
 the bounded human sections; the durable collector manifest retains every

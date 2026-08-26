@@ -1,4 +1,7 @@
-use crate::inventory::{inventory, InventoryMetrics, InventoryOptions};
+use crate::inventory::{
+    inventory, InventoryMetrics, InventoryOptions, InventoryTraversalEvidence,
+    InventoryTraversalIncompleteReason, InventoryTraversalStatus,
+};
 use crate::{
     discover_repositories, format_bytes, generated_dir_identity, skip_repository_discovery_dir,
     triage_repositories_serial_with_errors, CleanupClass, CleanupMode, GeneratedDirAction,
@@ -196,6 +199,8 @@ pub struct GeneratedArtifactMeasurement {
     #[serde(default)]
     pub completion_attempts: u64,
     pub filesystem: Option<String>,
+    #[serde(default)]
+    pub traversal: InventoryTraversalEvidence,
     pub complete: bool,
     pub visited_entries: u64,
     pub metrics: InventoryMetrics,
@@ -221,6 +226,7 @@ impl GeneratedArtifactMeasurement {
             activity_mtime_nanos: None,
             completion_attempts: 0,
             filesystem: None,
+            traversal: InventoryTraversalEvidence::default(),
             complete: false,
             visited_entries: 0,
             metrics: InventoryMetrics {
@@ -378,7 +384,7 @@ fn seed_resume_measurements(
     artifacts: &mut [GeneratedArtifactObservation],
     resume: &LoadedResumeManifest,
 ) -> (usize, usize) {
-    let mut reused_complete = 0;
+    let reused_complete = 0;
     let mut carried_incomplete = 0;
     for artifact in artifacts {
         let Some(prior) = resume.measurements.get(&artifact.path) else {
@@ -402,16 +408,17 @@ fn seed_resume_measurements(
         {
             continue;
         }
+        // A bounded activity sample can prioritize incomplete report-only
+        // observations, but it cannot prove that a complete recursive
+        // measurement is still current: an existing deeper descendant may
+        // change without updating any sampled ancestor. Complete observations
+        // therefore require a fresh inventory pass on every run.
+        if measurement_is_complete(prior) {
+            continue;
+        }
         artifact.measurement = prior.clone();
         artifact.measurement.source = GeneratedMeasurementSource::PriorManifest;
-        if artifact.measurement.complete
-            && artifact.measurement.error.is_none()
-            && artifact.measurement.metrics.private_reclaimable_complete
-        {
-            reused_complete += 1;
-        } else {
-            carried_incomplete += 1;
-        }
+        carried_incomplete += 1;
     }
     (reused_complete, carried_incomplete)
 }
@@ -984,9 +991,11 @@ pub fn print_generated_collect(run: &GeneratedCollectRun) {
             .take(run.manifest.policy.top)
         {
             println!(
-                "  {} private lower bound | {} allocated lower bound | {} entries | {} | {}",
+                "  {} private{} | {} allocated{} | {} entries | {} | {}",
                 format_bytes(artifact.measurement.metrics.private_reclaimable_bytes),
+                incomplete_measurement_qualifier(&artifact.measurement),
                 format_bytes(artifact.measurement.metrics.allocated_bytes),
+                incomplete_measurement_qualifier(&artifact.measurement),
                 artifact.measurement.visited_entries,
                 artifact
                     .measurement
@@ -1087,6 +1096,22 @@ fn measurement_is_complete(measurement: &GeneratedArtifactMeasurement) -> bool {
     measurement.complete
         && measurement.error.is_none()
         && measurement.metrics.private_reclaimable_complete
+}
+
+fn incomplete_measurement_qualifier(measurement: &GeneratedArtifactMeasurement) -> &'static str {
+    let budget_only = measurement.traversal.status == InventoryTraversalStatus::Incomplete
+        && measurement.traversal.scan_error_count == 0
+        && !measurement.traversal.incomplete_reasons.is_empty()
+        && measurement
+            .traversal
+            .incomplete_reasons
+            .iter()
+            .all(|reason| *reason == InventoryTraversalIncompleteReason::EntryBudgetExhausted);
+    if budget_only {
+        " observed lower bound"
+    } else {
+        " incomplete observation"
+    }
 }
 
 fn artifact_is_safe(artifact: &GeneratedArtifactObservation) -> bool {
@@ -1346,6 +1371,7 @@ fn measure_artifacts(
                     .join("; "),
             )
         };
+        let traversal = root.traversal;
         let mut metrics = root.metrics;
         metrics.private_reclaimable_complete = complete && metrics.private_reclaimable_complete;
         for index in indexes {
@@ -1361,6 +1387,7 @@ fn measure_artifacts(
                 activity_mtime_nanos: artifacts[*index].mtime_nanos,
                 completion_attempts,
                 filesystem: Some(root.filesystem.clone()),
+                traversal: traversal.clone(),
                 complete,
                 visited_entries: root.visited_entries,
                 metrics: metrics.clone(),
@@ -1718,6 +1745,21 @@ mod tests {
             activity_mtime_nanos: None,
             completion_attempts: 0,
             filesystem: Some("fixture".to_string()),
+            traversal: if complete {
+                InventoryTraversalEvidence {
+                    status: InventoryTraversalStatus::Complete,
+                    ..InventoryTraversalEvidence::default()
+                }
+            } else {
+                InventoryTraversalEvidence {
+                    status: InventoryTraversalStatus::Incomplete,
+                    incomplete_reasons: vec![
+                        InventoryTraversalIncompleteReason::EntryBudgetExhausted,
+                    ],
+                    entry_budget_exhaustion: None,
+                    scan_error_count: 0,
+                }
+            },
             complete,
             visited_entries,
             metrics: InventoryMetrics {
@@ -1763,12 +1805,15 @@ mod tests {
     }
 
     #[test]
-    fn resume_reuses_complete_measurement_for_an_unchanged_root() {
+    fn resume_requires_a_fresh_scan_when_a_deep_descendant_changes() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target");
-        fs::create_dir(&target).unwrap();
-        fs::write(target.join("artifact"), b"fixture").unwrap();
+        let deep = target.join("one/two/three/four/five/six/seven");
+        fs::create_dir_all(&deep).unwrap();
+        let artifact_path = deep.join("artifact");
+        fs::write(&artifact_path, b"old").unwrap();
         let prior = prior_measurement(&target, true, 1, 4096);
+        fs::write(&artifact_path, b"new").unwrap();
         let resume = loaded_resume(
             temp.path().join("prior.json"),
             BTreeMap::from([(target.clone(), prior)]),
@@ -1776,16 +1821,34 @@ mod tests {
         let mut artifacts = vec![artifact(&target, GeneratedDirAction::Skip)];
 
         let counts = seed_resume_measurements(&mut artifacts, &resume);
-        measure_artifacts(&mut artifacts, 1, 1, true).unwrap();
 
-        assert_eq!(counts, (1, 0));
+        assert_eq!(counts, (0, 0));
         assert_eq!(
             artifacts[0].measurement.source,
-            GeneratedMeasurementSource::PriorManifest
+            GeneratedMeasurementSource::Pending
         );
+    }
+
+    #[test]
+    fn incomplete_measurement_qualifiers_distinguish_budget_caps_from_scan_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let mut measurement = prior_measurement(&target, false, 1, 4096);
+
         assert_eq!(
-            artifacts[0].measurement.metrics.private_reclaimable_bytes,
-            4096
+            incomplete_measurement_qualifier(&measurement),
+            " observed lower bound"
+        );
+
+        measurement.traversal.incomplete_reasons =
+            vec![InventoryTraversalIncompleteReason::ScanErrors];
+        measurement.traversal.scan_error_count = 1;
+        measurement.error = Some("permission denied".to_string());
+
+        assert_eq!(
+            incomplete_measurement_qualifier(&measurement),
+            " incomplete observation"
         );
     }
 

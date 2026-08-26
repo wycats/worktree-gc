@@ -169,12 +169,14 @@ Generated opportunity reporting ranks complete APFS-private measurements
 before incomplete lower bounds. Complete owner-free roots, complete retained
 or blocked roots, and incomplete measurements remain separate report queues so
 summed path allocation cannot masquerade as reclaim evidence. A generated
-collector manifest can seed a later bounded pass: identity-matching complete
-observations retain their original timestamps, while incomplete lower bounds
-prioritize which roots receive the next per-artifact completion budget. The
-report records current versus resumed observations. This is an observation
-ledger, not mutation authority; an exact cleanup manifest always measures and
-revalidates its candidate again.
+collector manifest can seed a later bounded pass: incomplete observations
+prioritize which roots receive the next per-artifact completion budget, while
+complete roots receive a fresh recursive measurement. The report preserves
+structured traversal causes so clean entry-budget exhaustion is an observed
+lower bound and scan failures remain incomplete observations. It also records
+current versus resumed observations. This is an observation ledger, not
+mutation authority; an exact cleanup manifest always measures and revalidates
+its candidate again.
 
 These domains remain owner-report-only: `~/.cache/local-sandbox`,
 `~/.codex/sessions` plus `~/.codex/archived_sessions`, and VS Code/Gateway

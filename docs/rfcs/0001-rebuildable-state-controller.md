@@ -483,10 +483,11 @@ already conservative and is not the first place to spend implementation risk.
 The current bet is a trustworthy generated-opportunity loop. The report should
 lead with complete APFS-private reclaim rather than summed path allocation,
 separate blocked roots from incomplete measurements, and spend later bounded
-passes completing the largest observed lower bounds. Identity-matching complete
-observations may retain their original timestamps across report-only passes;
-changed identities are measured fresh, and cleanup still requires a newly
-measured exact manifest. Organic proof is one multi-GiB opportunity whose
+passes completing the largest observed lower bounds. Incomplete observations
+may guide later completion priority, while complete roots are recursively
+measured again because bounded activity sampling cannot prove deep-descendant
+freshness. Cleanup still requires a newly measured exact manifest. Organic
+proof is one multi-GiB opportunity whose
 projected private reclaim closely matches realized free space after supervised
 execution.
 
@@ -514,9 +515,9 @@ large generated roots are owned rather than owner-free.
   quarantine, Cargo-lock, and realized-reclaim evidence.
 - In delivery: distinguish traversal completion from private-measurement
   completion at the root and retained-aggregate levels; rank complete private
-  reclaim before lower bounds; and let a prior generated report reuse
-  identity-matching complete observations while prioritizing its incomplete
-  roots for a bounded completion pass.
+  reclaim before lower bounds; and let a prior generated report prioritize its
+  incomplete roots for a bounded completion pass while remeasuring complete
+  roots.
 - Next: segment and resume oversized broad inventory roots without
   double-counting, then classify their material generated descendants through
   existing exact execution contracts.
