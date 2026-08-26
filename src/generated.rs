@@ -1796,11 +1796,15 @@ mod tests {
             fs::write(root.join("one"), b"one").unwrap();
             fs::write(root.join("two"), b"two").unwrap();
         }
+        let mut smaller_prior = prior_measurement(&smaller, false, 1, 0);
+        smaller_prior.metrics.allocated_bytes = 10;
+        let mut larger_prior = prior_measurement(&larger, false, 1, 0);
+        larger_prior.metrics.allocated_bytes = 100;
         let resume = loaded_resume(
             temp.path().join("prior.json"),
             BTreeMap::from([
-                (smaller.clone(), prior_measurement(&smaller, false, 1, 10)),
-                (larger.clone(), prior_measurement(&larger, false, 1, 100)),
+                (smaller.clone(), smaller_prior),
+                (larger.clone(), larger_prior),
             ]),
         );
         let mut artifacts = vec![
