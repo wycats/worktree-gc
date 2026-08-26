@@ -1372,8 +1372,8 @@ fn measure_artifacts(
             let measurement = &artifacts[indexes[0]].measurement;
             let hint = &measurement.metrics;
             (
-                measurement.source != GeneratedMeasurementSource::PriorManifest,
                 measurement.completion_attempts,
+                measurement.source != GeneratedMeasurementSource::PriorManifest,
                 std::cmp::Reverse(hint.private_reclaimable_bytes),
                 std::cmp::Reverse(hint.allocated_bytes),
                 path.clone(),
@@ -2021,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_incomplete_roots_stay_ahead_of_fresh_remeasurements() {
+    fn unattempted_resumed_roots_stay_ahead_of_fresh_remeasurements() {
         let temp = tempfile::tempdir().unwrap();
         let fresh = temp.path().join("a-fresh");
         let resumed = temp.path().join("b-resumed");
@@ -2029,8 +2029,7 @@ mod tests {
         fs::create_dir(&resumed).unwrap();
         fs::write(fresh.join("one"), b"one").unwrap();
         fs::write(resumed.join("one"), b"one").unwrap();
-        let mut resumed_prior = prior_measurement(&resumed, false, 1, 4096);
-        resumed_prior.completion_attempts = 3;
+        let resumed_prior = prior_measurement(&resumed, false, 1, 4096);
         let resume = loaded_resume(
             temp.path().join("prior.json"),
             BTreeMap::from([(resumed.clone(), resumed_prior)]),
@@ -2051,7 +2050,41 @@ mod tests {
             artifacts[1].measurement.source,
             GeneratedMeasurementSource::CurrentRun
         );
-        assert_eq!(artifacts[1].measurement.completion_attempts, 4);
+        assert_eq!(artifacts[1].measurement.completion_attempts, 1);
+    }
+
+    #[test]
+    fn fresh_roots_enter_after_a_resumed_root_has_a_bounded_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let fresh = temp.path().join("a-fresh");
+        let resumed = temp.path().join("b-resumed");
+        fs::create_dir(&fresh).unwrap();
+        fs::create_dir(&resumed).unwrap();
+        fs::write(fresh.join("one"), b"one").unwrap();
+        fs::write(resumed.join("one"), b"one").unwrap();
+        let mut resumed_prior = prior_measurement(&resumed, false, 1, 4096);
+        resumed_prior.completion_attempts = 1;
+        let resume = loaded_resume(
+            temp.path().join("prior.json"),
+            BTreeMap::from([(resumed.clone(), resumed_prior)]),
+        );
+        let mut artifacts = vec![
+            artifact(&fresh, GeneratedDirAction::Skip),
+            artifact(&resumed, GeneratedDirAction::Skip),
+        ];
+
+        seed_resume_measurements(&mut artifacts, &resume);
+        measure_artifacts(&mut artifacts, 1, 1, true).unwrap();
+
+        assert_eq!(
+            artifacts[0].measurement.source,
+            GeneratedMeasurementSource::CurrentRun
+        );
+        assert_eq!(
+            artifacts[1].measurement.source,
+            GeneratedMeasurementSource::PriorManifest
+        );
+        assert_eq!(artifacts[1].measurement.completion_attempts, 1);
     }
 
     #[test]
