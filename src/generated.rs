@@ -691,7 +691,7 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
         .count();
     let incomplete_measurements = artifacts
         .iter()
-        .filter(|artifact| artifact_is_incomplete(artifact))
+        .filter(|artifact| artifact_measurement_is_incomplete(artifact))
         .count();
     let all_measurements_current = resumed_measurements == 0;
     let observed_metrics = sum_metrics(
@@ -968,11 +968,7 @@ pub fn print_generated_collect(run: &GeneratedCollectRun) {
         for artifact in plan
             .artifacts
             .iter()
-            .filter(|artifact| {
-                !artifact.measurement.complete
-                    || artifact.measurement.error.is_some()
-                    || !artifact.measurement.metrics.private_reclaimable_complete
-            })
+            .filter(|artifact| artifact_measurement_is_incomplete(artifact))
             .take(run.manifest.policy.top)
         {
             println!(
@@ -1067,10 +1063,17 @@ fn age_days(now: SystemTime, then_unix: i64) -> u64 {
 }
 
 fn artifact_is_incomplete(artifact: &GeneratedArtifactObservation) -> bool {
-    !artifact.ownership_evidence_complete
-        || !artifact.measurement.complete
-        || artifact.measurement.error.is_some()
-        || !artifact.measurement.metrics.private_reclaimable_complete
+    !artifact.ownership_evidence_complete || artifact_measurement_is_incomplete(artifact)
+}
+
+fn artifact_measurement_is_incomplete(artifact: &GeneratedArtifactObservation) -> bool {
+    !measurement_is_complete(&artifact.measurement)
+}
+
+fn measurement_is_complete(measurement: &GeneratedArtifactMeasurement) -> bool {
+    measurement.complete
+        && measurement.error.is_none()
+        && measurement.metrics.private_reclaimable_complete
 }
 
 fn artifact_is_safe(artifact: &GeneratedArtifactObservation) -> bool {
@@ -1213,10 +1216,7 @@ fn measure_artifacts(
 ) -> Result<()> {
     let mut targets: BTreeMap<PathBuf, (GeneratedDirIdentity, Vec<usize>)> = BTreeMap::new();
     for (index, artifact) in artifacts.iter_mut().enumerate() {
-        if artifact.measurement.complete
-            && artifact.measurement.error.is_none()
-            && artifact.measurement.metrics.private_reclaimable_complete
-        {
+        if measurement_is_complete(&artifact.measurement) {
             continue;
         }
         let identity = match generated_dir_identity(&artifact.path) {
@@ -1334,7 +1334,7 @@ fn measure_artifacts(
         let mut metrics = root.metrics;
         metrics.private_reclaimable_complete = complete && metrics.private_reclaimable_complete;
         for index in indexes {
-            artifacts[*index].measurement = GeneratedArtifactMeasurement {
+            let current = GeneratedArtifactMeasurement {
                 source: GeneratedMeasurementSource::CurrentRun,
                 identity: Some(identity.clone()),
                 measured_at_unix: Some(measured_at_unix),
@@ -1344,9 +1344,37 @@ fn measure_artifacts(
                 metrics: metrics.clone(),
                 error: error.clone(),
             };
+            if measurement_improves_prior_hint(&current, &artifacts[*index].measurement) {
+                artifacts[*index].measurement = current;
+            }
         }
     }
     Ok(())
+}
+
+fn measurement_improves_prior_hint(
+    current: &GeneratedArtifactMeasurement,
+    prior: &GeneratedArtifactMeasurement,
+) -> bool {
+    if prior.source != GeneratedMeasurementSource::PriorManifest || measurement_is_complete(current)
+    {
+        return true;
+    }
+    if measurement_is_complete(prior) {
+        return false;
+    }
+
+    let current_metrics = &current.metrics;
+    let prior_metrics = &prior.metrics;
+    let does_not_regress = current.visited_entries >= prior.visited_entries
+        && current_metrics.private_reclaimable_bytes >= prior_metrics.private_reclaimable_bytes
+        && current_metrics.allocated_bytes >= prior_metrics.allocated_bytes
+        && current_metrics.logical_bytes >= prior_metrics.logical_bytes;
+    let makes_progress = current.visited_entries > prior.visited_entries
+        || current_metrics.private_reclaimable_bytes > prior_metrics.private_reclaimable_bytes
+        || current_metrics.allocated_bytes > prior_metrics.allocated_bytes
+        || current_metrics.logical_bytes > prior_metrics.logical_bytes;
+    does_not_regress && makes_progress
 }
 
 fn summarize_artifacts(
@@ -1795,6 +1823,47 @@ mod tests {
             GeneratedMeasurementSource::PriorManifest
         );
         assert!(!artifacts[0].measurement.complete);
+    }
+
+    #[test]
+    fn resume_retains_a_stronger_incomplete_hint_after_a_shorter_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("one"), b"one").unwrap();
+        fs::write(target.join("two"), b"two").unwrap();
+        let prior = prior_measurement(&target, false, 2, 4096);
+        let resume = loaded_resume(
+            temp.path().join("prior.json"),
+            BTreeMap::from([(target.clone(), prior)]),
+        );
+        let mut artifacts = vec![artifact(&target, GeneratedDirAction::Skip)];
+
+        seed_resume_measurements(&mut artifacts, &resume);
+        measure_artifacts(&mut artifacts, 1, 1, true).unwrap();
+
+        assert_eq!(
+            artifacts[0].measurement.source,
+            GeneratedMeasurementSource::PriorManifest
+        );
+        assert_eq!(artifacts[0].measurement.visited_entries, 2);
+        assert_eq!(
+            artifacts[0].measurement.metrics.private_reclaimable_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn ownership_incompleteness_does_not_request_measurement_resumption() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let mut artifact = artifact(&target, GeneratedDirAction::Skip);
+        artifact.ownership_evidence_complete = false;
+        artifact.measurement = prior_measurement(&target, true, 1, 4096);
+
+        assert!(artifact_is_incomplete(&artifact));
+        assert!(!artifact_measurement_is_incomplete(&artifact));
     }
 
     #[test]
