@@ -712,7 +712,7 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
         .iter()
         .filter(|artifact| artifact_measurement_is_incomplete(artifact))
         .count();
-    let all_measurements_current = resumed_measurements == 0;
+    let all_measurements_current = measurements_are_current(&artifacts);
     let observed_metrics = sum_metrics(
         artifacts
             .iter()
@@ -993,9 +993,9 @@ pub fn print_generated_collect(run: &GeneratedCollectRun) {
             println!(
                 "  {} private{} | {} allocated{} | {} entries | {} | {}",
                 format_bytes(artifact.measurement.metrics.private_reclaimable_bytes),
-                incomplete_measurement_qualifier(&artifact.measurement),
+                private_measurement_qualifier(&artifact.measurement),
                 format_bytes(artifact.measurement.metrics.allocated_bytes),
-                incomplete_measurement_qualifier(&artifact.measurement),
+                traversal_measurement_qualifier(&artifact.measurement),
                 artifact.measurement.visited_entries,
                 artifact
                     .measurement
@@ -1098,7 +1098,13 @@ fn measurement_is_complete(measurement: &GeneratedArtifactMeasurement) -> bool {
         && measurement.metrics.private_reclaimable_complete
 }
 
-fn incomplete_measurement_qualifier(measurement: &GeneratedArtifactMeasurement) -> &'static str {
+fn measurements_are_current(artifacts: &[GeneratedArtifactObservation]) -> bool {
+    artifacts
+        .iter()
+        .all(|artifact| artifact.measurement.source == GeneratedMeasurementSource::CurrentRun)
+}
+
+fn traversal_is_budget_lower_bound(measurement: &GeneratedArtifactMeasurement) -> bool {
     let budget_only = measurement.traversal.status == InventoryTraversalStatus::Incomplete
         && measurement.traversal.scan_error_count == 0
         && !measurement.traversal.incomplete_reasons.is_empty()
@@ -1107,10 +1113,41 @@ fn incomplete_measurement_qualifier(measurement: &GeneratedArtifactMeasurement) 
             .incomplete_reasons
             .iter()
             .all(|reason| *reason == InventoryTraversalIncompleteReason::EntryBudgetExhausted);
-    if budget_only {
-        " observed lower bound"
-    } else {
-        " incomplete observation"
+    budget_only
+}
+
+fn traversal_measurement_qualifier(measurement: &GeneratedArtifactMeasurement) -> &'static str {
+    match (
+        measurement.traversal.status,
+        traversal_is_budget_lower_bound(measurement),
+    ) {
+        (InventoryTraversalStatus::Complete, _) => "",
+        (InventoryTraversalStatus::Incomplete, true) => " observed lower bound",
+        (InventoryTraversalStatus::Incomplete, false) => " incomplete observation",
+        (InventoryTraversalStatus::Unknown, _) => " traversal completeness unknown",
+    }
+}
+
+fn private_measurement_qualifier(measurement: &GeneratedArtifactMeasurement) -> &'static str {
+    match (
+        measurement.traversal.status,
+        traversal_is_budget_lower_bound(measurement),
+        measurement.metrics.private_reclaimable_complete,
+    ) {
+        (InventoryTraversalStatus::Complete, _, true) => "",
+        (InventoryTraversalStatus::Complete, _, false) => " private measurement lower bound",
+        (InventoryTraversalStatus::Incomplete, true, true) => " observed lower bound",
+        (InventoryTraversalStatus::Incomplete, true, false) => {
+            " observed lower bound; private measurement incomplete"
+        }
+        (InventoryTraversalStatus::Incomplete, false, true) => " incomplete observation",
+        (InventoryTraversalStatus::Incomplete, false, false) => {
+            " incomplete observation; private measurement incomplete"
+        }
+        (InventoryTraversalStatus::Unknown, _, true) => " traversal completeness unknown",
+        (InventoryTraversalStatus::Unknown, _, false) => {
+            " traversal completeness unknown; private measurement incomplete"
+        }
     }
 }
 
@@ -1375,8 +1412,8 @@ fn measure_artifacts(
         let mut metrics = root.metrics;
         metrics.private_reclaimable_complete = complete && metrics.private_reclaimable_complete;
         for index in indexes {
-            let previous = artifacts[*index].measurement.clone();
-            let completion_attempts = previous
+            let completion_attempts = artifacts[*index]
+                .measurement
                 .completion_attempts
                 .saturating_add(u64::from(prefer_completion));
             let current = GeneratedArtifactMeasurement {
@@ -1393,39 +1430,10 @@ fn measure_artifacts(
                 metrics: metrics.clone(),
                 error: error.clone(),
             };
-            if measurement_improves_prior_hint(&current, &previous) {
-                artifacts[*index].measurement = current;
-            } else {
-                artifacts[*index].measurement.completion_attempts = completion_attempts;
-            }
+            artifacts[*index].measurement = current;
         }
     }
     Ok(())
-}
-
-fn measurement_improves_prior_hint(
-    current: &GeneratedArtifactMeasurement,
-    prior: &GeneratedArtifactMeasurement,
-) -> bool {
-    if prior.source != GeneratedMeasurementSource::PriorManifest || measurement_is_complete(current)
-    {
-        return true;
-    }
-    if measurement_is_complete(prior) {
-        return false;
-    }
-
-    let current_metrics = &current.metrics;
-    let prior_metrics = &prior.metrics;
-    let does_not_regress = current.visited_entries >= prior.visited_entries
-        && current_metrics.private_reclaimable_bytes >= prior_metrics.private_reclaimable_bytes
-        && current_metrics.allocated_bytes >= prior_metrics.allocated_bytes
-        && current_metrics.logical_bytes >= prior_metrics.logical_bytes;
-    let makes_progress = current.visited_entries > prior.visited_entries
-        || current_metrics.private_reclaimable_bytes > prior_metrics.private_reclaimable_bytes
-        || current_metrics.allocated_bytes > prior_metrics.allocated_bytes
-        || current_metrics.logical_bytes > prior_metrics.logical_bytes;
-    does_not_regress && makes_progress
 }
 
 fn summarize_artifacts(
@@ -1837,8 +1845,12 @@ mod tests {
         let mut measurement = prior_measurement(&target, false, 1, 4096);
 
         assert_eq!(
-            incomplete_measurement_qualifier(&measurement),
+            traversal_measurement_qualifier(&measurement),
             " observed lower bound"
+        );
+        assert_eq!(
+            private_measurement_qualifier(&measurement),
+            " observed lower bound; private measurement incomplete"
         );
 
         measurement.traversal.incomplete_reasons =
@@ -1847,8 +1859,22 @@ mod tests {
         measurement.error = Some("permission denied".to_string());
 
         assert_eq!(
-            incomplete_measurement_qualifier(&measurement),
+            traversal_measurement_qualifier(&measurement),
             " incomplete observation"
+        );
+        assert_eq!(
+            private_measurement_qualifier(&measurement),
+            " incomplete observation; private measurement incomplete"
+        );
+
+        measurement.traversal = InventoryTraversalEvidence {
+            status: InventoryTraversalStatus::Complete,
+            ..InventoryTraversalEvidence::default()
+        };
+        assert_eq!(traversal_measurement_qualifier(&measurement), "");
+        assert_eq!(
+            private_measurement_qualifier(&measurement),
+            " private measurement lower bound"
         );
     }
 
@@ -1947,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_retains_a_stronger_incomplete_hint_after_a_shorter_retry() {
+    fn resume_replaces_a_stale_incomplete_hint_after_a_shorter_retry() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target");
         fs::create_dir(&target).unwrap();
@@ -1965,13 +1991,32 @@ mod tests {
 
         assert_eq!(
             artifacts[0].measurement.source,
-            GeneratedMeasurementSource::PriorManifest
+            GeneratedMeasurementSource::CurrentRun
         );
-        assert_eq!(artifacts[0].measurement.visited_entries, 2);
-        assert_eq!(
-            artifacts[0].measurement.metrics.private_reclaimable_bytes,
-            4096
+        assert_eq!(artifacts[0].measurement.visited_entries, 1);
+        assert_eq!(artifacts[0].measurement.completion_attempts, 1);
+    }
+
+    #[test]
+    fn current_snapshot_requires_every_artifact_to_be_measured_in_this_run() {
+        let mut current = artifact(
+            Path::new("/tmp/repo/current/target"),
+            GeneratedDirAction::Skip,
         );
+        current.measurement.source = GeneratedMeasurementSource::CurrentRun;
+        let pending = artifact(
+            Path::new("/tmp/repo/pending/target"),
+            GeneratedDirAction::Skip,
+        );
+        let mut prior = artifact(
+            Path::new("/tmp/repo/prior/target"),
+            GeneratedDirAction::Skip,
+        );
+        prior.measurement.source = GeneratedMeasurementSource::PriorManifest;
+
+        assert!(measurements_are_current(std::slice::from_ref(&current)));
+        assert!(!measurements_are_current(&[current.clone(), pending]));
+        assert!(!measurements_are_current(&[current, prior]));
     }
 
     #[test]
