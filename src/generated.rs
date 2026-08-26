@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -333,18 +333,30 @@ fn load_resume_manifest(path: &Path) -> Result<LoadedResumeManifest> {
             path.display()
         )
     })?;
-    let bytes = fs::read(&canonical).with_context(|| {
+    let mut file = fs::File::open(&canonical).with_context(|| {
+        format!(
+            "open generated collector resume manifest {}",
+            canonical.display()
+        )
+    })?;
+    let opened_metadata = file.metadata().with_context(|| {
+        format!(
+            "inspect opened generated collector resume manifest {}",
+            canonical.display()
+        )
+    })?;
+    anyhow::ensure!(
+        opened_metadata.is_file() && opened_metadata.len() <= MAX_RESUME_MANIFEST_BYTES,
+        "opened generated collector resume manifest is not a regular file within the {}-byte limit: {}",
+        MAX_RESUME_MANIFEST_BYTES,
+        canonical.display()
+    );
+    let bytes = read_bounded(&mut file, MAX_RESUME_MANIFEST_BYTES).with_context(|| {
         format!(
             "read generated collector resume manifest {}",
             canonical.display()
         )
     })?;
-    anyhow::ensure!(
-        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_RESUME_MANIFEST_BYTES,
-        "generated collector resume manifest grew beyond the {}-byte limit while reading: {}",
-        MAX_RESUME_MANIFEST_BYTES,
-        canonical.display()
-    );
     let document: ResumeManifestDocument = serde_json::from_slice(&bytes).with_context(|| {
         format!(
             "parse generated collector resume manifest {}",
@@ -378,6 +390,20 @@ fn load_resume_manifest(path: &Path) -> Result<LoadedResumeManifest> {
         run_id: document.run_id,
         measurements,
     })
+}
+
+fn read_bounded(reader: &mut impl Read, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("input exceeds the {max_bytes}-byte limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn seed_resume_measurements(
@@ -963,7 +989,7 @@ pub fn print_generated_collect(run: &GeneratedCollectRun) {
         );
     }
     println!("complete retained or blocked generated roots by private reclaim:");
-    for artifact in plan
+    let mut blocked = plan
         .artifacts
         .iter()
         .filter(|artifact| {
@@ -972,8 +998,9 @@ pub fn print_generated_collect(run: &GeneratedCollectRun) {
                 && artifact.measurement.error.is_none()
                 && artifact.measurement.metrics.private_reclaimable_complete
         })
-        .take(run.manifest.policy.top)
-    {
+        .collect::<Vec<_>>();
+    sort_artifact_refs_by_reclaim(&mut blocked);
+    for artifact in blocked.into_iter().take(run.manifest.policy.top) {
         println!(
             "  {} private | {} allocated | {} | {}",
             format_bytes(artifact.measurement.metrics.private_reclaimable_bytes),
@@ -1010,6 +1037,16 @@ pub fn print_generated_collect(run: &GeneratedCollectRun) {
             run.manifest_path.display()
         );
     }
+}
+
+fn sort_artifact_refs_by_reclaim(artifacts: &mut Vec<&GeneratedArtifactObservation>) {
+    artifacts.sort_by_key(|artifact| {
+        (
+            std::cmp::Reverse(artifact.measurement.metrics.private_reclaimable_bytes),
+            std::cmp::Reverse(artifact.measurement.metrics.allocated_bytes),
+            artifact.path.clone(),
+        )
+    });
 }
 
 fn observations_from_triage(
@@ -1335,6 +1372,7 @@ fn measure_artifacts(
             let measurement = &artifacts[indexes[0]].measurement;
             let hint = &measurement.metrics;
             (
+                measurement.source != GeneratedMeasurementSource::PriorManifest,
                 measurement.completion_attempts,
                 std::cmp::Reverse(hint.private_reclaimable_bytes),
                 std::cmp::Reverse(hint.allocated_bytes),
@@ -1813,6 +1851,16 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reader_rejects_input_before_buffering_beyond_the_limit() {
+        let mut input = io::Cursor::new(b"0123456789");
+
+        let error = read_bounded(&mut input, 8).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(input.position(), 9);
+    }
+
+    #[test]
     fn resume_requires_a_fresh_scan_when_a_deep_descendant_changes() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target");
@@ -1973,6 +2021,40 @@ mod tests {
     }
 
     #[test]
+    fn resumed_incomplete_roots_stay_ahead_of_fresh_remeasurements() {
+        let temp = tempfile::tempdir().unwrap();
+        let fresh = temp.path().join("a-fresh");
+        let resumed = temp.path().join("b-resumed");
+        fs::create_dir(&fresh).unwrap();
+        fs::create_dir(&resumed).unwrap();
+        fs::write(fresh.join("one"), b"one").unwrap();
+        fs::write(resumed.join("one"), b"one").unwrap();
+        let mut resumed_prior = prior_measurement(&resumed, false, 1, 4096);
+        resumed_prior.completion_attempts = 3;
+        let resume = loaded_resume(
+            temp.path().join("prior.json"),
+            BTreeMap::from([(resumed.clone(), resumed_prior)]),
+        );
+        let mut artifacts = vec![
+            artifact(&fresh, GeneratedDirAction::Skip),
+            artifact(&resumed, GeneratedDirAction::Skip),
+        ];
+
+        seed_resume_measurements(&mut artifacts, &resume);
+        measure_artifacts(&mut artifacts, 1, 1, true).unwrap();
+
+        assert_eq!(
+            artifacts[0].measurement.source,
+            GeneratedMeasurementSource::Pending
+        );
+        assert_eq!(
+            artifacts[1].measurement.source,
+            GeneratedMeasurementSource::CurrentRun
+        );
+        assert_eq!(artifacts[1].measurement.completion_attempts, 4);
+    }
+
+    #[test]
     fn resume_replaces_a_stale_incomplete_hint_after_a_shorter_retry() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target");
@@ -2097,6 +2179,28 @@ mod tests {
         assert_eq!(artifacts[0].path, Path::new("/tmp/repo/complete/target"));
         assert_eq!(artifacts[1].path, Path::new("/tmp/repo/errored/target"));
         assert_eq!(artifacts[2].path, Path::new("/tmp/repo/incomplete/target"));
+    }
+
+    #[test]
+    fn blocked_report_section_ranks_by_private_reclaim() {
+        let mut smaller = artifact(
+            Path::new("/tmp/repo/smaller/target"),
+            GeneratedDirAction::Skip,
+        );
+        smaller.measurement.metrics.private_reclaimable_bytes = 1_000;
+        let mut larger = artifact(
+            Path::new("/tmp/repo/larger/target"),
+            GeneratedDirAction::Skip,
+        );
+        larger.ownership_evidence_complete = false;
+        larger.measurement.metrics.private_reclaimable_bytes = 10_000;
+        let observations = [smaller, larger];
+        let mut blocked = observations.iter().collect::<Vec<_>>();
+
+        sort_artifact_refs_by_reclaim(&mut blocked);
+
+        assert_eq!(blocked[0].path, Path::new("/tmp/repo/larger/target"));
+        assert_eq!(blocked[1].path, Path::new("/tmp/repo/smaller/target"));
     }
 
     #[test]
