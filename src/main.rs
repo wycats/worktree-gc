@@ -243,7 +243,7 @@ enum CollectorCommand {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Reuse identity-matching complete observations and prioritize incomplete roots from a prior generated manifest"
+            help = "Prioritize identity-matching incomplete roots from a prior generated manifest; complete roots are measured fresh"
         )]
         resume_manifest: Option<PathBuf>,
 

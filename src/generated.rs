@@ -709,7 +709,7 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
         &mut artifacts,
         options.max_entries,
         options.max_entries_per_artifact,
-        resume.is_some(),
+        carried_incomplete_hints > 0,
     )?;
     sort_artifacts_for_opportunity_report(&mut artifacts);
 
@@ -2052,6 +2052,47 @@ mod tests {
             GeneratedMeasurementSource::CurrentRun
         );
         assert_eq!(artifacts[1].measurement.completion_attempts, 4);
+    }
+
+    #[test]
+    fn irrelevant_resume_manifest_preserves_fair_measurement_sharing() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("a-first");
+        let second = temp.path().join("b-second");
+        let unrelated = temp.path().join("unrelated");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::create_dir(&unrelated).unwrap();
+        for root in [&first, &second] {
+            fs::write(root.join("one"), b"one").unwrap();
+            fs::write(root.join("two"), b"two").unwrap();
+        }
+        let resume = loaded_resume(
+            temp.path().join("prior.json"),
+            BTreeMap::from([(
+                unrelated.clone(),
+                prior_measurement(&unrelated, false, 1, 4096),
+            )]),
+        );
+        let mut artifacts = vec![
+            artifact(&first, GeneratedDirAction::Skip),
+            artifact(&second, GeneratedDirAction::Skip),
+        ];
+
+        let (_, carried_incomplete_hints) = seed_resume_measurements(&mut artifacts, &resume);
+        measure_artifacts(&mut artifacts, 2, 2, carried_incomplete_hints > 0).unwrap();
+
+        assert_eq!(carried_incomplete_hints, 0);
+        assert_eq!(artifacts[0].measurement.visited_entries, 1);
+        assert_eq!(artifacts[1].measurement.visited_entries, 1);
+        assert_eq!(
+            artifacts[0].measurement.source,
+            GeneratedMeasurementSource::CurrentRun
+        );
+        assert_eq!(
+            artifacts[1].measurement.source,
+            GeneratedMeasurementSource::CurrentRun
+        );
     }
 
     #[test]
