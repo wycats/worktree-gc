@@ -170,6 +170,7 @@ pub struct GeneratedArtifactObservation {
     pub has_tracked_files: bool,
     pub reason: String,
     pub mtime_unix: Option<i64>,
+    pub mtime_nanos: Option<u32>,
     pub effective_days: u64,
     pub recent_activity: bool,
     pub in_use: bool,
@@ -188,6 +189,12 @@ pub struct GeneratedArtifactMeasurement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<GeneratedDirIdentity>,
     pub measured_at_unix: Option<u64>,
+    #[serde(default)]
+    pub activity_mtime_unix: Option<i64>,
+    #[serde(default)]
+    pub activity_mtime_nanos: Option<u32>,
+    #[serde(default)]
+    pub completion_attempts: u64,
     pub filesystem: Option<String>,
     pub complete: bool,
     pub visited_entries: u64,
@@ -210,6 +217,9 @@ impl GeneratedArtifactMeasurement {
             source: GeneratedMeasurementSource::Pending,
             identity: None,
             measured_at_unix: None,
+            activity_mtime_unix: None,
+            activity_mtime_nanos: None,
+            completion_attempts: 0,
             filesystem: None,
             complete: false,
             visited_entries: 0,
@@ -387,6 +397,8 @@ fn seed_resume_measurements(
             || !current_identity
                 .canonical_path
                 .starts_with(canonical_worktree)
+            || prior.activity_mtime_unix != artifact.mtime_unix
+            || prior.activity_mtime_nanos != artifact.mtime_nanos
         {
             continue;
         }
@@ -1034,6 +1046,7 @@ fn observation(
         has_tracked_files: artifact.has_tracked_files,
         reason: artifact.reason,
         mtime_unix: artifact.mtime_unix,
+        mtime_nanos: artifact.mtime_nanos,
         effective_days: artifact.effective_days,
         recent_activity,
         in_use: artifact.in_use,
@@ -1257,8 +1270,10 @@ fn measure_artifacts(
     let mut targets = targets.into_iter().collect::<Vec<_>>();
     if prefer_completion {
         targets.sort_by_key(|(path, (_, indexes))| {
-            let hint = &artifacts[indexes[0]].measurement.metrics;
+            let measurement = &artifacts[indexes[0]].measurement;
+            let hint = &measurement.metrics;
             (
+                measurement.completion_attempts,
                 std::cmp::Reverse(hint.private_reclaimable_bytes),
                 std::cmp::Reverse(hint.allocated_bytes),
                 path.clone(),
@@ -1334,18 +1349,27 @@ fn measure_artifacts(
         let mut metrics = root.metrics;
         metrics.private_reclaimable_complete = complete && metrics.private_reclaimable_complete;
         for index in indexes {
+            let previous = artifacts[*index].measurement.clone();
+            let completion_attempts = previous
+                .completion_attempts
+                .saturating_add(u64::from(prefer_completion));
             let current = GeneratedArtifactMeasurement {
                 source: GeneratedMeasurementSource::CurrentRun,
                 identity: Some(identity.clone()),
                 measured_at_unix: Some(measured_at_unix),
+                activity_mtime_unix: artifacts[*index].mtime_unix,
+                activity_mtime_nanos: artifacts[*index].mtime_nanos,
+                completion_attempts,
                 filesystem: Some(root.filesystem.clone()),
                 complete,
                 visited_entries: root.visited_entries,
                 metrics: metrics.clone(),
                 error: error.clone(),
             };
-            if measurement_improves_prior_hint(&current, &artifacts[*index].measurement) {
+            if measurement_improves_prior_hint(&current, &previous) {
                 artifacts[*index].measurement = current;
+            } else {
+                artifacts[*index].measurement.completion_attempts = completion_attempts;
             }
         }
     }
@@ -1652,6 +1676,7 @@ mod tests {
             has_tracked_files: false,
             reason: "fixture".to_string(),
             mtime_unix: None,
+            mtime_nanos: None,
             effective_days: 3,
             recent_activity: false,
             in_use: false,
@@ -1689,6 +1714,9 @@ mod tests {
             source: GeneratedMeasurementSource::CurrentRun,
             identity: Some(generated_dir_identity(path).unwrap()),
             measured_at_unix: Some(1),
+            activity_mtime_unix: None,
+            activity_mtime_nanos: None,
+            completion_attempts: 0,
             filesystem: Some("fixture".to_string()),
             complete,
             visited_entries,
@@ -1786,6 +1814,32 @@ mod tests {
     }
 
     #[test]
+    fn resume_discards_measurement_when_sampled_descendant_activity_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let mut prior = prior_measurement(&target, true, 1, 4096);
+        prior.activity_mtime_unix = Some(1);
+        prior.activity_mtime_nanos = Some(10);
+        let resume = loaded_resume(
+            temp.path().join("prior.json"),
+            BTreeMap::from([(target.clone(), prior)]),
+        );
+        let mut current = artifact(&target, GeneratedDirAction::Skip);
+        current.mtime_unix = Some(1);
+        current.mtime_nanos = Some(11);
+        let mut artifacts = vec![current];
+
+        let counts = seed_resume_measurements(&mut artifacts, &resume);
+
+        assert_eq!(counts, (0, 0));
+        assert_eq!(
+            artifacts[0].measurement.source,
+            GeneratedMeasurementSource::Pending
+        );
+    }
+
+    #[test]
     fn resume_prioritizes_the_largest_incomplete_private_reclaim_hint() {
         let temp = tempfile::tempdir().unwrap();
         let smaller = temp.path().join("a-smaller");
@@ -1855,6 +1909,41 @@ mod tests {
             artifacts[0].measurement.metrics.private_reclaimable_bytes,
             4096
         );
+    }
+
+    #[test]
+    fn resume_rotates_roots_after_a_bounded_completion_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let waiting = temp.path().join("a-waiting");
+        let attempted = temp.path().join("b-attempted");
+        fs::create_dir(&waiting).unwrap();
+        fs::create_dir(&attempted).unwrap();
+        for root in [&waiting, &attempted] {
+            fs::write(root.join("one"), b"one").unwrap();
+            fs::write(root.join("two"), b"two").unwrap();
+        }
+        let mut waiting_prior = prior_measurement(&waiting, false, 1, 0);
+        waiting_prior.metrics.allocated_bytes = 10;
+        let mut attempted_prior = prior_measurement(&attempted, false, 1, 0);
+        attempted_prior.metrics.allocated_bytes = 100;
+        attempted_prior.completion_attempts = 1;
+        let resume = loaded_resume(
+            temp.path().join("prior.json"),
+            BTreeMap::from([
+                (waiting.clone(), waiting_prior),
+                (attempted.clone(), attempted_prior),
+            ]),
+        );
+        let mut artifacts = vec![
+            artifact(&waiting, GeneratedDirAction::Skip),
+            artifact(&attempted, GeneratedDirAction::Skip),
+        ];
+
+        seed_resume_measurements(&mut artifacts, &resume);
+        measure_artifacts(&mut artifacts, 1, 1, true).unwrap();
+
+        assert_eq!(artifacts[0].measurement.completion_attempts, 1);
+        assert_eq!(artifacts[1].measurement.completion_attempts, 1);
     }
 
     #[test]
