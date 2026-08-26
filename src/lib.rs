@@ -55,8 +55,10 @@ pub use generated::{
     collect_generated, print_generated_collect, GeneratedArtifactMeasurement,
     GeneratedArtifactObservation, GeneratedArtifactSummary, GeneratedCollectAction,
     GeneratedCollectManifest, GeneratedCollectOptions, GeneratedCollectPlan,
-    GeneratedCollectPolicy, GeneratedCollectRun, GeneratedRebuildCost, GeneratedRebuildCostSummary,
-    GeneratedRootCoverage, DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
+    GeneratedCollectPolicy, GeneratedCollectRun, GeneratedMeasurementSource, GeneratedRebuildCost,
+    GeneratedRebuildCostSummary, GeneratedResumeSource, GeneratedRootCoverage,
+    DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES, DEFAULT_GENERATED_MAX_ENTRIES_PER_ARTIFACT,
+    DEFAULT_GENERATED_OPPORTUNITY_TOP,
 };
 pub use github_pr::{
     PullRequestEvidence, PullRequestLifecycle, PullRequestPolicy, PullRequestRecord,

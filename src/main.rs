@@ -17,7 +17,8 @@ use worktree_gc::{
     SweepStrategy, SweepTool, TriageOptions, DEFAULT_CODEX_SESSION_MAX_ENTRIES,
     DEFAULT_GATEWAY_EXACT_MAX_ENTRIES, DEFAULT_GATEWAY_EXACT_MAX_ENTRIES_PER_UNIT,
     DEFAULT_GENERATED_DAYS, DEFAULT_GENERATED_DELETE_NAMES,
-    DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
+    DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES, DEFAULT_GENERATED_MAX_ENTRIES_PER_ARTIFACT,
+    DEFAULT_GENERATED_OPPORTUNITY_TOP, DEFAULT_PROTECTION_TTL_DAYS, DEFAULT_STALE_DAYS,
     MAX_PROTECTION_TTL_DAYS,
 };
 
@@ -231,6 +232,30 @@ enum CollectorCommand {
             help = "Maximum entries to APFS-measure across all generated roots"
         )]
         max_entries: u64,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_GENERATED_MAX_ENTRIES_PER_ARTIFACT,
+            help = "Maximum entries to spend completing one generated-root measurement"
+        )]
+        max_entries_per_artifact: u64,
+
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Reuse identity-matching complete observations and prioritize incomplete roots from a prior generated manifest"
+        )]
+        resume_manifest: Option<PathBuf>,
+
+        #[arg(
+            long,
+            default_value_t = DEFAULT_GENERATED_OPPORTUNITY_TOP,
+            help = "Maximum rows to print in each opportunity section"
+        )]
+        top: usize,
+
+        #[arg(long, help = "Write the complete generated opportunity run as JSON")]
+        json: bool,
     },
     /// Report Codex task-store compression and physical-storage health
     CodexSessions {
@@ -735,15 +760,27 @@ fn main() -> Result<()> {
                     generated_days,
                     max_discovery_entries,
                     max_entries,
+                    max_entries_per_artifact,
+                    resume_manifest,
+                    top,
+                    json,
                 } => {
                     let run = collect_generated(GeneratedCollectOptions {
                         roots,
                         generated_days,
                         max_discovery_entries,
                         max_entries,
+                        max_entries_per_artifact,
+                        resume_manifest,
+                        top,
                         now,
                     })?;
-                    print_generated_collect(&run);
+                    if json {
+                        serde_json::to_writer_pretty(std::io::stdout().lock(), &run)?;
+                        println!();
+                    } else {
+                        print_generated_collect(&run);
+                    }
                 }
                 CollectorCommand::CodexSessions {
                     codex_home,
@@ -1367,6 +1404,13 @@ helper_socket = "unused-helper.sock"
             "77",
             "--max-entries",
             "99",
+            "--max-entries-per-artifact",
+            "88",
+            "--resume-manifest",
+            "/tmp/prior.json",
+            "--top",
+            "7",
+            "--json",
         ])
         .expect("generated collector CLI should parse");
         match cli.command {
@@ -1377,6 +1421,10 @@ helper_socket = "unused-helper.sock"
                         generated_days,
                         max_discovery_entries,
                         max_entries,
+                        max_entries_per_artifact,
+                        resume_manifest,
+                        top,
+                        json,
                     },
             } => {
                 assert_eq!(
@@ -1386,6 +1434,10 @@ helper_socket = "unused-helper.sock"
                 assert_eq!(generated_days, 3);
                 assert_eq!(max_discovery_entries, 77);
                 assert_eq!(max_entries, 99);
+                assert_eq!(max_entries_per_artifact, 88);
+                assert_eq!(resume_manifest, Some(PathBuf::from("/tmp/prior.json")));
+                assert_eq!(top, 7);
+                assert!(json);
             }
             _ => unreachable!(),
         }

@@ -1,13 +1,14 @@
 use crate::inventory::{inventory, InventoryMetrics, InventoryOptions};
 use crate::{
-    discover_repositories, format_bytes, skip_repository_discovery_dir,
+    discover_repositories, format_bytes, generated_dir_identity, skip_repository_discovery_dir,
     triage_repositories_serial_with_errors, CleanupClass, CleanupMode, GeneratedDirAction,
-    GeneratedDirConfig, GeneratedDirInfo, ProtectionMatch, TriageOptions, TriageReport,
-    DEFAULT_GENERATED_DAYS, DEFAULT_STALE_DAYS,
+    GeneratedDirConfig, GeneratedDirIdentity, GeneratedDirInfo, ProtectionMatch, TriageOptions,
+    TriageReport, DEFAULT_GENERATED_DAYS, DEFAULT_STALE_DAYS,
 };
 use anyhow::{Context, Result};
 use atomic_write_file::AtomicWriteFile;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
@@ -15,10 +16,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-const GENERATED_COLLECT_MANIFEST_VERSION: u64 = 3;
-const MAX_ENTRIES_PER_ARTIFACT: u64 = 250_000;
+const GENERATED_COLLECT_MANIFEST_VERSION: u64 = 4;
+const MAX_RESUME_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DISCOVERY_ENTRIES_PER_ROOT: u64 = 250_000;
 pub const DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES: u64 = 1_000_000;
+pub const DEFAULT_GENERATED_MAX_ENTRIES_PER_ARTIFACT: u64 = 2_000_000;
+pub const DEFAULT_GENERATED_OPPORTUNITY_TOP: usize = 30;
 
 #[derive(Debug, Clone)]
 pub struct GeneratedCollectOptions {
@@ -26,6 +29,9 @@ pub struct GeneratedCollectOptions {
     pub generated_days: u64,
     pub max_discovery_entries: u64,
     pub max_entries: u64,
+    pub max_entries_per_artifact: u64,
+    pub resume_manifest: Option<PathBuf>,
+    pub top: usize,
     pub now: SystemTime,
 }
 
@@ -36,6 +42,9 @@ impl Default for GeneratedCollectOptions {
             generated_days: DEFAULT_GENERATED_DAYS,
             max_discovery_entries: DEFAULT_GENERATED_DISCOVERY_MAX_ENTRIES,
             max_entries: 2_000_000,
+            max_entries_per_artifact: DEFAULT_GENERATED_MAX_ENTRIES_PER_ARTIFACT,
+            resume_manifest: None,
+            top: DEFAULT_GENERATED_OPPORTUNITY_TOP,
             now: SystemTime::now(),
         }
     }
@@ -72,6 +81,18 @@ pub struct GeneratedCollectPolicy {
     pub max_discovery_entries: u64,
     pub max_discovery_entries_per_root: u64,
     pub repository_parallelism: usize,
+    pub top: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<GeneratedResumeSource>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedResumeSource {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub run_id: String,
+    pub reused_complete_measurements: usize,
+    pub carried_incomplete_hints: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -90,6 +111,10 @@ pub struct GeneratedCollectPlan {
     pub discovery_complete: bool,
     pub ownership_complete: bool,
     pub measurement_complete: bool,
+    pub current_measurements: usize,
+    pub resumed_measurements: usize,
+    pub incomplete_measurements: usize,
+    pub all_measurements_current: bool,
     pub repositories: usize,
     pub linked_worktrees: usize,
     pub root_coverage: Vec<GeneratedRootCoverage>,
@@ -156,8 +181,12 @@ pub struct GeneratedArtifactObservation {
     pub measurement: GeneratedArtifactMeasurement,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GeneratedArtifactMeasurement {
+    #[serde(default)]
+    pub source: GeneratedMeasurementSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<GeneratedDirIdentity>,
     pub measured_at_unix: Option<u64>,
     pub filesystem: Option<String>,
     pub complete: bool,
@@ -166,9 +195,20 @@ pub struct GeneratedArtifactMeasurement {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedMeasurementSource {
+    #[default]
+    Pending,
+    CurrentRun,
+    PriorManifest,
+}
+
 impl GeneratedArtifactMeasurement {
     fn pending() -> Self {
         Self {
+            source: GeneratedMeasurementSource::Pending,
+            identity: None,
             measured_at_unix: None,
             filesystem: None,
             complete: false,
@@ -224,6 +264,144 @@ struct RootDiscovery {
     discovery_errors: Vec<String>,
     classification_errors: Vec<String>,
     repositories: Vec<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumeManifestDocument {
+    manifest_version: u64,
+    collector: String,
+    run_id: String,
+    plan: ResumeManifestPlan,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumeManifestPlan {
+    artifacts: Vec<ResumeManifestArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumeManifestArtifact {
+    path: PathBuf,
+    measurement: GeneratedArtifactMeasurement,
+}
+
+#[derive(Debug)]
+struct LoadedResumeManifest {
+    path: PathBuf,
+    sha256: String,
+    run_id: String,
+    measurements: BTreeMap<PathBuf, GeneratedArtifactMeasurement>,
+}
+
+fn load_resume_manifest(path: &Path) -> Result<LoadedResumeManifest> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "inspect generated collector resume manifest {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "generated collector resume manifest is not a regular non-symlink file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_RESUME_MANIFEST_BYTES,
+        "generated collector resume manifest exceeds the {}-byte limit: {}",
+        MAX_RESUME_MANIFEST_BYTES,
+        path.display()
+    );
+    let canonical = fs::canonicalize(path).with_context(|| {
+        format!(
+            "resolve generated collector resume manifest {}",
+            path.display()
+        )
+    })?;
+    let bytes = fs::read(&canonical).with_context(|| {
+        format!(
+            "read generated collector resume manifest {}",
+            canonical.display()
+        )
+    })?;
+    anyhow::ensure!(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_RESUME_MANIFEST_BYTES,
+        "generated collector resume manifest grew beyond the {}-byte limit while reading: {}",
+        MAX_RESUME_MANIFEST_BYTES,
+        canonical.display()
+    );
+    let document: ResumeManifestDocument = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parse generated collector resume manifest {}",
+            canonical.display()
+        )
+    })?;
+    anyhow::ensure!(
+        document.manifest_version == GENERATED_COLLECT_MANIFEST_VERSION,
+        "generated collector resume manifest version {} is not resumable by version {}",
+        document.manifest_version,
+        GENERATED_COLLECT_MANIFEST_VERSION
+    );
+    anyhow::ensure!(
+        document.collector == "generated",
+        "resume manifest is for collector {:?}, expected generated",
+        document.collector
+    );
+    let mut measurements = BTreeMap::new();
+    for artifact in document.plan.artifacts {
+        anyhow::ensure!(
+            measurements
+                .insert(artifact.path.clone(), artifact.measurement)
+                .is_none(),
+            "resume manifest contains duplicate generated root {}",
+            artifact.path.display()
+        );
+    }
+    Ok(LoadedResumeManifest {
+        path: canonical,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        run_id: document.run_id,
+        measurements,
+    })
+}
+
+fn seed_resume_measurements(
+    artifacts: &mut [GeneratedArtifactObservation],
+    resume: &LoadedResumeManifest,
+) -> (usize, usize) {
+    let mut reused_complete = 0;
+    let mut carried_incomplete = 0;
+    for artifact in artifacts {
+        let Some(prior) = resume.measurements.get(&artifact.path) else {
+            continue;
+        };
+        let Some(prior_identity) = prior.identity.as_ref() else {
+            continue;
+        };
+        let Ok(current_identity) = generated_dir_identity(&artifact.path) else {
+            continue;
+        };
+        let Ok(canonical_worktree) = fs::canonicalize(&artifact.worktree_path) else {
+            continue;
+        };
+        if &current_identity != prior_identity
+            || !current_identity
+                .canonical_path
+                .starts_with(canonical_worktree)
+        {
+            continue;
+        }
+        artifact.measurement = prior.clone();
+        artifact.measurement.source = GeneratedMeasurementSource::PriorManifest;
+        if artifact.measurement.complete
+            && artifact.measurement.error.is_none()
+            && artifact.measurement.metrics.private_reclaimable_complete
+        {
+            reused_complete += 1;
+        } else {
+            carried_incomplete += 1;
+        }
+    }
+    (reused_complete, carried_incomplete)
 }
 
 fn discover_requested_roots(
@@ -403,9 +581,20 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
     );
     anyhow::ensure!(options.max_entries > 0, "max_entries must be at least 1");
     anyhow::ensure!(
+        options.max_entries_per_artifact > 0,
+        "max_entries_per_artifact must be at least 1"
+    );
+    anyhow::ensure!(options.top > 0, "top must be at least 1");
+    anyhow::ensure!(
         options.max_discovery_entries > 0,
         "max_discovery_entries must be at least 1"
     );
+
+    let resume = options
+        .resume_manifest
+        .as_deref()
+        .map(load_resume_manifest)
+        .transpose()?;
 
     let (mut discoveries, canonical_roots, repository_paths) =
         discover_requested_roots(&options.roots, options.max_discovery_entries);
@@ -467,14 +656,17 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
         .len();
     let repositories = repository_paths.len();
     let mut artifacts = observations_from_triage(reports, options.now);
-    measure_artifacts(&mut artifacts, options.max_entries)?;
-    artifacts.sort_by_key(|artifact| {
-        (
-            std::cmp::Reverse(artifact.measurement.metrics.private_reclaimable_bytes),
-            std::cmp::Reverse(artifact.measurement.metrics.allocated_bytes),
-            artifact.path.clone(),
-        )
-    });
+    let (reused_complete_measurements, carried_incomplete_hints) = resume
+        .as_ref()
+        .map(|resume| seed_resume_measurements(&mut artifacts, resume))
+        .unwrap_or_default();
+    measure_artifacts(
+        &mut artifacts,
+        options.max_entries,
+        options.max_entries_per_artifact,
+        resume.is_some(),
+    )?;
+    sort_artifacts_for_opportunity_report(&mut artifacts);
 
     let discovery_complete = discoveries.iter().all(|root| root.discovery_complete);
     let ownership_complete = discoveries
@@ -489,6 +681,19 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
             && artifact.measurement.metrics.private_reclaimable_complete
     });
     let complete = discovery_complete && ownership_complete && measurement_complete;
+    let current_measurements = artifacts
+        .iter()
+        .filter(|artifact| artifact.measurement.source == GeneratedMeasurementSource::CurrentRun)
+        .count();
+    let resumed_measurements = artifacts
+        .iter()
+        .filter(|artifact| artifact.measurement.source == GeneratedMeasurementSource::PriorManifest)
+        .count();
+    let incomplete_measurements = artifacts
+        .iter()
+        .filter(|artifact| artifact_is_incomplete(artifact))
+        .count();
+    let all_measurements_current = resumed_measurements == 0;
     let observed_metrics = sum_metrics(
         artifacts
             .iter()
@@ -541,10 +746,18 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
             generated_activity_only: true,
             check_in_use: true,
             max_entries: options.max_entries,
-            max_entries_per_artifact: MAX_ENTRIES_PER_ARTIFACT,
+            max_entries_per_artifact: options.max_entries_per_artifact,
             max_discovery_entries: options.max_discovery_entries,
             max_discovery_entries_per_root: MAX_DISCOVERY_ENTRIES_PER_ROOT,
             repository_parallelism: 1,
+            top: options.top,
+            resume: resume.map(|resume| GeneratedResumeSource {
+                path: resume.path,
+                sha256: resume.sha256,
+                run_id: resume.run_id,
+                reused_complete_measurements,
+                carried_incomplete_hints,
+            }),
         },
         plan: GeneratedCollectPlan {
             action,
@@ -553,6 +766,10 @@ pub fn collect_generated(options: GeneratedCollectOptions) -> Result<GeneratedCo
             discovery_complete,
             ownership_complete,
             measurement_complete,
+            current_measurements,
+            resumed_measurements,
+            incomplete_measurements,
+            all_measurements_current,
             repositories,
             linked_worktrees,
             root_coverage,
@@ -597,13 +814,35 @@ pub fn print_generated_collect(run: &GeneratedCollectRun) {
         plan.linked_worktrees,
         plan.artifacts.len(),
         format_bytes(plan.observed_metrics.private_reclaimable_bytes),
-        if plan.complete { "" } else { " (lower bound)" },
+        if !plan.measurement_complete {
+            " (lower bound)"
+        } else if !plan.all_measurements_current {
+            " (includes prior exact observations)"
+        } else {
+            ""
+        },
         format_bytes(plan.observed_metrics.allocated_bytes)
     );
     println!(
-        "coverage: discovery={} ownership={} measurement={}",
-        plan.discovery_complete, plan.ownership_complete, plan.measurement_complete
+        "coverage: discovery={} ownership={} measurement={} current_snapshot={} | {} current, {} resumed, {} incomplete",
+        plan.discovery_complete,
+        plan.ownership_complete,
+        plan.measurement_complete,
+        plan.all_measurements_current,
+        plan.current_measurements,
+        plan.resumed_measurements,
+        plan.incomplete_measurements
     );
+    if let Some(resume) = &run.manifest.policy.resume {
+        println!(
+            "resumed from {} ({}, run {}): {} complete measurements reused, {} incomplete hints carried",
+            resume.path.display(),
+            resume.sha256,
+            resume.run_id,
+            resume.reused_complete_measurements,
+            resume.carried_incomplete_hints
+        );
+    }
     for root in &plan.root_coverage {
         println!(
             "  root {}: {} repositories, {} worktrees, {} generated roots, {} safe, {} active, {} protected, {} tracked, {} incomplete, {} report-only{}",
@@ -687,19 +926,71 @@ pub fn print_generated_collect(run: &GeneratedCollectRun) {
             summary.report_only
         );
     }
-    println!("largest generated roots:");
-    for artifact in plan.artifacts.iter().take(30) {
+    println!("complete rebuildable opportunity observations by private reclaim:");
+    for artifact in plan
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact_is_safe(artifact))
+        .take(run.manifest.policy.top)
+    {
         println!(
-            "  {} private{} | {} allocated | {:?} | {}",
+            "  {} private | {} allocated | {:?} rebuild | {:?} measurement from {} | {}",
             format_bytes(artifact.measurement.metrics.private_reclaimable_bytes),
-            if artifact.measurement.complete {
-                ""
-            } else {
-                " (lower bound)"
-            },
             format_bytes(artifact.measurement.metrics.allocated_bytes),
-            artifact.cleanup_action,
+            artifact.rebuild_cost.unwrap_or(GeneratedRebuildCost::High),
+            artifact.measurement.source,
+            artifact.measurement.measured_at_unix.unwrap_or_default(),
             artifact.path.display()
+        );
+    }
+    println!("complete retained or blocked generated roots by private reclaim:");
+    for artifact in plan
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            !artifact.rebuildable_opportunity
+                && artifact.measurement.complete
+                && artifact.measurement.error.is_none()
+                && artifact.measurement.metrics.private_reclaimable_complete
+        })
+        .take(run.manifest.policy.top)
+    {
+        println!(
+            "  {} private | {} allocated | {} | {}",
+            format_bytes(artifact.measurement.metrics.private_reclaimable_bytes),
+            format_bytes(artifact.measurement.metrics.allocated_bytes),
+            artifact.reason,
+            artifact.path.display()
+        );
+    }
+    if plan.incomplete_measurements > 0 {
+        println!("incomplete generated-root measurements:");
+        for artifact in plan
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                !artifact.measurement.complete
+                    || artifact.measurement.error.is_some()
+                    || !artifact.measurement.metrics.private_reclaimable_complete
+            })
+            .take(run.manifest.policy.top)
+        {
+            println!(
+                "  {} private lower bound | {} allocated lower bound | {} entries | {} | {}",
+                format_bytes(artifact.measurement.metrics.private_reclaimable_bytes),
+                format_bytes(artifact.measurement.metrics.allocated_bytes),
+                artifact.measurement.visited_entries,
+                artifact
+                    .measurement
+                    .error
+                    .as_deref()
+                    .unwrap_or("incomplete"),
+                artifact.path.display()
+            );
+        }
+        println!(
+            "resume this bounded opportunity census with --resume-manifest {}",
+            run.manifest_path.display()
         );
     }
 }
@@ -757,6 +1048,17 @@ fn observation(
         rebuild_cost,
         measurement: GeneratedArtifactMeasurement::pending(),
     }
+}
+
+fn sort_artifacts_for_opportunity_report(artifacts: &mut [GeneratedArtifactObservation]) {
+    artifacts.sort_by_key(|artifact| {
+        (
+            artifact_is_incomplete(artifact),
+            std::cmp::Reverse(artifact.measurement.metrics.private_reclaimable_bytes),
+            std::cmp::Reverse(artifact.measurement.metrics.allocated_bytes),
+            artifact.path.clone(),
+        )
+    });
 }
 
 fn age_days(now: SystemTime, then_unix: i64) -> u64 {
@@ -906,30 +1208,23 @@ fn rebuild_cost(name: &str) -> GeneratedRebuildCost {
 fn measure_artifacts(
     artifacts: &mut [GeneratedArtifactObservation],
     max_entries: u64,
+    max_entries_per_artifact: u64,
+    prefer_completion: bool,
 ) -> Result<()> {
-    let mut targets: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    let mut targets: BTreeMap<PathBuf, (GeneratedDirIdentity, Vec<usize>)> = BTreeMap::new();
     for (index, artifact) in artifacts.iter_mut().enumerate() {
-        let metadata = match fs::symlink_metadata(&artifact.path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                artifact
-                    .measurement
-                    .fail(format!("inspect generated root: {error}"));
-                continue;
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            artifact
-                .measurement
-                .fail("generated root is not a non-symlink directory");
+        if artifact.measurement.complete
+            && artifact.measurement.error.is_none()
+            && artifact.measurement.metrics.private_reclaimable_complete
+        {
             continue;
         }
-        let canonical = match fs::canonicalize(&artifact.path) {
-            Ok(path) => path,
+        let identity = match generated_dir_identity(&artifact.path) {
+            Ok(identity) => identity,
             Err(error) => {
                 artifact
                     .measurement
-                    .fail(format!("resolve generated root: {error}"));
+                    .fail(format!("inspect generated root: {error:#}"));
                 continue;
             }
         };
@@ -942,26 +1237,45 @@ fn measure_artifacts(
                 continue;
             }
         };
-        if !canonical.starts_with(&canonical_worktree) {
+        if !identity.canonical_path.starts_with(&canonical_worktree) {
             artifact.measurement.fail(format!(
                 "generated root escaped owning worktree {}",
                 canonical_worktree.display()
             ));
             continue;
         }
-        targets.entry(canonical).or_default().push(index);
+        targets
+            .entry(identity.canonical_path.clone())
+            .or_insert_with(|| (identity, Vec::new()))
+            .1
+            .push(index);
     }
     if targets.is_empty() {
         return Ok(());
     }
 
+    let mut targets = targets.into_iter().collect::<Vec<_>>();
+    if prefer_completion {
+        targets.sort_by_key(|(path, (_, indexes))| {
+            let hint = &artifacts[indexes[0]].measurement.metrics;
+            (
+                std::cmp::Reverse(hint.private_reclaimable_bytes),
+                std::cmp::Reverse(hint.allocated_bytes),
+                path.clone(),
+            )
+        });
+    }
     let mut remaining_entries = max_entries;
     let target_count = targets.len();
-    for (position, (path, indexes)) in targets.iter().enumerate() {
+    for (position, (path, (identity, indexes))) in targets.iter().enumerate() {
         let remaining_roots = u64::try_from(target_count - position).unwrap_or(u64::MAX);
-        let fair_share =
-            remaining_entries.saturating_add(remaining_roots.saturating_sub(1)) / remaining_roots;
-        let root_budget = MAX_ENTRIES_PER_ARTIFACT.min(fair_share);
+        let root_budget = if prefer_completion {
+            remaining_entries.min(max_entries_per_artifact)
+        } else {
+            let fair_share = remaining_entries.saturating_add(remaining_roots.saturating_sub(1))
+                / remaining_roots;
+            max_entries_per_artifact.min(fair_share)
+        };
         if root_budget == 0 {
             for index in indexes {
                 artifacts[*index]
@@ -1021,6 +1335,8 @@ fn measure_artifacts(
         metrics.private_reclaimable_complete = complete && metrics.private_reclaimable_complete;
         for index in indexes {
             artifacts[*index].measurement = GeneratedArtifactMeasurement {
+                source: GeneratedMeasurementSource::CurrentRun,
+                identity: Some(identity.clone()),
                 measured_at_unix: Some(measured_at_unix),
                 filesystem: Some(root.filesystem.clone()),
                 complete,
@@ -1335,6 +1651,184 @@ mod tests {
         );
     }
 
+    fn prior_measurement(
+        path: &Path,
+        complete: bool,
+        visited_entries: u64,
+        private_reclaimable_bytes: u64,
+    ) -> GeneratedArtifactMeasurement {
+        GeneratedArtifactMeasurement {
+            source: GeneratedMeasurementSource::CurrentRun,
+            identity: Some(generated_dir_identity(path).unwrap()),
+            measured_at_unix: Some(1),
+            filesystem: Some("fixture".to_string()),
+            complete,
+            visited_entries,
+            metrics: InventoryMetrics {
+                private_reclaimable_bytes,
+                private_reclaimable_complete: complete,
+                ..InventoryMetrics::default()
+            },
+            error: (!complete).then(|| "entry budget exhausted".to_string()),
+        }
+    }
+
+    fn loaded_resume(
+        path: PathBuf,
+        measurements: BTreeMap<PathBuf, GeneratedArtifactMeasurement>,
+    ) -> LoadedResumeManifest {
+        LoadedResumeManifest {
+            path,
+            sha256: "fixture".to_string(),
+            run_id: "prior-run".to_string(),
+            measurements,
+        }
+    }
+
+    #[test]
+    fn resume_requires_the_current_generated_manifest_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("prior.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "manifest_version": GENERATED_COLLECT_MANIFEST_VERSION - 1,
+                "collector": "generated",
+                "run_id": "prior-run",
+                "plan": { "artifacts": [] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = load_resume_manifest(&manifest).unwrap_err();
+
+        assert!(error.to_string().contains("is not resumable"));
+    }
+
+    #[test]
+    fn resume_reuses_complete_measurement_for_an_unchanged_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), b"fixture").unwrap();
+        let prior = prior_measurement(&target, true, 1, 4096);
+        let resume = loaded_resume(
+            temp.path().join("prior.json"),
+            BTreeMap::from([(target.clone(), prior)]),
+        );
+        let mut artifacts = vec![artifact(&target, GeneratedDirAction::Skip)];
+
+        let counts = seed_resume_measurements(&mut artifacts, &resume);
+        measure_artifacts(&mut artifacts, 1, 1, true).unwrap();
+
+        assert_eq!(counts, (1, 0));
+        assert_eq!(
+            artifacts[0].measurement.source,
+            GeneratedMeasurementSource::PriorManifest
+        );
+        assert_eq!(
+            artifacts[0].measurement.metrics.private_reclaimable_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn resume_discards_measurement_when_generated_root_identity_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let replaced = temp.path().join("replaced");
+        fs::create_dir(&target).unwrap();
+        let prior = prior_measurement(&target, true, 1, 4096);
+        fs::rename(&target, &replaced).unwrap();
+        fs::create_dir(&target).unwrap();
+        let resume = loaded_resume(
+            temp.path().join("prior.json"),
+            BTreeMap::from([(target.clone(), prior)]),
+        );
+        let mut artifacts = vec![artifact(&target, GeneratedDirAction::Skip)];
+
+        let counts = seed_resume_measurements(&mut artifacts, &resume);
+
+        assert_eq!(counts, (0, 0));
+        assert_eq!(
+            artifacts[0].measurement.source,
+            GeneratedMeasurementSource::Pending
+        );
+    }
+
+    #[test]
+    fn resume_prioritizes_the_largest_incomplete_private_reclaim_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let smaller = temp.path().join("a-smaller");
+        let larger = temp.path().join("b-larger");
+        fs::create_dir(&smaller).unwrap();
+        fs::create_dir(&larger).unwrap();
+        for root in [&smaller, &larger] {
+            fs::write(root.join("one"), b"one").unwrap();
+            fs::write(root.join("two"), b"two").unwrap();
+        }
+        let resume = loaded_resume(
+            temp.path().join("prior.json"),
+            BTreeMap::from([
+                (smaller.clone(), prior_measurement(&smaller, false, 1, 10)),
+                (larger.clone(), prior_measurement(&larger, false, 1, 100)),
+            ]),
+        );
+        let mut artifacts = vec![
+            artifact(&smaller, GeneratedDirAction::Skip),
+            artifact(&larger, GeneratedDirAction::Skip),
+        ];
+        let counts = seed_resume_measurements(&mut artifacts, &resume);
+
+        measure_artifacts(&mut artifacts, 2, 2, true).unwrap();
+
+        assert_eq!(counts, (0, 2));
+        assert_eq!(
+            artifacts[1].measurement.source,
+            GeneratedMeasurementSource::CurrentRun
+        );
+        assert_eq!(artifacts[1].measurement.visited_entries, 2);
+        assert!(artifacts[1].measurement.error.is_none());
+        assert_eq!(
+            artifacts[0].measurement.source,
+            GeneratedMeasurementSource::PriorManifest
+        );
+        assert!(!artifacts[0].measurement.complete);
+    }
+
+    #[test]
+    fn opportunity_report_ranks_complete_private_reclaim_before_large_lower_bounds() {
+        let mut complete = artifact(
+            Path::new("/tmp/repo/complete/target"),
+            GeneratedDirAction::Skip,
+        );
+        complete.measurement.complete = true;
+        complete.measurement.metrics.private_reclaimable_complete = true;
+        complete.measurement.metrics.private_reclaimable_bytes = 3_500_000;
+        let mut incomplete = artifact(
+            Path::new("/tmp/repo/incomplete/target"),
+            GeneratedDirAction::Skip,
+        );
+        incomplete.measurement.metrics.private_reclaimable_bytes = 5_000_000_000;
+        incomplete.measurement.metrics.allocated_bytes = 6_000_000_000;
+        let mut errored = artifact(
+            Path::new("/tmp/repo/errored/target"),
+            GeneratedDirAction::Skip,
+        );
+        errored.measurement.complete = true;
+        errored.measurement.metrics.private_reclaimable_complete = true;
+        errored.measurement.metrics.private_reclaimable_bytes = 7_000_000_000;
+        errored.measurement.error = Some("measurement raced".to_string());
+        let mut artifacts = vec![incomplete, errored, complete];
+
+        sort_artifacts_for_opportunity_report(&mut artifacts);
+
+        assert_eq!(artifacts[0].path, Path::new("/tmp/repo/complete/target"));
+        assert_eq!(artifacts[1].path, Path::new("/tmp/repo/errored/target"));
+        assert_eq!(artifacts[2].path, Path::new("/tmp/repo/incomplete/target"));
+    }
+
     #[test]
     fn active_or_skipped_generated_roots_are_still_measured() {
         let temp = tempfile::tempdir().unwrap();
@@ -1343,7 +1837,7 @@ mod tests {
         fs::write(target.join("artifact"), vec![0_u8; 16 * 1024]).unwrap();
         let mut artifacts = vec![artifact(&target, GeneratedDirAction::Skip)];
 
-        measure_artifacts(&mut artifacts, 100).unwrap();
+        measure_artifacts(&mut artifacts, 100, 100, false).unwrap();
 
         assert_filesystem_measurement_succeeded(&artifacts[0].measurement);
     }
@@ -1359,7 +1853,7 @@ mod tests {
         observation.worktree_path = owner;
         let mut artifacts = vec![observation];
 
-        measure_artifacts(&mut artifacts, 100).unwrap();
+        measure_artifacts(&mut artifacts, 100, 100, false).unwrap();
 
         assert!(!artifacts[0].measurement.complete);
         assert!(artifacts[0]
@@ -1382,7 +1876,7 @@ mod tests {
             artifact(&target, GeneratedDirAction::Skip),
         ];
 
-        measure_artifacts(&mut artifacts, 100).unwrap();
+        measure_artifacts(&mut artifacts, 100, 100, false).unwrap();
 
         assert!(!artifacts[0].measurement.complete);
         assert!(artifacts[0].measurement.error.is_some());
@@ -1405,7 +1899,7 @@ mod tests {
             artifact(&second, GeneratedDirAction::Skip),
         ];
 
-        measure_artifacts(&mut artifacts, 2).unwrap();
+        measure_artifacts(&mut artifacts, 2, 2, false).unwrap();
 
         assert_eq!(artifacts[0].measurement.visited_entries, 1);
         assert_eq!(artifacts[1].measurement.visited_entries, 1);

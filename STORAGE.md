@@ -165,6 +165,17 @@ The top-level artifact set is deduplicated. Per-root byte totals are retained
 for coverage diagnosis but are explicitly non-additive because requested roots
 can discover the same repository or linked worktree.
 
+Generated opportunity reporting ranks complete APFS-private measurements
+before incomplete lower bounds. Complete owner-free roots, complete retained
+or blocked roots, and incomplete measurements remain separate report queues so
+summed path allocation cannot masquerade as reclaim evidence. A generated
+collector manifest can seed a later bounded pass: identity-matching complete
+observations retain their original timestamps, while incomplete lower bounds
+prioritize which roots receive the next per-artifact completion budget. The
+report records current versus resumed observations. This is an observation
+ledger, not mutation authority; an exact cleanup manifest always measures and
+revalidates its candidate again.
+
 These domains remain owner-report-only: `~/.cache/local-sandbox`,
 `~/.codex/sessions` plus `~/.codex/archived_sessions`, and VS Code/Gateway
 storage. The `collect codex-sessions` adapter correlates Codex's task index
@@ -342,9 +353,12 @@ revision.
 5. **In delivery: completion-aware machine evidence.** Preserve structured
    cap/error reasons, budgets, pending-directory counts, and per-aggregate
    traversal completeness so capped currencies are visibly lower bounds and
-   error-affected currencies are visibly incomplete observations.
-   Next, segment oversized roots into resumable census units and reconcile
-   their non-overlapping results into family and long-tail totals.
+   error-affected currencies are visibly incomplete observations. Generated
+   opportunity manifests now carry completed observations and incomplete
+   prioritization hints into a later bounded pass without upgrading either to
+   deletion authority. Next, segment oversized broad inventory roots into
+   resumable census units and reconcile their non-overlapping results into
+   family and long-tail totals.
 6. **Next: active-target granular budgets.** Extend incremental pruning and
    coherent Cargo profile reset with a reviewed active-target size policy so
    current worktrees do not accrete indefinitely.
@@ -362,10 +376,13 @@ revision.
    evidence, and VM storage remain report-only until explicit retention or
    export contracts exist. Parallels deletion is outside generic cleanup.
 
-The immediate center of gravity is steps 5 and 6: make the machine census
-complete enough to explain the long tail, then keep large active targets from
-rebuilding it. Owner-free coarse deletion remains the fastest recovery path,
-while whole-worktree removal stays conservative and separate.
+The immediate center of gravity is an accurate generated-opportunity loop:
+discover rebuildable roots, complete their APFS-private measurements over
+bounded passes, and compare one exact candidate's projected reclaim with its
+realized `df` change. That closes the shortest path to owner-free coarse
+recovery while routing large owned roots into active-target pruning. Broad
+machine census resumption and active-target budgets stay next in that order;
+whole-worktree removal stays conservative and separate.
 
 Resumable inventory is the next measurement slice. It should partition
 oversized roots into stable non-overlapping segments, persist observation time
