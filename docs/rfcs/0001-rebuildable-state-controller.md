@@ -24,7 +24,7 @@ state.
 | Measured pressure candidates and exact execution manifests | Landed | Retain |
 | Report-only owner adapters for durable domains | Landed | Retain |
 | Bounded scheduling and pressure waves | Landed | Retain |
-| Bounded generated-root discovery and opportunity coverage | Landed | Extend coverage with completion-aware, resumable census evidence |
+| Bounded generated-root discovery and opportunity coverage | In delivery | Rank complete APFS-private reclaim first and carry bounded observations into completion passes |
 | Completion-aware broad inventory evidence | In delivery | Qualify capped roots and affected aggregates as lower bounds |
 | Workday-aware artifact age | Validated on an unpublished stack | Retain as evidence and optional cooldown; remove as primary eligibility authority |
 | Scoped source, artifact, runtime, and legacy protections | Not implemented | Build before weakening broad worktree protection |
@@ -480,13 +480,21 @@ the main near-term reclaim mechanism. Tier 1 granular pruning keeps active
 trees from rebuilding the same long tail. Tier 3 whole-worktree deletion is
 already conservative and is not the first place to spend implementation risk.
 
-The current bet is measurement closure. This delivery makes capped and failed
-inventory visibly partial at the root and retained-aggregate levels. The next
-slice should segment oversized roots into resumable, non-overlapping census
-units and reconcile their family totals. Classification and targeted adapters
-then turn material managed regions into candidates without treating inventory
-size as deletion authority. Active-target size budgets remain the next cleanup
-capability after the census can explain where the long tail lives.
+The current bet is a trustworthy generated-opportunity loop. The report should
+lead with complete APFS-private reclaim rather than summed path allocation,
+separate blocked roots from incomplete measurements, and spend later bounded
+passes completing the largest observed lower bounds. Incomplete observations
+may guide later completion priority, while complete roots are recursively
+measured again because bounded activity sampling cannot prove deep-descendant
+freshness. Cleanup still requires a newly measured exact manifest. Organic
+proof is one multi-GiB opportunity whose
+projected private reclaim closely matches realized free space after supervised
+execution.
+
+Broad machine measurement closure stays next: segment oversized inventory
+roots into resumable, non-overlapping census units and reconcile their family
+totals. Active-target size budgets follow once the census can explain which
+large generated roots are owned rather than owner-free.
 
 ### Phase 1: separate policy domains
 
@@ -506,10 +514,13 @@ capability after the census can explain where the long tail lives.
   execution retains exact source/inode identity, ownership, protection,
   quarantine, Cargo-lock, and realized-reclaim evidence.
 - In delivery: distinguish traversal completion from private-measurement
-  completion at the root and retained-aggregate levels.
-- Next: segment and resume oversized inventory roots without double-counting,
-  then classify their material generated descendants through existing exact
-  execution contracts.
+  completion at the root and retained-aggregate levels; rank complete private
+  reclaim before lower bounds; and let a prior generated report prioritize its
+  incomplete roots for a bounded completion pass while remeasuring complete
+  roots.
+- Next: segment and resume oversized broad inventory roots without
+  double-counting, then classify their material generated descendants through
+  existing exact execution contracts.
 
 ### Phase 3: strengthen active-target pruning
 

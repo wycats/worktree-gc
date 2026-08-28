@@ -337,7 +337,9 @@ inventory identifies a large development root:
 worktree-gc collect generated \
   ~/Code ~/plugins ~/.codex/worktrees ~/Documents/Codex ~/Documents/sandboxd \
   --max-discovery-entries 1000000 \
-  --max-entries 2000000
+  --max-entries 2000000 \
+  --max-entries-per-artifact 2000000 \
+  --top 30
 ```
 
 Repository discovery is hidden-file aware, recognizes linked-worktree `.git`
@@ -355,6 +357,35 @@ kind and rebuild-cost class. Overlapping requested roots retain independent,
 explicitly non-additive coverage totals. This command has no execution
 surface: deletion still requires a fresh cleanup manifest and the exact
 manifest/digest-bound executor.
+
+The human report is an opportunity ranking rather than a `du` ranking. It
+lists complete APFS-private measurements first, separates complete retained or
+blocked roots from rebuildable roots, and moves incomplete lower bounds into a
+separate queue. This matters for APFS clones and pnpm-linked trees, where path
+allocation can substantially exceed the space deleting one path would reclaim.
+
+Large generated roots can be completed over several bounded collector runs:
+
+```sh
+worktree-gc collect generated ~/.codex/worktrees \
+  --resume-manifest ~/.local/state/worktree-gc/collectors/PRIOR-generated-dry-run.json \
+  --max-entries 4000000 \
+  --max-entries-per-artifact 2000000
+```
+
+A version-compatible resume manifest carries identity-matching incomplete
+observations forward as completion-priority hints. Complete observations are
+measured again because a bounded activity sample cannot prove that every deep
+descendant is unchanged. Every artifact records its measurement source,
+traversal evidence, and observation time; scan failures remain distinct from
+clean entry-budget lower bounds. These resumed observations remain report-only
+prioritization evidence; cleanup always creates a fresh manifest and repeats
+exact identity, measurement, ownership, protection, tracked-content, and lock
+checks.
+
+Use `--json` for the complete structured opportunity run. `--top` affects only
+the bounded human sections; the durable collector manifest retains every
+discovered artifact.
 
 ### Codex task-store compression health
 
