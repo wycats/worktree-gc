@@ -21,7 +21,7 @@ use std::fs;
 #[cfg(target_os = "macos")]
 use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixListener;
 #[cfg(unix)]
@@ -44,8 +44,14 @@ pub const DEFAULT_HELPER_PLIST: &str =
     "/Library/LaunchDaemons/com.wycats.worktree-gc.ownership-helper.plist";
 pub const DEFAULT_HELPER_SOCKET: &str =
     "/Library/Application Support/worktree-gc/run/ownership.sock";
+pub const DEFAULT_HELPER_STARTUP_ERROR: &str =
+    "/Library/Application Support/worktree-gc/last-startup-error";
 #[cfg(any(target_os = "macos", test))]
 const HELPER_CONFIG_VERSION: u64 = 1;
+#[cfg(any(target_os = "macos", test))]
+const MAX_STARTUP_ERROR_BYTES: usize = 4096;
+#[cfg(any(target_os = "macos", test))]
+const RUNTIME_DIRECTORY_MODE: u32 = 0o755;
 #[cfg(unix)]
 const HELPER_IO_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "macos", test))]
@@ -131,24 +137,11 @@ pub fn capture_from_helper(_socket: &Path, _roots: &[PathBuf]) -> Result<Ownersh
 
 #[cfg(target_os = "macos")]
 pub fn serve(config_path: &Path, socket_path: &Path) -> Result<()> {
-    ensure_root()?;
-    let config = load_root_owned_config(config_path)?;
-    let socket_parent = socket_path
-        .parent()
-        .context("ownership helper socket has no parent directory")?;
-    ensure_root_owned_directory_chain(&socket_parent.canonicalize()?)?;
-    if let Ok(metadata) = fs::symlink_metadata(socket_path) {
-        ensure!(
-            metadata.file_type().is_socket() && metadata.uid() == 0,
-            "refusing to replace non-helper socket path {}",
-            socket_path.display()
-        );
-        fs::remove_file(socket_path)?;
-    }
-    let listener = UnixListener::bind(socket_path)
-        .with_context(|| format!("failed to bind {}", socket_path.display()))?;
-    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
-    chown(socket_path, 0, config.allowed_gid)?;
+    let startup = prepare_listener(config_path, socket_path);
+    let (listener, config) = match startup {
+        Ok(ready) => ready,
+        Err(error) => return Err(record_startup_failure(config_path, error)),
+    };
 
     for connection in listener.incoming() {
         let mut stream = match connection {
@@ -165,9 +158,382 @@ pub fn serve(config_path: &Path, socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn prepare_listener(
+    config_path: &Path,
+    socket_path: &Path,
+) -> Result<(UnixListener, HelperConfig)> {
+    ensure_root()?;
+    let config = load_root_owned_config(config_path)?;
+    let socket_parent = socket_path
+        .parent()
+        .context("ownership helper socket has no parent directory")?;
+    recover_socket_parent(socket_parent)?;
+    remove_stale_socket(socket_path)?;
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
+    chown(socket_path, 0, config.allowed_gid)?;
+    validate_ready_socket(socket_path, config.allowed_gid)?;
+    clear_startup_error(&startup_error_path(config_path)?)?;
+    Ok((listener, config))
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn serve(_config_path: &Path, _socket_path: &Path) -> Result<()> {
     bail!("the privileged ownership helper service requires macOS")
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedPathKind {
+    Directory,
+    RegularFile,
+    Socket,
+    Symlink,
+    Other,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedPathMetadata {
+    kind: ManagedPathKind,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    len: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeLeafAction {
+    Create,
+    Reuse,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn runtime_leaf_action(
+    path: &Path,
+    metadata: Option<ManagedPathMetadata>,
+) -> Result<RuntimeLeafAction> {
+    let Some(metadata) = metadata else {
+        return Ok(RuntimeLeafAction::Create);
+    };
+    ensure!(
+        metadata.kind == ManagedPathKind::Directory,
+        "{} is not a real directory",
+        path.display()
+    );
+    ensure!(metadata.uid == 0, "{} is not owned by root", path.display());
+    ensure!(
+        metadata.mode == RUNTIME_DIRECTORY_MODE,
+        "{} has mode {:o}, expected 755",
+        path.display(),
+        metadata.mode
+    );
+    ensure!(
+        metadata.mode & 0o022 == 0,
+        "{} is group- or world-writable",
+        path.display()
+    );
+    Ok(RuntimeLeafAction::Reuse)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn normalized_runtime_leaf_mode(path: &Path, metadata: ManagedPathMetadata) -> Result<u32> {
+    ensure!(
+        metadata.kind == ManagedPathKind::Directory,
+        "new ownership helper runtime path {} is not a real directory",
+        path.display()
+    );
+    ensure!(
+        metadata.uid == 0,
+        "new ownership helper runtime directory {} is not owned by root",
+        path.display()
+    );
+    ensure!(
+        metadata.mode & !RUNTIME_DIRECTORY_MODE == 0,
+        "new ownership helper runtime directory {} has mode {:o}, broader than requested {:o}",
+        path.display(),
+        metadata.mode,
+        RUNTIME_DIRECTORY_MODE
+    );
+    Ok(RUNTIME_DIRECTORY_MODE)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn canonical_runtime_leaf_spelling(
+    runtime_leaf: &Path,
+    durable_parent: &Path,
+    canonical_durable_parent: &Path,
+) -> Result<()> {
+    ensure!(
+        durable_parent.as_os_str() == canonical_durable_parent.as_os_str(),
+        "ownership helper durable parent {} is not canonically spelled (resolved to {})",
+        durable_parent.display(),
+        canonical_durable_parent.display()
+    );
+    let leaf_name = runtime_leaf
+        .file_name()
+        .context("ownership helper runtime directory has no leaf name")?;
+    let canonical_runtime_leaf = canonical_durable_parent.join(leaf_name);
+    ensure!(
+        runtime_leaf.as_os_str() == canonical_runtime_leaf.as_os_str(),
+        "ownership helper runtime directory {} is not a canonical one-leaf child of {}",
+        runtime_leaf.display(),
+        canonical_durable_parent.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn stale_socket_is_removable(path: &Path, metadata: ManagedPathMetadata) -> Result<()> {
+    ensure!(
+        metadata.kind == ManagedPathKind::Socket && metadata.uid == 0,
+        "refusing to replace non-helper socket path {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ready_socket_is_valid(
+    path: &Path,
+    metadata: ManagedPathMetadata,
+    allowed_gid: u32,
+) -> Result<()> {
+    ensure!(
+        metadata.kind == ManagedPathKind::Socket
+            && metadata.uid == 0
+            && metadata.gid == allowed_gid
+            && metadata.mode == 0o660,
+        "ownership helper socket {} has unexpected identity or permissions",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn startup_error_file_is_valid(path: &Path, metadata: ManagedPathMetadata) -> Result<()> {
+    ensure!(
+        metadata.kind == ManagedPathKind::RegularFile
+            && metadata.uid == 0
+            && metadata.gid == 0
+            && metadata.mode == 0o644
+            && metadata.len <= MAX_STARTUP_ERROR_BYTES as u64,
+        "ownership helper startup error record {} has unexpected identity, permissions, or size",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn sanitize_startup_error(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len().min(MAX_STARTUP_ERROR_BYTES));
+    for character in value.chars() {
+        let character = if character.is_control() || character.is_whitespace() {
+            ' '
+        } else {
+            character
+        };
+        if sanitized.len() + character.len_utf8() + 1 > MAX_STARTUP_ERROR_BYTES {
+            break;
+        }
+        sanitized.push(character);
+    }
+    let sanitized = sanitized.trim();
+    let sanitized = if sanitized.is_empty() {
+        "ownership helper startup failed"
+    } else {
+        sanitized
+    };
+    format!("{sanitized}\n")
+}
+
+#[cfg(target_os = "macos")]
+fn optional_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    optional_metadata_result(path, fs::symlink_metadata(path))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn optional_metadata_result<T>(path: &Path, result: std::io::Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn managed_metadata(metadata: &fs::Metadata) -> ManagedPathMetadata {
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_symlink() {
+        ManagedPathKind::Symlink
+    } else if file_type.is_dir() {
+        ManagedPathKind::Directory
+    } else if file_type.is_file() {
+        ManagedPathKind::RegularFile
+    } else if file_type.is_socket() {
+        ManagedPathKind::Socket
+    } else {
+        ManagedPathKind::Other
+    };
+    ManagedPathMetadata {
+        kind,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode() & 0o777,
+        len: metadata.len(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn recover_socket_parent(socket_parent: &Path) -> Result<()> {
+    let ancestor = socket_parent
+        .parent()
+        .context("ownership helper socket parent has no parent directory")?;
+    let canonical_ancestor = ancestor.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize ownership helper durable parent {}",
+            ancestor.display()
+        )
+    })?;
+    canonical_runtime_leaf_spelling(socket_parent, ancestor, &canonical_ancestor)?;
+    ensure_root_owned_directory_chain(ancestor)?;
+    match runtime_leaf_action(
+        socket_parent,
+        optional_metadata(socket_parent)?
+            .as_ref()
+            .map(managed_metadata),
+    )? {
+        RuntimeLeafAction::Create => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(RUNTIME_DIRECTORY_MODE);
+            builder.create(socket_parent).with_context(|| {
+                format!(
+                    "failed to create ownership helper runtime directory {} with mode {:o}",
+                    socket_parent.display(),
+                    RUNTIME_DIRECTORY_MODE
+                )
+            })?;
+            let created = fs::symlink_metadata(socket_parent)
+                .with_context(|| format!("failed to inspect {}", socket_parent.display()))?;
+            let final_mode =
+                normalized_runtime_leaf_mode(socket_parent, managed_metadata(&created))?;
+            fs::set_permissions(socket_parent, fs::Permissions::from_mode(final_mode))?;
+            chown(socket_parent, 0, 0)?;
+        }
+        RuntimeLeafAction::Reuse => {}
+    }
+    let metadata = fs::symlink_metadata(socket_parent)
+        .with_context(|| format!("failed to inspect {}", socket_parent.display()))?;
+    runtime_leaf_action(socket_parent, Some(managed_metadata(&metadata)))?;
+    ensure_root_owned_directory_chain(socket_parent)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_stale_socket(socket_path: &Path) -> Result<()> {
+    let Some(metadata) = optional_metadata(socket_path)? else {
+        return Ok(());
+    };
+    stale_socket_is_removable(socket_path, managed_metadata(&metadata))?;
+    fs::remove_file(socket_path)
+        .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_ready_socket(socket_path: &Path, allowed_gid: u32) -> Result<()> {
+    let metadata = fs::symlink_metadata(socket_path)
+        .with_context(|| format!("failed to inspect helper socket {}", socket_path.display()))?;
+    ready_socket_is_valid(socket_path, managed_metadata(&metadata), allowed_gid)?;
+    ensure_root_owned_directory_chain(
+        socket_path
+            .parent()
+            .context("ownership helper socket has no parent directory")?,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn startup_error_path(config_path: &Path) -> Result<PathBuf> {
+    Ok(config_path
+        .parent()
+        .context("ownership helper config has no parent")?
+        .join("last-startup-error"))
+}
+
+#[cfg(target_os = "macos")]
+fn record_startup_failure(config_path: &Path, error: anyhow::Error) -> anyhow::Error {
+    let message = sanitize_startup_error(&format!("{error:#}"));
+    startup_failure_with_recording(error, || {
+        let path = startup_error_path(config_path)?;
+        write_startup_error(&path, &message)
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn startup_failure_with_recording(
+    error: anyhow::Error,
+    record: impl FnOnce() -> Result<()>,
+) -> anyhow::Error {
+    match record() {
+        Ok(()) => error,
+        Err(record_error) => error.context(format!(
+            "failed to record ownership helper startup error: {record_error:#}"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_startup_error(path: &Path, message: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("ownership helper startup error path has no parent")?;
+    ensure_root_owned_directory_chain(parent)?;
+    if let Some(metadata) = optional_metadata(path)? {
+        startup_error_file_is_valid(path, managed_metadata(&metadata))?;
+        let existing = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        ensure!(
+            sanitize_startup_error(existing.trim_end()) == existing,
+            "ownership helper startup error record {} is not sanitized",
+            path.display()
+        );
+    }
+    let message = sanitize_startup_error(message.trim_end());
+    atomic_write(path, message.as_bytes(), 0o644)?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    startup_error_file_is_valid(path, managed_metadata(&metadata))?;
+    ensure!(
+        fs::read(path)? == message.as_bytes(),
+        "ownership helper startup error record changed during publication"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn read_startup_error(path: &Path) -> Result<Option<String>> {
+    let Some(metadata) = optional_metadata(path)? else {
+        return Ok(None);
+    };
+    startup_error_file_is_valid(path, managed_metadata(&metadata))?;
+    let evidence =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    ensure!(
+        sanitize_startup_error(evidence.trim_end()) == evidence,
+        "ownership helper startup error record {} is not sanitized",
+        path.display()
+    );
+    Ok(Some(evidence.trim_end().to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn clear_startup_error(path: &Path) -> Result<()> {
+    let Some(metadata) = optional_metadata(path)? else {
+        return Ok(());
+    };
+    startup_error_file_is_valid(path, managed_metadata(&metadata))?;
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
 }
 
 #[cfg(target_os = "macos")]
@@ -717,22 +1083,24 @@ pub fn uninstall() -> Result<()> {
     if service_loaded()? {
         bootout_service()?;
     }
-    for (path, expected_socket) in [
-        (Path::new(DEFAULT_HELPER_SOCKET), true),
-        (Path::new(DEFAULT_HELPER_PLIST), false),
-        (Path::new(DEFAULT_HELPER_CONFIG), false),
-        (Path::new(DEFAULT_HELPER_BINARY), false),
+    remove_helper_socket_if_present()?;
+    clear_startup_error(Path::new(DEFAULT_HELPER_STARTUP_ERROR))?;
+    for path in [
+        Path::new(DEFAULT_HELPER_PLIST),
+        Path::new(DEFAULT_HELPER_CONFIG),
+        Path::new(DEFAULT_HELPER_BINARY),
     ] {
-        if let Ok(metadata) = fs::symlink_metadata(path) {
-            ensure!(
-                metadata.uid() == 0
-                    && !metadata.file_type().is_symlink()
-                    && (metadata.file_type().is_socket() == expected_socket),
-                "refusing to remove unexpected helper path {}",
-                path.display()
-            );
-            fs::remove_file(path)?;
-        }
+        let Some(metadata) = optional_metadata(path)? else {
+            continue;
+        };
+        ensure!(
+            metadata.uid() == 0
+                && metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink(),
+            "refusing to remove unexpected helper path {}",
+            path.display()
+        );
+        fs::remove_file(path)?;
     }
     remove_all_installation_backups()?;
     Ok(())
@@ -741,16 +1109,10 @@ pub fn uninstall() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn remove_helper_socket_if_present() -> Result<()> {
     let socket = Path::new(DEFAULT_HELPER_SOCKET);
-    let metadata = match fs::symlink_metadata(socket) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+    let Some(metadata) = optional_metadata(socket)? else {
+        return Ok(());
     };
-    ensure!(
-        metadata.file_type().is_socket() && metadata.uid() == 0,
-        "refusing to remove unexpected helper socket {}",
-        socket.display()
-    );
+    stale_socket_is_removable(socket, managed_metadata(&metadata))?;
     fs::remove_file(socket)?;
     Ok(())
 }
@@ -777,7 +1139,7 @@ pub fn status() -> HelperStatus {
                 roots: Vec::new(),
                 socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
                 probe_complete: false,
-                error: Some(format!("{error:#}")),
+                error: Some(status_error_with_startup_evidence(&error)),
             };
         }
     };
@@ -793,8 +1155,22 @@ pub fn status() -> HelperStatus {
             roots: Vec::new(),
             socket: PathBuf::from(DEFAULT_HELPER_SOCKET),
             probe_complete: false,
-            error: Some(format!("{error:#}")),
+            error: Some(status_error_with_startup_evidence(&error)),
         },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn status_error_with_startup_evidence(error: &anyhow::Error) -> String {
+    let error = sanitize_startup_error(&format!("{error:#}"));
+    match read_startup_error(Path::new(DEFAULT_HELPER_STARTUP_ERROR)) {
+        Ok(Some(startup)) => format!("{}; last startup error: {startup}", error.trim_end()),
+        Ok(None) => error.trim_end().to_string(),
+        Err(evidence_error) => format!(
+            "{}; startup error evidence unavailable: {}",
+            error.trim_end(),
+            sanitize_startup_error(&format!("{evidence_error:#}")).trim_end()
+        ),
     }
 }
 
@@ -1500,6 +1876,243 @@ mod tests {
         Ok(())
     }
 
+    fn managed_path(
+        kind: ManagedPathKind,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        len: u64,
+    ) -> ManagedPathMetadata {
+        ManagedPathMetadata {
+            kind,
+            uid,
+            gid,
+            mode,
+            len,
+        }
+    }
+
+    #[test]
+    fn runtime_recovery_creates_only_an_absent_leaf() -> Result<()> {
+        let path = Path::new("/Library/Application Support/worktree-gc/run");
+        assert_eq!(RUNTIME_DIRECTORY_MODE, 0o755);
+        assert_eq!(runtime_leaf_action(path, None)?, RuntimeLeafAction::Create);
+        assert_eq!(
+            runtime_leaf_action(
+                path,
+                Some(managed_path(ManagedPathKind::Directory, 0, 0, 0o755, 0,)),
+            )?,
+            RuntimeLeafAction::Reuse
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_creation_and_reuse_share_the_exact_final_mode_policy() -> Result<()> {
+        let path = Path::new("/durable/run");
+        assert_eq!(RUNTIME_DIRECTORY_MODE, 0o755);
+        assert_eq!(
+            runtime_leaf_action(
+                path,
+                Some(managed_path(
+                    ManagedPathKind::Directory,
+                    0,
+                    0,
+                    RUNTIME_DIRECTORY_MODE,
+                    0,
+                )),
+            )?,
+            RuntimeLeafAction::Reuse
+        );
+        assert!(runtime_leaf_action(
+            path,
+            Some(managed_path(
+                ManagedPathKind::Directory,
+                0,
+                0,
+                RUNTIME_DIRECTORY_MODE | 0o022,
+                0,
+            )),
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn restrictive_umask_result_is_normalized_to_the_exact_runtime_mode() -> Result<()> {
+        let path = Path::new("/durable/run");
+        for initial_mode in [0o700, 0o711, 0o750, RUNTIME_DIRECTORY_MODE] {
+            assert_eq!(
+                normalized_runtime_leaf_mode(
+                    path,
+                    managed_path(ManagedPathKind::Directory, 0, 0, initial_mode, 0),
+                )?,
+                RUNTIME_DIRECTORY_MODE
+            );
+        }
+        assert!(normalized_runtime_leaf_mode(
+            path,
+            managed_path(ManagedPathKind::Directory, 0, 0, 0o775, 0),
+        )
+        .is_err());
+        assert!(normalized_runtime_leaf_mode(
+            path,
+            managed_path(ManagedPathKind::Symlink, 0, 0, 0o700, 0),
+        )
+        .is_err());
+        assert!(normalized_runtime_leaf_mode(
+            path,
+            managed_path(ManagedPathKind::Directory, 501, 0, 0o700, 0),
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_recovery_requires_canonical_one_leaf_spelling() -> Result<()> {
+        canonical_runtime_leaf_spelling(
+            Path::new("/durable/run"),
+            Path::new("/durable"),
+            Path::new("/durable"),
+        )?;
+        assert!(canonical_runtime_leaf_spelling(
+            Path::new("/durable/./run"),
+            Path::new("/durable/."),
+            Path::new("/durable"),
+        )
+        .is_err());
+        assert!(canonical_runtime_leaf_spelling(
+            Path::new("/durable/nested/../run"),
+            Path::new("/durable/nested/.."),
+            Path::new("/durable"),
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_recovery_rejects_aliases_wrong_owners_and_wrong_modes() {
+        let path = Path::new("/Library/Application Support/worktree-gc/run");
+        for metadata in [
+            managed_path(ManagedPathKind::Symlink, 0, 0, 0o755, 0),
+            managed_path(ManagedPathKind::RegularFile, 0, 0, 0o755, 0),
+            managed_path(ManagedPathKind::Directory, 501, 0, 0o755, 0),
+            managed_path(ManagedPathKind::Directory, 0, 0, 0o700, 0),
+            managed_path(ManagedPathKind::Directory, 0, 0, 0o775, 0),
+        ] {
+            assert!(runtime_leaf_action(path, Some(metadata)).is_err());
+        }
+    }
+
+    #[test]
+    fn optional_path_inspection_propagates_every_error_except_not_found() -> Result<()> {
+        let path = Path::new("/expected/path");
+        assert_eq!(
+            optional_metadata_result::<()>(
+                path,
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            )?,
+            None
+        );
+        let error = optional_metadata_result::<()>(
+            path,
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("failed to inspect /expected/path"));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_socket_removal_requires_a_root_owned_socket() -> Result<()> {
+        let path = Path::new("/runtime/ownership.sock");
+        stale_socket_is_removable(path, managed_path(ManagedPathKind::Socket, 0, 20, 0o660, 0))?;
+        for metadata in [
+            managed_path(ManagedPathKind::Socket, 501, 20, 0o660, 0),
+            managed_path(ManagedPathKind::RegularFile, 0, 20, 0o660, 0),
+            managed_path(ManagedPathKind::Symlink, 0, 20, 0o660, 0),
+        ] {
+            assert!(stale_socket_is_removable(path, metadata).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ready_socket_requires_exact_identity_and_permissions() -> Result<()> {
+        let path = Path::new("/runtime/ownership.sock");
+        ready_socket_is_valid(
+            path,
+            managed_path(ManagedPathKind::Socket, 0, 20, 0o660, 0),
+            20,
+        )?;
+        for metadata in [
+            managed_path(ManagedPathKind::Socket, 501, 20, 0o660, 0),
+            managed_path(ManagedPathKind::Socket, 0, 21, 0o660, 0),
+            managed_path(ManagedPathKind::Socket, 0, 20, 0o666, 0),
+            managed_path(ManagedPathKind::RegularFile, 0, 20, 0o660, 0),
+        ] {
+            assert!(ready_socket_is_valid(path, metadata, 20).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_error_record_requires_bounded_root_controlled_public_evidence() -> Result<()> {
+        let path = Path::new(DEFAULT_HELPER_STARTUP_ERROR);
+        startup_error_file_is_valid(
+            path,
+            managed_path(ManagedPathKind::RegularFile, 0, 0, 0o644, 4096),
+        )?;
+        for metadata in [
+            managed_path(ManagedPathKind::Symlink, 0, 0, 0o644, 1),
+            managed_path(ManagedPathKind::RegularFile, 501, 0, 0o644, 1),
+            managed_path(ManagedPathKind::RegularFile, 0, 20, 0o644, 1),
+            managed_path(ManagedPathKind::RegularFile, 0, 0, 0o600, 1),
+            managed_path(ManagedPathKind::RegularFile, 0, 0, 0o644, 4097),
+        ] {
+            assert!(startup_error_file_is_valid(path, metadata).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_error_evidence_is_single_line_and_bounded() {
+        let evidence = sanitize_startup_error(&format!(
+            "failed\nwith\tcontrol\rcharacters {}",
+            "x".repeat(MAX_STARTUP_ERROR_BYTES * 2)
+        ));
+        assert!(evidence.ends_with('\n'));
+        assert_eq!(evidence.matches('\n').count(), 1);
+        assert!(evidence.len() <= MAX_STARTUP_ERROR_BYTES);
+        assert!(!evidence.contains('\t'));
+        assert!(!evidence.contains('\r'));
+    }
+
+    #[test]
+    fn startup_failure_preserves_the_original_cause_when_recording_fails() {
+        let error =
+            startup_failure_with_recording(anyhow::anyhow!("socket parent is missing"), || {
+                bail!("diagnostic path is unsafe")
+            });
+        let chain = format!("{error:#}");
+        assert!(chain.contains("socket parent is missing"));
+        assert!(chain.contains("diagnostic path is unsafe"));
+    }
+
+    #[test]
+    fn startup_error_record_is_a_durable_sibling_of_the_runtime_leaf() {
+        assert_eq!(
+            Path::new(DEFAULT_HELPER_STARTUP_ERROR).parent(),
+            Path::new(DEFAULT_HELPER_CONFIG).parent()
+        );
+        assert_eq!(
+            Path::new(DEFAULT_HELPER_SOCKET)
+                .parent()
+                .and_then(Path::parent),
+            Path::new(DEFAULT_HELPER_STARTUP_ERROR).parent()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_roots_are_canonical_and_deduplicated_before_persistence() -> Result<()> {
@@ -1862,6 +2475,7 @@ mod tests {
         );
         assert!(plist.contains("<string>serve</string>"));
         assert!(plist.contains("<string>/dev/null</string>"));
+        assert!(!plist.contains(DEFAULT_HELPER_STARTUP_ERROR));
         assert!(!plist.contains("/var/log/"));
         assert!(!plist.contains("cleanup"));
         assert!(!plist.contains("execute"));
