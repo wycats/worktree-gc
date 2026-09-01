@@ -1996,6 +1996,7 @@ mod tests {
         for metadata in [
             managed_path(ManagedPathKind::Symlink, 0, 0, 0o755, 0),
             managed_path(ManagedPathKind::RegularFile, 0, 0, 0o755, 0),
+            managed_path(ManagedPathKind::Other, 0, 0, 0o755, 0),
             managed_path(ManagedPathKind::Directory, 501, 0, 0o755, 0),
             managed_path(ManagedPathKind::Directory, 0, 0, 0o700, 0),
             managed_path(ManagedPathKind::Directory, 0, 0, 0o775, 0),
