@@ -129,8 +129,14 @@ The installer atomically places the helper under
 `/Library/Application Support/worktree-gc`, and bootstraps
 `com.wycats.worktree-gc.ownership-helper`. The Unix socket authenticates the
 peer UID and is available at
-`/Library/Application Support/worktree-gc/run/ownership.sock`. Inspect the
-service without mutation:
+`/Library/Application Support/worktree-gc/run/ownership.sock`. On startup the
+helper can recreate that one root-controlled `run` directory when the durable
+application-support parent is intact; it never recursively recreates missing
+ancestors or accepts aliases, writable directories, or unexpected filesystem
+objects. A bounded, sanitized last-startup error remains under the durable
+application-support directory until the helper has established the expected
+root-owned socket identity and permissions. Inspect the service and that
+diagnostic evidence without mutation:
 
 ```sh
 ./worktree-gc-ownership-helper status
