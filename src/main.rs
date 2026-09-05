@@ -42,6 +42,23 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Plan or run an opt-in bounded batch of native archived-child migrations (macOS)
+    CodexMigration {
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+        #[arg(
+            long,
+            help = "Apply the separately enabled migration policy; default is read-only"
+        )]
+        apply: bool,
+    },
+    /// Export a migration's verified original into a new isolated Codex home (macOS)
+    RecoverCodexMigration {
+        #[arg(long, value_name = "PATH")]
+        journal: PathBuf,
+        #[arg(long, value_name = "ABSENT_DIRECTORY")]
+        destination: PathBuf,
+    },
     /// Measure files or directories with bounded, clone-aware accounting
     Inventory {
         #[arg(value_name = "PATH", required = true)]
@@ -688,6 +705,25 @@ fn exact_execution_ownership_policy(config_path: Option<&Path>) -> Result<Owners
     }
 }
 
+fn run_codex_migration(args: &[std::ffi::OsString]) -> Result<()> {
+    anyhow::ensure!(
+        cfg!(target_os = "macos"),
+        "archived-child migration currently supports macOS"
+    );
+    // Embedded in the release artifact: installing worktree-gc also installs the
+    // exact reviewed operator. Isolated Python ignores PYTHONPATH/user packages.
+    let status = std::process::Command::new("python3")
+        .args(["-I", "-c", include_str!("codex_migration.py")])
+        .args(args)
+        .status()
+        .context("run archived-child operator (requires Python 3.11+)")?;
+    anyhow::ensure!(
+        status.success(),
+        "archived-child operator stopped: {status}"
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let now = SystemTime::now();
@@ -695,6 +731,37 @@ fn main() -> Result<()> {
     let roots = cli.root;
 
     match cli.command {
+        Command::CodexMigration { config, apply } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "migration takes its own config; omit --repo/--root"
+            );
+            let mut args = vec![
+                std::ffi::OsString::from("run"),
+                "--config".into(),
+                config.into_os_string(),
+            ];
+            if apply {
+                args.push("--apply".into());
+            }
+            run_codex_migration(&args)?;
+        }
+        Command::RecoverCodexMigration {
+            journal,
+            destination,
+        } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "recovery takes an exact journal; omit --repo/--root"
+            );
+            run_codex_migration(&[
+                "recover".into(),
+                "--journal".into(),
+                journal.into_os_string(),
+                "--destination".into(),
+                destination.into_os_string(),
+            ])?;
+        }
         Command::Inventory {
             paths,
             depth,
@@ -1487,6 +1554,32 @@ helper_socket = "unused-helper.sock"
             Cli::try_parse_from(["worktree-gc", "collect", "codex-sessions", "--execute",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn archived_migration_is_explicit_and_separate_from_collection() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "codex-migration",
+            "--config",
+            "/migration.toml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::CodexMigration { apply: false, .. }
+        ));
+        assert!(Cli::try_parse_from(["worktree-gc", "codex-migration", "--apply"]).is_err());
+        assert!(
+            Cli::try_parse_from(["worktree-gc", "collect", "codex-sessions", "--apply",]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "recover-codex-migration",
+            "--journal",
+            "/entry.json",
+        ])
+        .is_err());
     }
 
     #[test]

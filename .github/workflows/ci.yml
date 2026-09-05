@@ -23,6 +23,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install Python for the embedded migration operator
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test archived-child migration with isolated fixtures
+        run: python3 -B -m unittest discover -s tests -p 'test_codex_migration.py'
+
       - name: Check formatting
         run: cargo fmt --check
 

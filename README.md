@@ -393,6 +393,95 @@ Use `--json` for the complete structured opportunity run. `--top` affects only
 the bounded human sections; the durable collector manifest retains every
 discovered artifact.
 
+### Recoverable archived-child migration (opt-in, macOS)
+
+`codex-migration` packages the verified external-backup → first-party migration
+→ continuation-check sequence into a bounded batch. It is a separate policy
+domain from generated-tree deletion and from `collect codex-sessions`.
+
+```sh
+worktree-gc codex-migration --config /absolute/path/migration.toml
+# After enabling the policy and approving its activation:
+worktree-gc codex-migration --config /absolute/path/migration.toml --apply
+```
+
+The first command reads index/file metadata and emits a JSON plan to stdout. It
+does not read rollout contents, create a backup/journal, or invoke migration.
+The second requires `enabled = true` and a quiet Codex store. Both are independent
+of the existing `scheduled` command; this change installs no scheduler.
+
+The operator is embedded in the Rust release artifact and uses Python 3.11+
+(`python3` on the service PATH), SQLite from Python's standard library, the
+configured `zstd` executable, and macOS `diskutil`, `lsof`, `codesign`, and
+`sandbox-exec`. Native compatibility is currently proven for **Codex 0.153.4**;
+a different binary/version needs a new compatibility proof and policy digest.
+
+Create the journal directory with mode 0700 and the separate policy file with
+mode 0600. The external backup directory must already exist on the expected
+volume. All paths must use their canonical physical spelling. Example policy:
+
+```toml
+enabled = false
+codex_home = "/Users/you/.codex"
+codex_binary = "/Applications/ChatGPT.app/Contents/Resources/codex"
+codex_sha256 = "REPLACE_WITH_VERIFIED_64_CHARACTER_SHA256"
+zstd_binary = "/absolute/canonical/path/to/zstd"
+backup_root = "/Volumes/YourDrive/Codex History Backups"
+backup_volume_uuid = "REPLACE_WITH_VERIFIED_VOLUME_UUID"
+journal_root = "/Users/you/.local/state/worktree-gc/archived-migrations"
+grace_hours = 24
+max_tasks = 4
+max_source_bytes = 4294967296
+max_raw_bytes_per_task = 32212254720
+max_seconds = 1800
+min_free_bytes = 32212254720
+exclude_threads = []
+```
+
+Eligibility requires an archived **legacy leaf child**, complete nonconflicting
+lineage with a known parent, archive/index/file inactivity beyond the grace
+period, and no pin or explicit exclusion. A long-lived unarchived parent does
+not retain an otherwise eligible child. Unarchived children and non-leaves
+remain outside this policy. Plans report stored file bytes, not APFS-private
+reclaim or predicted migration savings.
+
+Apply serializes workers and honors recursive worktree-gc protections. It
+verifies the external volume and read-back backup hash, freshly rechecks the
+exact child and file, invokes only native `migrate-rollouts --thread ID --apply`
+with networking disabled, compares the latest checkpoint and continuation
+records, and records file reduction separately from live filesystem free-space
+change. Compressed inputs are streamed for verification; native decompression
+and rewrite require additional local scratch headroom. The batch stops on the
+first failed guard, time/byte/capacity bound, or unverified migration.
+
+**History and recovery:** native migration can leave a legacy child's browsable
+history empty while retaining its verified continuation. The untouched external
+original remains the history recovery source. These backups contain sensitive
+task data; choose a suitably secured external volume and retain them. The
+operator never prunes them.
+
+```sh
+worktree-gc recover-codex-migration \
+  --journal /absolute/journal-root/ENTRY.json \
+  --destination /absolute/new-isolated-codex-home
+```
+
+Recovery verifies the volume and original hash and exports the original into an
+absent isolated home. It preserves the live store, including any later turns.
+Open/read the exact task using Codex pointed at that isolated home. The pilot
+verified original history and unarchive after restoration; this export command
+does not itself open, unarchive, resume, or overwrite a live task. A pending or
+`recovery_required` journal pauses future apply batches for inspection. There
+is intentionally no automatic retry or journal-acknowledgment switch.
+
+The first unattended policy is **quiet-store only**: an active Codex client or
+worker defers the batch. The native CLI has no atomic “still archived at this
+timestamp” precondition. Pre/post index, file, and ownership checks therefore
+complement its own writer coordination; a conflicting open/unarchive during
+the operation is a stop/recovery condition. Activating a periodic invocation
+and validating that quiet windows occur often enough are separate rollout
+steps. Running this from inside an active Codex task will defer apply normally.
+
 ### Codex task-store compression health
 
 `collect codex-sessions` keeps Codex's task store visible in the machine
