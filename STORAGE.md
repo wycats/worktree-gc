@@ -300,9 +300,14 @@ and unarchive checks, recovery inspection, and a calendar-triggered run. If
 quiet windows cannot serve the eligible pool, improve native coordination;
 retain this evidence rather than weakening the archival guard.
 
-The embedded operator uses Python 3.11+ and bounded subprocesses to reuse the
-tested SQLite, compressed-stream and native-command path without adding a
-second rollout writer. It reports stored-file reduction and filesystem free
+The Rust operator uses typed SQLite observation, bounded compressed streams,
+signal-aware owned process groups, and first-party migration as the live rollout
+writer. Recovery registers originals through native startup and verifies exact
+read/unarchive/read history parity in an isolated store. Backup eligibility
+requires external physical disks disjoint from the source's physical stores;
+different APFS volumes on one disk do not qualify. The complete native store,
+backup and journal surfaces share canonical recursive protection enforcement.
+It reports stored-file reduction and filesystem free
 space separately. It neither claims APFS-private reclaim from file lengths nor
 deletes external backups. Shared stores, VM storage and Parallels remain
 outside this migration policy.

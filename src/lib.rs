@@ -1,5 +1,7 @@
 mod cargo_incremental;
 mod cargo_profiles;
+#[cfg(unix)]
+pub mod codex_migration;
 mod codex_sessions;
 mod exact_generated;
 mod gateway_storage;

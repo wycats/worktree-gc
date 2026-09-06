@@ -410,9 +410,8 @@ does not read rollout contents, create a backup/journal, or invoke migration.
 The second requires `enabled = true` and a quiet Codex store. Both are independent
 of the existing `scheduled` command; this change installs no scheduler.
 
-The operator is embedded in the Rust release artifact and uses Python 3.11+
-(`python3` on the service PATH), SQLite from Python's standard library, the
-configured `zstd` executable, and macOS `diskutil`, `lsof`, `codesign`, and
+The operator and its fixtures are implemented in Rust. The release artifact
+includes SQLite; it uses the configured `zstd` executable and macOS `diskutil`, `lsof`, `codesign`, and
 `sandbox-exec`. Native compatibility is currently proven for **Codex 0.153.4**;
 a different binary/version needs a new compatibility proof and policy digest.
 
@@ -445,8 +444,12 @@ not retain an otherwise eligible child. Unarchived children and non-leaves
 remain outside this policy. Plans report stored file bytes, not APFS-private
 reclaim or predicted migration savings.
 
-Apply serializes workers and honors recursive worktree-gc protections. It
-verifies the external volume and read-back backup hash, freshly rechecks the
+Apply serializes workers and honors recursive worktree-gc protections over the
+whole native store (including index, sidecars and temporary files), backup and
+journal surfaces. It revalidates canonical lease paths, rejects hardlinked
+SQLite/index sidecars, and requires known physically external backup disks
+disjoint from the source disks, including APFS physical-store resolution. It
+verifies the external volume and read-back backup hash before and after migration, freshly rechecks the
 exact child and file, invokes only native `migrate-rollouts --thread ID --apply`
 with networking disabled, compares the latest checkpoint and continuation
 records, and records file reduction separately from live filesystem free-space
@@ -466,11 +469,18 @@ worktree-gc recover-codex-migration \
   --destination /absolute/new-isolated-codex-home
 ```
 
-Recovery verifies the volume and original hash and exports the original into an
-absent isolated home. It preserves the live store, including any later turns.
-Open/read the exact task using Codex pointed at that isolated home. The pilot
-verified original history and unarchive after restoration; this export command
-does not itself open, unarchive, resume, or overwrite a live task. A pending or
+Recovery verifies the physical volume and original hash, then creates a fresh
+isolated home. First-party app-server startup registers the original; exact
+read/unarchive/read calls must return nonempty identical history before success.
+Networking is denied and native writes are confined to that isolated home.
+It preserves the live store, including any later turns, and sends no model turn.
+Recovery's native history response is bounded at 256 MiB and each RPC at four
+minutes within a thirty-minute recovery deadline. Larger responses fail with
+the external original preserved; this limit does not establish recovery
+throughput or coverage for the entire archived population.
+Failed recovery retains diagnostic staging while keeping the requested final
+destination retryable. Open the recovered task with Codex pointed at the returned
+isolated home. A pending or
 `recovery_required` journal pauses future apply batches for inspection. There
 is intentionally no automatic retry or journal-acknowledgment switch.
 
