@@ -291,6 +291,14 @@ fn list_protections_at(registry_path: &Path, now: SystemTime) -> Result<Vec<Prot
 }
 
 fn read_active_protections(registry_path: &Path, now: SystemTime) -> Result<Vec<ProtectionLease>> {
+    read_active_protections_inner(registry_path, now, true)
+}
+
+fn read_active_protections_inner(
+    registry_path: &Path,
+    now: SystemTime,
+    persist_expiry: bool,
+) -> Result<Vec<ProtectionLease>> {
     let mut registry = read_registry(registry_path)?;
     let original_len = registry.leases.len();
     registry.leases.retain(|lease| lease.is_active(now));
@@ -372,10 +380,68 @@ fn read_active_protections(registry_path: &Path, now: SystemTime) -> Result<Vec<
             );
         }
     }
-    if registry.leases.len() != original_len {
+    if persist_expiry && registry.leases.len() != original_len {
         write_registry(registry_path, &registry)?;
     }
     Ok(registry.leases)
+}
+
+/// Migration uses the real registry even in fixture builds. Holding this shared
+/// lock prevents lease edits; each native boundary rechecks canonical paths.
+#[cfg(unix)]
+pub(crate) struct MigrationProtectionGuard {
+    _lock: std::fs::File,
+    registry: PathBuf,
+}
+
+#[cfg(unix)]
+impl MigrationProtectionGuard {
+    pub(crate) fn acquire(registry: &Path) -> Result<Self> {
+        use crate::codex_migration::io;
+        let parent = registry.parent().context("registry parent")?;
+        io::canonical_prefixes(parent)?;
+        std::fs::create_dir_all(parent)?;
+        io::canonical(parent, true)?;
+        let lock = io::lock_file(&parent.join("protections.lock"), true)?;
+        Ok(Self {
+            _lock: lock,
+            registry: registry.to_path_buf(),
+        })
+    }
+
+    pub(crate) fn check(&self, paths: &[PathBuf], now: SystemTime) -> Result<()> {
+        use crate::codex_migration::io;
+        io::canonical_prefixes(&self.registry)?;
+        match std::fs::symlink_metadata(&self.registry) {
+            Ok(_) => {
+                ensure_registry_bound(&self.registry)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let leases = read_active_protections_inner(&self.registry, now, false)?;
+        for path in paths {
+            io::canonical_prefixes(path)?;
+            if let Some(lease) = protection_for_path(path, &leases) {
+                bail!(
+                    "recursive protection {} applies to {}",
+                    lease.id,
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn ensure_registry_bound(path: &Path) -> Result<()> {
+    let identity = crate::codex_migration::io::identity(path)?;
+    anyhow::ensure!(
+        identity.bytes <= 4 * 1024 * 1024,
+        "protection registry exceeds size bound"
+    );
+    Ok(())
 }
 
 pub fn protection_for_path(
@@ -433,6 +499,10 @@ fn validate_stored_path(path: &Path) -> Result<()> {
     if path
         .components()
         .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || path
+            .to_string_lossy()
+            .split(std::path::is_separator)
+            .any(|component| matches!(component, "." | ".."))
     {
         bail!("protection path must not contain '.' or '..' components");
     }

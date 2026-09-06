@@ -178,14 +178,14 @@ current versus resumed observations. This is an observation ledger, not
 mutation authority; an exact cleanup manifest always measures and revalidates
 its candidate again.
 
-These domains remain owner-report-only: `~/.cache/local-sandbox`,
+These domains remain owner-report-only to generated-tree GC: `~/.cache/local-sandbox`,
 `~/.codex/sessions` plus `~/.codex/archived_sessions`, and VS Code/Gateway
 storage. The `collect codex-sessions` adapter correlates Codex's task index
 with plain and natively compressed task files, reports compression
 configuration and marker health, and APFS-measures the physical store without
 reading transcript contents. It grants no archive, retention, compression, or
-deletion authority; Codex's native task-store compression remains the recovery
-mechanism.
+deletion authority. Codex owns native compression and the separate opt-in
+archived-child migration described below.
 
 Generic inventory may expose these domains' physical size but cannot infer
 liveness, pin/export state, eligibility, or deletion authority. Parallels is
@@ -259,10 +259,58 @@ The report records:
 - age buckets derived from owner-index activity timestamps;
 - bounded traversal, correlation, and APFS-measurement completeness.
 
-This is health and coverage evidence, not an eligibility reconstruction.
-Worktree-gc does not decide which tasks are safe to compress, mutate Codex
+This collector remains health and coverage evidence. It does not mutate Codex
 configuration, restart the application, alter archive state, or expose a
 session cleanup command.
+
+### Owner-mediated archived-child migration
+
+The current session-storage bet is recoverable migration of archived legacy
+leaf children. The September 5 compressed pilot reduced one stored file from
+700,407,785 to 4,799,120 bytes using first-party Codex 0.153.4. Latest-checkpoint
+and continuation payloads matched. Native history projection changed from 676
+turns / 32,545 items to zero; restoring the original in an isolated store
+recovered the exact history, and native unarchive succeeded there. This is one
+representative proof, not a population-wide savings estimate. Retained local
+proof copies also offset the pilot's live-store reduction.
+
+`codex-migration` implements an opt-in, bounded adapter around that native
+operation. Eligibility uses actual archive time, index activity and file
+activity with a minimum 24-hour grace; only known-parent leaf children in
+legacy mode qualify. Child status is reconciled from both spawn edges and
+source metadata. Parent longevity does not decide the child's eligibility.
+Pinned tasks, explicit exclusions, recursive protections, incomplete lineage,
+ambiguous physical spellings, hardlinks, symlinks, and cross-device rollouts
+retain their source. The report-only collector remains unchanged.
+
+Each apply requires a UUID-verified separate backup volume, byte-identical
+readback of an exclusive original copy, fresh source/index evidence, a signed
+and digest-pinned supported native binary, native exact-ID dry-run/apply, and
+streamed continuation parity. A durable journal is published before native
+apply. Uncertain/interrupted apply blocks subsequent batches and preserves
+both histories for diagnosis. Recovery exports the original to a new isolated
+store; it never replaces later live history or writes the SQLite index itself.
+
+Policy and activation are separate from generated-tree GC. The existing daily
+GC command, live configuration, privileged helper and sessions remain unchanged
+by delivery. The initial periodic runner uses quiet Codex-store windows until
+native migration offers an atomic archival-state precondition. Activation
+acceptance must include an observed batch, missing-drive deferral, archive-grace
+and unarchive checks, recovery inspection, and a calendar-triggered run. If
+quiet windows cannot serve the eligible pool, improve native coordination;
+retain this evidence rather than weakening the archival guard.
+
+The Rust operator uses typed SQLite observation, bounded compressed streams,
+signal-aware owned process groups, and first-party migration as the live rollout
+writer. Recovery registers originals through native startup and verifies exact
+read/unarchive/read history parity in an isolated store. Backup eligibility
+requires external physical disks disjoint from the source's physical stores;
+different APFS volumes on one disk do not qualify. The complete native store,
+backup and journal surfaces share canonical recursive protection enforcement.
+It reports stored-file reduction and filesystem free
+space separately. It neither claims APFS-private reclaim from file lengths nor
+deletes external backups. Shared stores, VM storage and Parallels remain
+outside this migration policy.
 
 ## Source and rebuildable-state policy
 

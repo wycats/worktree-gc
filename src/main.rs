@@ -42,6 +42,23 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Plan or run an opt-in bounded batch of native archived-child migrations (macOS)
+    CodexMigration {
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+        #[arg(
+            long,
+            help = "Apply the separately enabled migration policy; default is read-only"
+        )]
+        apply: bool,
+    },
+    /// Recover and natively register a verified original in a new isolated home (macOS)
+    RecoverCodexMigration {
+        #[arg(long, value_name = "PATH")]
+        journal: PathBuf,
+        #[arg(long, value_name = "ABSENT_DIRECTORY")]
+        destination: PathBuf,
+    },
     /// Measure files or directories with bounded, clone-aware accounting
     Inventory {
         #[arg(value_name = "PATH", required = true)]
@@ -695,6 +712,44 @@ fn main() -> Result<()> {
     let roots = cli.root;
 
     match cli.command {
+        Command::CodexMigration { config, apply } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "migration takes its own config; omit --repo/--root"
+            );
+            #[cfg(unix)]
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&worktree_gc::codex_migration::run(&config, apply)?)?
+            );
+            #[cfg(not(unix))]
+            {
+                let _ = (config, apply);
+                anyhow::bail!("archived-child migration currently supports macOS");
+            }
+        }
+        Command::RecoverCodexMigration {
+            journal,
+            destination,
+        } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "recovery takes an exact journal; omit --repo/--root"
+            );
+            #[cfg(unix)]
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&worktree_gc::codex_migration::recover(
+                    &journal,
+                    &destination
+                )?)?
+            );
+            #[cfg(not(unix))]
+            {
+                let _ = (journal, destination);
+                anyhow::bail!("archived-child migration currently supports macOS");
+            }
+        }
         Command::Inventory {
             paths,
             depth,
@@ -1487,6 +1542,32 @@ helper_socket = "unused-helper.sock"
             Cli::try_parse_from(["worktree-gc", "collect", "codex-sessions", "--execute",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn archived_migration_is_explicit_and_separate_from_collection() {
+        let cli = Cli::try_parse_from([
+            "worktree-gc",
+            "codex-migration",
+            "--config",
+            "/migration.toml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::CodexMigration { apply: false, .. }
+        ));
+        assert!(Cli::try_parse_from(["worktree-gc", "codex-migration", "--apply"]).is_err());
+        assert!(
+            Cli::try_parse_from(["worktree-gc", "collect", "codex-sessions", "--apply",]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "recover-codex-migration",
+            "--journal",
+            "/entry.json",
+        ])
+        .is_err());
     }
 
     #[test]
