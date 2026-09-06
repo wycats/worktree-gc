@@ -223,6 +223,29 @@ class Fixture(unittest.TestCase):
         with self.assertRaisesRegex(m.Refusal, "identity changed"):
             m.refresh(candidate, self.policy)
 
+    def test_rollout_traversal_outside_archive_refuses_before_native(self):
+        outside = self.home / self.source.name
+        outside.write_bytes(self.source.read_bytes())
+        with database(self.home / "state_5.sqlite") as c:
+            c.execute("update threads set rollout_path=? where id=?",
+                      (str(self.home / "archived_sessions" / ".." / outside.name), self.child["id"]))
+        report = m.batch(self.policy, True, FakeRuntime)
+        self.assertEqual(report["plan"]["refusals"]["rollout outside archive root"], 1)
+        self.assertEqual(report["plan"]["selected"], [])
+        self.assertEqual(report["results"], [])
+        self.assertEqual(FakeRuntime.calls, [])
+        self.assertEqual(list(self.backup.iterdir()), [])
+
+    def test_rollout_archive_symlink_escape_refuses(self):
+        outside = self.home / "outside"
+        outside.mkdir()
+        (outside / self.source.name).write_bytes(self.source.read_bytes())
+        alias = self.home / "archived_sessions" / "alias"
+        alias.symlink_to(outside, target_is_directory=True)
+        changed = dict(self.child, rollout_path=str(alias / self.source.name))
+        with self.assertRaisesRegex(m.Refusal, "path alias or symlink"):
+            m.rollout_path(self.home, changed)
+
     def test_parent_state_drift_refuses(self):
         candidate = self.candidate()
         with database(self.home / "state_5.sqlite") as c:
@@ -356,6 +379,28 @@ class Fixture(unittest.TestCase):
                 m.recover(journal, destination)
             with self.assertRaisesRegex(m.Refusal, "outside live"):
                 m.recover(journal, self.home / "danger")
+
+    def test_partial_recovery_is_removed_and_same_destination_can_retry(self):
+        result = m.batch(self.policy, True, FakeRuntime)
+        journal = Path(result["results"][0]["journal"])
+        j = json.loads(journal.read_bytes())
+        original = Path(j["backup"]).read_bytes()
+        live_after = self.source.read_bytes()
+        destination = self.root / "recovered"
+        failure = m.Refusal("recovery free-space floor")
+        def partial_copy(source, target, guard):
+            target.write_bytes(b"partial original history")
+            raise failure
+        with patch.object(m, "capture", return_value=m.plistlib.dumps({"VolumeUUID": "fixture"})):
+            with patch.object(m, "verified_copy", side_effect=partial_copy):
+                with self.assertRaises(m.Refusal) as caught:
+                    m.recover(journal, destination)
+                self.assertIs(caught.exception, failure)
+            self.assertFalse(destination.exists())
+            restored = m.recover(journal, destination)
+        self.assertEqual(Path(restored["restored"]).read_bytes(), original)
+        self.assertEqual(Path(j["backup"]).read_bytes(), original)
+        self.assertEqual(self.source.read_bytes(), live_after)
 
     def test_recovery_rejects_backup_drift(self):
         result = m.batch(self.policy, True, FakeRuntime)

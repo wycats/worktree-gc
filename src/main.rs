@@ -705,6 +705,14 @@ fn exact_execution_ownership_policy(config_path: Option<&Path>) -> Result<Owners
     }
 }
 
+#[cfg(unix)]
+fn exec_migration_operator(command: &mut std::process::Command) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    // Preserve the public PID so TERM/HUP reach the operator's journal and
+    // subprocess teardown handlers directly.
+    Err(command.exec()).context("run archived-child operator (requires Python 3.11+)")
+}
+
 fn run_codex_migration(args: &[std::ffi::OsString]) -> Result<()> {
     anyhow::ensure!(
         cfg!(target_os = "macos"),
@@ -712,16 +720,18 @@ fn run_codex_migration(args: &[std::ffi::OsString]) -> Result<()> {
     );
     // Embedded in the release artifact: installing worktree-gc also installs the
     // exact reviewed operator. Isolated Python ignores PYTHONPATH/user packages.
-    let status = std::process::Command::new("python3")
+    let mut command = std::process::Command::new("python3");
+    command
         .args(["-I", "-c", include_str!("codex_migration.py")])
-        .args(args)
-        .status()
-        .context("run archived-child operator (requires Python 3.11+)")?;
-    anyhow::ensure!(
-        status.success(),
-        "archived-child operator stopped: {status}"
-    );
-    Ok(())
+        .args(args);
+    #[cfg(unix)]
+    {
+        exec_migration_operator(&mut command)
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("archived-child migration currently supports macOS")
+    }
 }
 
 fn main() -> Result<()> {
@@ -1580,6 +1590,85 @@ helper_socket = "unused-helper.sock"
             "/entry.json",
         ])
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_exec_signal_fixture() {
+        let Some(marker) = std::env::var_os("WORKTREE_GC_SIGNAL_FIXTURE") else {
+            return;
+        };
+        let mut command = std::process::Command::new("python3");
+        command
+            .args([
+                "-I",
+                "-c",
+                r#"
+import os, pathlib, signal, sys, time
+path = pathlib.Path(sys.argv[1])
+def stopped(signum, frame):
+    path.write_text(str(signum))
+    sys.exit(42)
+signal.signal(signal.SIGTERM, stopped)
+signal.signal(signal.SIGHUP, stopped)
+path.write_text('ready:' + str(os.getpid()))
+while True:
+    time.sleep(.01)
+"#,
+            ])
+            .arg(marker);
+        exec_migration_operator(&mut command).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_operator_keeps_public_pid_and_handles_term_and_hup() {
+        use std::time::Duration;
+        for (name, number) in [("TERM", 15), ("HUP", 1)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = tmp.path().join("signal");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::migration_exec_signal_fixture",
+                    "--nocapture",
+                ])
+                .env("WORKTREE_GC_SIGNAL_FIXTURE", &marker)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let ready = format!("ready:{}", child.id());
+            while std::fs::read_to_string(&marker).ok().as_deref() != Some(&ready)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let pid_preserved = std::fs::read_to_string(&marker).ok().as_deref() == Some(&ready);
+            let sent = pid_preserved
+                && std::process::Command::new("kill")
+                    .args([format!("-{name}"), child.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success();
+            let mut status = child.try_wait().unwrap();
+            while status.is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+                status = child.try_wait().unwrap();
+            }
+            if status.is_none() {
+                let _ = child.kill();
+                child.wait().unwrap();
+            }
+            assert!(
+                pid_preserved && sent,
+                "operator did not retain its public PID"
+            );
+            assert_eq!(status.and_then(|s| s.code()), Some(42));
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                number.to_string()
+            );
+        }
     }
 
     #[test]

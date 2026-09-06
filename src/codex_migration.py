@@ -225,7 +225,8 @@ def eligibility(row, parents, children, ids, now, grace, excluded):
 def rollout_path(home, row):
     root = canonical(home / "archived_sessions", directory=True)
     logical = Path(row["rollout_path"])
-    require(logical.is_absolute() and logical.is_relative_to(root), "rollout outside archive root")
+    require(logical.is_absolute() and ".." not in logical.parts and
+            logical.is_relative_to(root), "rollout outside archive root")
     name = logical.name
     require(name.endswith((".jsonl", ".jsonl.zst")) and
             name.removesuffix(".zst").endswith(row["id"] + ".jsonl"), "unexpected rollout name")
@@ -237,7 +238,9 @@ def rollout_path(home, row):
             path.lstat()
         except FileNotFoundError:
             continue
-        found.append(canonical(path))
+        selected = canonical(path)
+        require(selected.is_relative_to(root), "canonical rollout outside archive root")
+        found.append(selected)
     require(len(found) == 1, "missing or ambiguous rollout spelling")
     require(found[0].stat().st_dev == home.stat().st_dev, "nested rollout mount")
     return found[0]
@@ -658,10 +661,30 @@ def recover(journal_path, destination):
     require(digest_file(backup, guard) == j["backup_sha256"], "backup identity mismatch")
     require(free_bytes(target.parent) >= backup.stat().st_size + GIB, "recovery capacity")
     target.mkdir(mode=0o700)  # exclusive: an existing home is always a refusal
+    created = target.stat()
     archive = target / "archived_sessions"
-    archive.mkdir(mode=0o700)
     restored = archive / backup.name
-    require(verified_copy(backup, restored, guard) == j["backup_sha256"], "restoration mismatch")
+    archive_identity = None
+    try:
+        archive.mkdir(mode=0o700)
+        archive_identity = archive.stat()
+        require(verified_copy(backup, restored, guard) == j["backup_sha256"], "restoration mismatch")
+    except BaseException as error:
+        try:
+            current = canonical(target, directory=True).stat()
+            require((current.st_dev, current.st_ino) == (created.st_dev, created.st_ino),
+                    "recovery target changed during failure cleanup")
+            if archive_identity is not None:
+                current = canonical(archive, directory=True).stat()
+                require((current.st_dev, current.st_ino) ==
+                        (archive_identity.st_dev, archive_identity.st_ino),
+                        "recovery archive changed during failure cleanup")
+                restored.unlink(missing_ok=True)
+                archive.rmdir()
+            target.rmdir()
+        except (OSError, Refusal) as cleanup_error:
+            error.add_note(f"partial recovery retained at {target}: {cleanup_error}")
+        raise
     return {"isolated_codex_home": str(target), "restored": str(restored),
             "sha256": j["backup_sha256"], "live_store_unchanged": True}
 
