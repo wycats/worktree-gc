@@ -41,7 +41,7 @@ def rollout(tid, padding=""):
 def row(tid=None, parent=None):
     tid = tid or str(uuid.uuid4())
     return {"id": tid, "source": json.dumps({"subagent": {"thread_spawn": {
-        "parent_thread_id": parent}}}) if parent else '"cli"',
+        "parent_thread_id": parent}}}) if parent else 'cli',
         "history_mode": "legacy", "archived": 1, "archived_at": 100,
         "updated_at": 100, "is_pinned": 0, "rollout_path": "/unused"}
 
@@ -140,6 +140,21 @@ class Fixture(unittest.TestCase):
         self.assertEqual(list(self.backup.iterdir()), [])
         self.assertEqual(FakeRuntime.calls, [])
         self.assertEqual(before, self.source.read_bytes())
+
+    def test_scalar_root_sources_preserve_structured_child_lineage(self):
+        for source in ("cli", "vscode", "exec", "mcp", "unknown", '"cli"'):
+            with self.subTest(source=source):
+                with database(self.home / "state_5.sqlite") as c:
+                    c.execute("update threads set source=? where id=?", (source, self.parent["id"]))
+                candidate = self.candidate()
+                self.assertEqual(candidate["parent_id"], self.parent["id"])
+                self.assertEqual(candidate["row"]["id"], self.child["id"])
+
+    def test_malformed_structured_lineage_still_refuses(self):
+        with database(self.home / "state_5.sqlite") as c:
+            c.execute("update threads set source=? where id=?", ('{"subagent":', self.parent["id"]))
+        with self.assertRaises(json.JSONDecodeError):
+            self.candidate()
 
     def test_batch_native_backup_continuation_and_parent_parity(self):
         before = self.source.read_bytes()
@@ -352,6 +367,58 @@ class Fixture(unittest.TestCase):
             with self.assertRaisesRegex(m.Refusal, "identity mismatch"):
                 m.recover(journal, self.root / "recovered")
         self.assertFalse((self.root / "recovered").exists())
+
+
+class ProtectionGuardTests(unittest.TestCase):
+    def test_first_use_creates_and_locks_missing_state_directory(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp).resolve() / "new-state"
+            with patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+                with m.protection_guard() as paths:
+                    self.assertEqual(paths, [])
+                    with (state / "worktree-gc/protections.lock").open("rb") as other:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertFalse((state / "worktree-gc/protections.json").exists())
+
+    def test_existing_registry_retains_active_protections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp).resolve()
+            root = state / "worktree-gc"
+            root.mkdir()
+            registry = m.encoded({"version": 1, "leases": [
+                {"path": str(state), "expires_at_unix": int(time.time()) + 3600}]})
+            (root / "protections.json").write_bytes(registry)
+            with patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+                with m.protection_guard() as paths:
+                    self.assertEqual(paths, [state])
+            self.assertEqual((root / "protections.json").read_bytes(), registry)
+
+    def test_symlinked_state_is_rejected_before_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            real, alias = root / "real", root / "alias"
+            real.mkdir()
+            alias.symlink_to(real, target_is_directory=True)
+            for state in (alias, root):
+                with self.subTest(state=state):
+                    if state == root:
+                        (root / "worktree-gc").symlink_to(real, target_is_directory=True)
+                    with patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+                        with self.assertRaisesRegex(m.Refusal, "path alias or symlink"):
+                            with m.protection_guard():
+                                self.fail("aliased protection state accepted")
+            self.assertEqual(list(real.iterdir()), [])
+
+    def test_state_creation_error_remains_a_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp).resolve() / "state"
+            with patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+                with patch.object(Path, "mkdir", side_effect=PermissionError("denied")):
+                    with self.assertRaises(PermissionError):
+                        with m.protection_guard():
+                            self.fail("incomplete protection evidence accepted")
 
 
 class ContinuationTests(unittest.TestCase):

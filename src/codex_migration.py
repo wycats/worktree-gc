@@ -184,7 +184,13 @@ def lineage(rows, edges):
         parents.setdefault(child, set()).add(parent)
     for r in rows:
         require(str(uuid.UUID(r["id"])) == r["id"], "invalid task ID in index")
-        source = json.loads(r["source"])
+        source = r["source"]
+        require(isinstance(source, str) and source.strip(), "invalid task source")
+        # Ordinary sources are stored as bare scalars as well as JSON strings.
+        # Structured lineage must still parse successfully; corruption must not
+        # hide an existing child from the leaf-only migration policy.
+        if source.lstrip().startswith(("{", "[", '"')):
+            source = json.loads(source)
         if isinstance(source, dict) and isinstance(source.get("subagent"), dict):
             spawn = source["subagent"].get("thread_spawn")
             if isinstance(spawn, dict):
@@ -490,7 +496,11 @@ def protection_guard():
     """Same shared flock used by the Rust protection registry; no lease edits."""
     import fcntl
     state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
-    root = canonical(state / "worktree-gc", directory=True)
+    root = state / "worktree-gc"
+    require(root.is_absolute() and ".." not in root.parts and
+            root.resolve(strict=False) == root, f"path alias or symlink: {root}")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root = canonical(root, directory=True)
     fd = os.open(root / "protections.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
