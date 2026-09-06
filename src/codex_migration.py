@@ -358,7 +358,17 @@ def continuation(blocks, tid, max_raw):
             if head is None:
                 require(x.get("type") == "session_meta" and x["payload"]["id"] == tid,
                         "rollout task identity mismatch")
-                head = x["payload"]
+                head = dict(x["payload"])
+                # Native legacy-to-paginated migration changes these two
+                # representation fields. Every other metadata field participates
+                # in continuation parity, including unknown future fields.
+                require(head.get("history_mode", "legacy") in ("legacy", "paginated"),
+                        "unsupported session history mode")
+                boundary = head.get("subagent_history_start_ordinal")
+                require(boundary is None or (type(boundary) is int and boundary >= 0),
+                        "invalid subagent history boundary")
+                head.pop("history_mode", None)
+                head.pop("subagent_history_start_ordinal", None)
             kind, value = x.get("type"), x.get("payload")
             if kind == "compacted":
                 require(isinstance(value, dict) and value.get("replacement_history") is not None,
@@ -383,7 +393,8 @@ def continuation(blocks, tid, max_raw):
         require(len(pending) < LINE_LIMIT, "rollout record bound")
     require(not pending, "unterminated rollout record")
     require(checkpoint is not None, "no supported bounded continuation checkpoint")
-    return {"checkpoint": checkpoint, "responses": responses.hexdigest(),
+    return {"session_meta": hashlib.sha256(encoded(head)).hexdigest(),
+            "checkpoint": checkpoint, "responses": responses.hexdigest(),
             "state": state.hexdigest(), "ordered_continuation": ordered.hexdigest(),
             "responses_count": count}, raw
 
@@ -521,7 +532,12 @@ def protection_guard():
         paths = []
         for lease in value["leases"]:
             require(type(lease["expires_at_unix"]) is int, "invalid protection expiry")
-            path = Path(lease["path"])
+            raw_path = lease["path"]
+            require(isinstance(raw_path, str) and
+                    not any(part in (".", "..") for part in raw_path.split("/")) and
+                    not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in raw_path),
+                    "invalid protection path components or control characters")
+            path = Path(raw_path)
             require(path.is_absolute(), "non-absolute protection")
             if lease["expires_at_unix"] > time.time():
                 paths.append(path)
@@ -576,7 +592,8 @@ def migrate_one(candidate, p, rt):
         require(row == candidate["row"] | {"history_mode": "paginated"}, "post-migration index drift")
         require(next((r for r in rows if r["id"] == candidate["parent_id"]), None) ==
                 candidate["parent_row"], "post-migration parent drift")
-        _, children = lineage(rows, edges)
+        parents, children = lineage(rows, edges)
+        require(parents.get(tid) == {candidate["parent_id"]}, "post-migration parent lineage drift")
         require(tid not in children, "post-migration child appeared")
         rt.quiet(source)
         rt.volume()

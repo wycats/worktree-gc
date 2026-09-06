@@ -196,6 +196,53 @@ class Fixture(unittest.TestCase):
         self.assertIn(b"drift", self.source.read_bytes())
         self.assertNotIn(b"drift", Path(j["backup"]).read_bytes())
 
+    def test_removed_edge_only_parent_requires_recovery(self):
+        with database(self.home / "state_5.sqlite") as c:
+            c.execute("update threads set source='cli' where id=?", (self.child["id"],))
+            c.execute("insert into thread_spawn_edges values (?,?)", (self.parent["id"], self.child["id"]))
+        class ChangedRuntime(FakeRuntime):
+            def native(inner, tid, apply):
+                result = super().native(tid, apply)
+                if apply:
+                    with database(inner.p["codex_home"] / "state_5.sqlite") as c:
+                        c.execute("delete from thread_spawn_edges where child_thread_id=?", (tid,))
+                return result
+        with self.assertRaisesRegex(m.Refusal, "parent lineage drift"):
+            m.batch(self.policy, True, ChangedRuntime)
+        j = json.loads(next(self.journals.glob("*.json")).read_bytes())
+        self.assertEqual(j["phase"], "recovery_required")
+        self.assertTrue(Path(j["backup"]).is_file())
+
+    def test_conflicting_parent_edge_requires_recovery(self):
+        class ChangedRuntime(FakeRuntime):
+            def native(inner, tid, apply):
+                result = super().native(tid, apply)
+                if apply:
+                    with database(inner.p["codex_home"] / "state_5.sqlite") as c:
+                        c.execute("insert into thread_spawn_edges values (?,?)", (str(uuid.uuid4()), tid))
+                return result
+        with self.assertRaisesRegex(m.Refusal, "parent lineage drift"):
+            m.batch(self.policy, True, ChangedRuntime)
+        j = json.loads(next(self.journals.glob("*.json")).read_bytes())
+        self.assertEqual(j["phase"], "recovery_required")
+
+    def test_session_metadata_drift_is_durable(self):
+        class ChangedRuntime(FakeRuntime):
+            def native(inner, tid, apply):
+                result = super().native(tid, apply)
+                if apply:
+                    rows, _ = m.index_snapshot(inner.p["codex_home"])
+                    path = Path(next(r["rollout_path"] for r in rows if r["id"] == tid))
+                    records = [json.loads(line) for line in path.read_bytes().splitlines()]
+                    records[0]["payload"]["base_instructions"] = {"text": "unexpected replacement"}
+                    path.write_bytes(b"".join(m.encoded(r) + b"\n" for r in records))
+                return result
+        with self.assertRaisesRegex(m.Refusal, "continuation mismatch"):
+            m.batch(self.policy, True, ChangedRuntime)
+        j = json.loads(next(self.journals.glob("*.json")).read_bytes())
+        self.assertEqual(j["phase"], "recovery_required")
+        self.assertNotEqual(j["before_context"]["session_meta"], j["after_context"]["session_meta"])
+
     def test_quiet_store_refusal_precedes_backup(self):
         with patch.object(FakeRuntime, "quiet", side_effect=m.Refusal("store active")):
             with self.assertRaisesRegex(m.Refusal, "store active"):
@@ -415,6 +462,23 @@ class Fixture(unittest.TestCase):
 
 
 class ProtectionGuardTests(unittest.TestCase):
+    def test_malformed_protection_paths_fail_closed_before_normalization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp).resolve()
+            root = state / "worktree-gc"
+            root.mkdir()
+            for path in ("/home/user/.", "/home/user/../archive", "/home/user/./archive",
+                         "/home/user/\narchive", "/home/user/\x7farchive", 3):
+                with self.subTest(path=path):
+                    registry = m.encoded({"version": 1, "leases": [
+                        {"path": path, "expires_at_unix": int(time.time()) + 3600}]})
+                    (root / "protections.json").write_bytes(registry)
+                    with patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+                        with self.assertRaisesRegex(m.Refusal, "invalid protection path"):
+                            with m.protection_guard():
+                                self.fail("malformed protection accepted")
+                    self.assertEqual((root / "protections.json").read_bytes(), registry)
+
     def test_first_use_creates_and_locks_missing_state_directory(self):
         import fcntl
         with tempfile.TemporaryDirectory() as tmp:
@@ -467,6 +531,22 @@ class ProtectionGuardTests(unittest.TestCase):
 
 
 class ContinuationTests(unittest.TestCase):
+    def test_session_metadata_normalizes_only_native_representation_fields(self):
+        tid = str(uuid.uuid4())
+        records = [json.loads(line) for line in rollout(tid).splitlines()]
+        def proof():
+            return m.continuation([b"".join(m.encoded(r) + b"\n" for r in records)], tid, m.GIB)[0]
+        before = proof()
+        records[0]["payload"].update(history_mode="paginated", subagent_history_start_ordinal=5)
+        self.assertEqual(before, proof())
+        for field, value in (("cwd", "/changed"), ("model_provider", "different"),
+                             ("base_instructions", {"text": "changed"}),
+                             ("git", {"commit_hash": "different"}), ("future_field", None)):
+            with self.subTest(field=field):
+                records[0]["payload"][field] = value
+                self.assertNotEqual(before["session_meta"], proof()["session_meta"])
+                del records[0]["payload"][field]
+
     def test_state_and_response_interleaving_is_preserved(self):
         tid = str(uuid.uuid4())
         data = rollout(tid)
