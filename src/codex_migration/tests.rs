@@ -704,19 +704,20 @@ fn index_cap_is_explicit() {
 fn malformed_protection_paths_fail_closed_before_normalization() {
     let f = Fixture::new();
     for path in [
-        json!("/home/user/."),
-        json!("/home/user/../archive"),
-        json!("/home/user/./archive"),
-        json!("/home/user/\narchive"),
-        json!("/home/user/\u{7f}archive"),
+        json!(format!("{}/.", f.policy.codex_home.display())),
+        json!(format!("{}/../archive", f.policy.codex_home.display())),
+        json!(format!("{}/./archive", f.policy.codex_home.display())),
+        json!(format!("{}/\narchive", f.policy.codex_home.display())),
+        json!(format!("{}/\u{7f}archive", f.policy.codex_home.display())),
         json!(3),
     ] {
         f.protect(path);
         let before = fs::read(&f.registry).unwrap();
         let guard = MigrationProtectionGuard::acquire(&f.registry).unwrap();
-        assert!(guard
+        let error = guard
             .check(&f.policy.surfaces(), SystemTime::now())
-            .is_err());
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("protection"));
         assert_eq!(fs::read(&f.registry).unwrap(), before);
     }
 }

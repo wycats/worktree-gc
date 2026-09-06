@@ -499,6 +499,10 @@ fn validate_stored_path(path: &Path) -> Result<()> {
     if path
         .components()
         .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || path
+            .to_string_lossy()
+            .split(std::path::is_separator)
+            .any(|component| matches!(component, "." | ".."))
     {
         bail!("protection path must not contain '.' or '..' components");
     }
