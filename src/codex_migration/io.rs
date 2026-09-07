@@ -346,10 +346,18 @@ impl OwnedProcess {
         value: &serde_json::Value,
         guard: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
-        let stream = self.child.stdin.as_mut().context("native stdin absent")?;
         let mut bytes = serde_json::to_vec(value)?;
         ensure!(bytes.len() < 65536, "native request bound");
         bytes.push(b'\n');
+        self.write_input(&bytes, guard)
+    }
+    pub fn write_input(
+        &mut self,
+        bytes: &[u8],
+        guard: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        ensure!(bytes.len() <= 65536, "native request bound");
+        let stream = self.child.stdin.as_mut().context("native stdin absent")?;
         let mut offset = 0;
         while offset < bytes.len() {
             guard()?;
@@ -363,6 +371,9 @@ impl OwnedProcess {
             }
         }
         Ok(())
+    }
+    pub fn close_input(&mut self) {
+        self.child.stdin.take();
     }
     pub fn poll(
         &mut self,
@@ -554,7 +565,20 @@ pub fn intersects(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-pub fn lock_file(path: &Path, shared: bool) -> Result<File> {
+pub struct FileLock {
+    file: File,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // A concurrent fork can inherit this open file description until exec.
+        // Explicit unlock ends our scope's authority even while that inherited
+        // descriptor remains open; closing our descriptor alone cannot do so.
+        let _ = fs4::FileExt::unlock(&self.file);
+    }
+}
+
+pub fn lock_file(path: &Path, shared: bool) -> Result<FileLock> {
     canonical_prefixes(path)?;
     let file = OpenOptions::new()
         .read(true)
@@ -571,7 +595,7 @@ pub fn lock_file(path: &Path, shared: bool) -> Result<File> {
     } else {
         fs4::FileExt::try_lock(&file)?;
     }
-    Ok(file)
+    Ok(FileLock { file })
 }
 
 pub fn command_env(command: &mut Command, home: &Path, user: &Path, temp: &Path) {
@@ -601,6 +625,25 @@ pub fn absent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+    #[test]
+    fn lock_scope_releases_while_an_inherited_description_remains_open() {
+        for shared in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().canonicalize().unwrap().join("lock");
+            let guard = lock_file(&path, shared).unwrap();
+            // dup and fork retain the same flock open-file description. Keep
+            // that description alive deterministically instead of racing exec.
+            let inherited = guard.file.try_clone().unwrap();
+            assert!(lock_file(&path, false).is_err());
+            drop(guard);
+            let successor = lock_file(&path, false).unwrap();
+            drop(inherited);
+            assert!(lock_file(&path, false).is_err());
+            drop(successor);
+            assert!(lock_file(&path, false).is_ok());
+        }
+    }
+
     #[test]
     fn child_created_diagnostics_are_private() {
         let temp = tempfile::tempdir().unwrap();

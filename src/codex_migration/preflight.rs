@@ -22,6 +22,7 @@ pub fn preflight(config: &Path) -> Result<Value> {
                 "paths_and_bounds",
                 "capacity",
                 "native_binary",
+                "zstd_binary",
                 "sandbox",
                 "external_volume",
                 "protections",
@@ -70,6 +71,7 @@ pub fn preflight(config: &Path) -> Result<Value> {
             .verify_binary()
             .map(|()| json!({"sha256":policy.codex_sha256,"version":NATIVE_VERSION})),
     );
+    record(&mut checks, "zstd_binary", runtime.verify_zstd());
     record(
         &mut checks,
         "sandbox",

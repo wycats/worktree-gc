@@ -390,7 +390,7 @@ fn read_active_protections_inner(
 /// lock prevents lease edits; each native boundary rechecks canonical paths.
 #[cfg(unix)]
 pub(crate) struct MigrationProtectionGuard {
-    _lock: std::fs::File,
+    _lock: crate::codex_migration::io::FileLock,
     registry: PathBuf,
 }
 

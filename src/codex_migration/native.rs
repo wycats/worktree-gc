@@ -77,6 +77,30 @@ impl<'a> NativeRuntime<'a> {
         .context("checking sandbox execution capability")?;
         Ok(())
     }
+    pub(super) fn verify_zstd(&self) -> Result<Value> {
+        let before = identity(&self.policy.zstd_binary)?;
+        let profile = format!(
+            "(version 1)(allow default)(deny network*)(deny file-write*)(deny file-read* (subpath {}))",
+            serde_json::to_string(&self.policy.codex_home)?
+        );
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command
+            .args(["-p", &profile])
+            .arg(&self.policy.zstd_binary)
+            .args(["-dc"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir("/");
+        zstd_decompression_probe(&mut command, &mut || self.guard())
+            .context("verifying configured zstd decompression")?;
+        ensure!(
+            before == identity(&self.policy.zstd_binary)?,
+            "zstd executable identity changed during preflight"
+        );
+        Ok(
+            json!({"path":self.policy.zstd_binary,"identity":before,"synthetic_decompression_verified":true}),
+        )
+    }
     fn capture(&self, command: &mut Command) -> Result<Vec<u8>> {
         io::success(command, &mut |_| self.guard())
     }
@@ -106,11 +130,53 @@ impl<'a> NativeRuntime<'a> {
     }
 }
 
+fn zstd_decompression_probe(
+    command: &mut Command,
+    guard: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    // One standard Zstandard frame with a single last, uncompressed block.
+    // Input is synthetic and stays in pipes; preflight never reads rollouts.
+    const EXPECTED: &[u8] = b"worktree-gc-preflight\n";
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, EXPECTED.len() as u8];
+    frame.extend_from_slice(&((EXPECTED.len() as u32) << 3 | 1).to_le_bytes()[..3]);
+    frame.extend_from_slice(EXPECTED);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut check = || {
+        guard()?;
+        ensure!(Instant::now() < deadline, "zstd preflight deadline");
+        Ok(())
+    };
+    check()?;
+    let mut process = OwnedProcess::spawn(command, true)?;
+    let operation = (|| {
+        process.write_input(&frame, &mut check)?;
+        process.close_input();
+        let mut output = Vec::new();
+        loop {
+            check()?;
+            if let Some(status) = process.poll(&mut |block| {
+                ensure!(
+                    output.len() + block.len() <= EXPECTED.len(),
+                    "zstd probe output cap"
+                );
+                output.extend_from_slice(block);
+                Ok(())
+            })? {
+                ensure!(status.success(), "zstd probe exited {status}");
+                ensure!(output == EXPECTED, "zstd probe decoded unexpected bytes");
+                break Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    process.finish(operation)
+}
+
 fn rehearsal_owner_command(root: &Path) -> Command {
     let mut command = Command::new("/usr/sbin/lsof");
     // -t suppresses warnings. Field output plus +w preserves warnings so
     // traversal/access errors remain refusals alongside partial matches.
-    command.args(["-nP", "+w", "-F", "p", "+D"]).arg(root);
+    command.args(["-nP", "+w", "-F", "pf", "+D"]).arg(root);
     command
 }
 
@@ -1043,6 +1109,55 @@ pub(super) fn recover(journal_path: &Path, destination: &Path) -> Result<Value> 
 #[cfg(test)]
 mod topology_tests {
     use super::*;
+    #[test]
+    fn zstd_preflight_probe_checks_output_and_execution_failures() {
+        zstd_decompression_probe(
+            Command::new("/bin/sh")
+                .args(["-c", "cat >/dev/null; printf 'worktree-gc-preflight\\n'"]),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        for script in [
+            "cat >/dev/null; exit 7",
+            "cat >/dev/null; printf wrong",
+            "cat >/dev/null; printf 'worktree-gc-preflight plus unexpected bytes'",
+        ] {
+            assert!(zstd_decompression_probe(
+                Command::new("/bin/sh").args(["-c", script]),
+                &mut || Ok(()),
+            )
+            .is_err());
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let non_executable = temp.path().join("zstd");
+        fs::write(&non_executable, "fixture").unwrap();
+        for path in [non_executable, temp.path().join("missing")] {
+            assert!(zstd_decompression_probe(&mut Command::new(path), &mut || Ok(())).is_err());
+        }
+    }
+
+    #[test]
+    fn zstd_preflight_probe_preserves_cancellation_and_teardown() {
+        let calls = std::cell::Cell::new(0);
+        let error = zstd_decompression_probe(
+            Command::new("/bin/sh").args(["-c", "cat >/dev/null; sleep 30"]),
+            &mut || {
+                calls.set(calls.get() + 1);
+                ensure!(calls.get() < 3, "fixture cancellation");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("fixture cancellation"));
+    }
+
+    #[test]
+    fn rehearsal_lsof_explicitly_requests_pid_and_descriptor_fields() {
+        let command = rehearsal_owner_command(Path::new("/synthetic"));
+        let args: Vec<_> = command.get_args().collect();
+        assert!(args.windows(2).any(|pair| pair == ["-F", "pf"]));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn rehearsal_lsof_command_preserves_matches_and_real_warnings() {
@@ -1108,7 +1223,7 @@ mod topology_tests {
         assert!(!text.contains("STDOUT_SECRET"));
         let command = rehearsal_owner_command(Path::new("/synthetic"));
         let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
-        assert_eq!(args, ["-nP", "+w", "-F", "p", "+D", "/synthetic"]);
+        assert_eq!(args, ["-nP", "+w", "-F", "pf", "+D", "/synthetic"]);
     }
     #[cfg(target_os = "macos")]
     #[test]
