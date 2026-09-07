@@ -404,8 +404,24 @@ mod tests {
             assert!(Path::new(&environment[name]).starts_with(store.join("tmp")));
         }
         assert!(scope.command(Path::new("/configured/zstd"), &root).is_err());
+        let probe =
+            zstd_probe_command(Path::new("/configured/zstd"), &store, Some(&scope)).unwrap();
+        let args: Vec<_> = probe.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        let probe_profile = args[1];
+        for denied in [&store, &scope.live] {
+            assert!(probe_profile.contains(&format!(
+                "(deny file-read* (subpath {}))",
+                serde_json::to_string(denied).unwrap()
+            )));
+        }
+        assert!(probe_profile.contains("(deny file-write*)"));
+        assert!(probe_profile.contains("(deny network*)"));
+        assert!(!probe_profile.contains("allow file-write"));
+        assert_eq!(probe.get_program(), "/usr/bin/sandbox-exec");
+        assert_eq!(probe.get_current_dir(), Some(Path::new("/")));
         fs::rename(&store, root.join("old")).unwrap();
         fs::create_dir(&store).unwrap();
         assert!(scope.check().is_err());
+        assert!(zstd_probe_command(Path::new("/configured/zstd"), &store, Some(&scope)).is_err());
     }
 }

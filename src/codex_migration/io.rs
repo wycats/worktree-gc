@@ -228,6 +228,49 @@ pub fn free(path: &Path) -> Result<u64> {
         .context("free-space overflow")
 }
 
+pub fn writable_directory(path: &Path) -> Result<()> {
+    canonical(path, true)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let before = directory.metadata()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: owned directory descriptor and writable output, initialized on success.
+    ensure!(
+        unsafe { libc::fstatvfs(directory.as_raw_fd(), stat.as_mut_ptr()) } == 0,
+        "destination filesystem inspection failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let stat = unsafe { stat.assume_init() };
+    ensure!(
+        stat.f_flag & libc::ST_RDONLY == 0,
+        "destination filesystem is read-only"
+    );
+    // Effective credentials and ACLs must permit both creation and directory
+    // search. Checking the open directory avoids probing a replaced path.
+    ensure!(
+        unsafe {
+            libc::faccessat(
+                directory.as_raw_fd(),
+                c".".as_ptr(),
+                libc::W_OK | libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        } == 0,
+        "destination is not writable/searchable: {}",
+        std::io::Error::last_os_error()
+    );
+    canonical(path, true)?;
+    let after = fs::metadata(path)?;
+    ensure!(
+        (before.dev(), before.ino(), before.mode(), before.uid())
+            == (after.dev(), after.ino(), after.mode(), after.uid()),
+        "destination identity or permissions changed during observation"
+    );
+    Ok(())
+}
+
 pub struct Cancellation {
     pub flag: Arc<AtomicBool>,
     ids: Vec<signal_hook::SigId>,

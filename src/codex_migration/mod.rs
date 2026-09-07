@@ -664,6 +664,7 @@ trait Runtime {
     fn volume(&self) -> Result<()>;
     fn quiet(&self, path: Option<&Path>) -> Result<()>;
     fn verify_binary(&self) -> Result<()>;
+    fn verify_decompressor(&self) -> Result<()>;
     fn context(&self, path: &Path, tid: &str) -> Result<(Continuation, u64)>;
     fn native(&self, tid: &str, apply: bool) -> Result<Value>;
     fn free(&self, path: &Path) -> Result<u64> {
@@ -827,6 +828,8 @@ fn batch(policy: &Policy, apply: bool, runtime: &dyn Runtime, registry: &Path) -
     let mut results = Vec::new();
     if apply {
         ensure!(policy.enabled, "migration policy is disabled");
+        io::writable_directory(&policy.journal_root).context("checking journal destination")?;
+        io::writable_directory(&policy.backup_root).context("checking backup destination")?;
         let protections = MigrationProtectionGuard::acquire(registry)?;
         protections.check(&policy.surfaces(), SystemTime::now())?;
         let _lock = io::lock_file(&policy.journal_root.join("runner.lock"), false)?;
@@ -840,6 +843,15 @@ fn batch(policy: &Policy, apply: bool, runtime: &dyn Runtime, registry: &Path) -
         runtime
             .verify_binary()
             .context("verifying native Codex binary before batch")?;
+        if plan
+            .selected
+            .iter()
+            .any(|candidate| candidate.path.extension().is_some_and(|ext| ext == "zst"))
+        {
+            runtime
+                .verify_decompressor()
+                .context("verifying configured zstd before batch")?;
+        }
         for candidate in &plan.selected {
             runtime.guard()?;
             results.push(migrate_one(candidate, policy, runtime, &protections)?);

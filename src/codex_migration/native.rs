@@ -95,18 +95,11 @@ impl<'a> NativeRuntime<'a> {
     }
     pub(super) fn verify_zstd(&self) -> Result<Value> {
         let before = identity(&self.policy.zstd_binary)?;
-        let profile = format!(
-            "(version 1)(allow default)(deny network*)(deny file-write*)(deny file-read* (subpath {}))",
-            serde_json::to_string(&self.policy.codex_home)?
-        );
-        let mut command = Command::new("/usr/bin/sandbox-exec");
-        command
-            .args(["-p", &profile])
-            .arg(&self.policy.zstd_binary)
-            .args(["-dc"])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .current_dir("/");
+        let mut command = zstd_probe_command(
+            &self.policy.zstd_binary,
+            &self.policy.codex_home,
+            self.isolation,
+        )?;
         zstd_decompression_probe(&mut command, &mut || self.guard())
             .context("verifying configured zstd decompression")?;
         ensure!(
@@ -144,6 +137,33 @@ impl<'a> NativeRuntime<'a> {
         let bytes = self.capture(Command::new("/bin/ps").args(["-axo", "pid=,comm="]))?;
         validate_processes(std::str::from_utf8(&bytes)?, allowed)
     }
+}
+
+fn zstd_probe_command(
+    binary: &Path,
+    home: &Path,
+    isolation: Option<&RehearsalScope>,
+) -> Result<Command> {
+    let mut profile = format!(
+        "(version 1)(allow default)(deny network*)(deny file-write*)(deny file-read* (subpath {}))",
+        serde_json::to_string(home)?
+    );
+    if let Some(scope) = isolation {
+        scope.check()?;
+        profile.push_str(&format!(
+            "(deny file-read* (subpath {}))",
+            serde_json::to_string(&scope.live)?
+        ));
+    }
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
+        .args(["-p", &profile])
+        .arg(binary)
+        .args(["-dc"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/");
+    Ok(command)
 }
 
 fn zstd_decompression_probe(
@@ -561,6 +581,9 @@ fn volume(
 }
 
 impl Runtime for NativeRuntime<'_> {
+    fn verify_decompressor(&self) -> Result<()> {
+        self.verify_zstd().map(|_| ())
+    }
     fn guard(&self) -> Result<()> {
         self.cancel.check()?;
         ensure!(Instant::now() < self.deadline, "batch time limit");

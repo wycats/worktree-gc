@@ -37,6 +37,8 @@ pub fn preflight(config: &Path) -> Result<Value> {
             record(&mut checks, "policy", Err(error));
             for name in [
                 "paths_and_bounds",
+                "journal_destination",
+                "backup_destination",
                 "capacity",
                 "native_binary",
                 "zstd_binary",
@@ -58,6 +60,12 @@ pub fn preflight(config: &Path) -> Result<Value> {
         Ok(json!({"sha256":policy.policy_sha256,"enabled":policy.enabled})),
     );
     record(&mut checks, "paths_and_bounds", policy.validate().map(|()| json!({"codex_home":policy.codex_home,"backup_root":policy.backup_root,"journal_root":policy.journal_root})));
+    for (name, path) in [
+        ("journal_destination", &policy.journal_root),
+        ("backup_destination", &policy.backup_root),
+    ] {
+        record(&mut checks, name, io::writable_directory(path).map(|()| json!({"path":path,"writable_searchable":true,"filesystem_read_only":false,"advisory_only":true})));
+    }
     let cancel = io::Cancellation::install()?;
     // Bound even a malformed policy; preflight probes do not share apply's
     // capacity guard, so low capacity cannot mask independent diagnostics.
