@@ -945,6 +945,29 @@ fn native_process_probe_allows_only_exact_owned_pid() {
 }
 
 #[test]
+fn preflight_protection_observation_never_creates_state() {
+    let f = Fixture::new();
+    let registry = f.root.join("absent-state/protections.json");
+    MigrationProtectionGuard::observe(&registry, &f.policy.surfaces(), SystemTime::now()).unwrap();
+    assert!(!registry.parent().unwrap().exists());
+    f.protect(json!(f.policy.codex_home));
+    let before = fs::read(&f.registry).unwrap();
+    assert!(MigrationProtectionGuard::observe(
+        &f.registry,
+        &f.policy.surfaces(),
+        SystemTime::now()
+    )
+    .is_err());
+    assert_eq!(fs::read(&f.registry).unwrap(), before);
+    assert!(!f
+        .registry
+        .parent()
+        .unwrap()
+        .join("protections.lock")
+        .exists());
+}
+
+#[test]
 fn child_output_limit_and_timeout_teardown() {
     let started = Instant::now();
     let mut output = std::process::Command::new("/usr/bin/yes");

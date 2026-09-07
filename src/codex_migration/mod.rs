@@ -1,6 +1,9 @@
 //! Opt-in bounded native migration. Codex is the sole live rollout/index writer.
 pub(crate) mod io;
 mod native;
+mod preflight;
+pub use native::rehearse;
+pub use preflight::preflight;
 #[cfg(test)]
 mod tests;
 
@@ -97,6 +100,11 @@ fn sha(value: &str) -> bool {
 
 impl Policy {
     pub fn load(path: &Path) -> Result<Self> {
+        let value = Self::parse(path)?;
+        value.validate()?;
+        Ok(value)
+    }
+    fn parse(path: &Path) -> Result<Self> {
         let metadata = fs::symlink_metadata(path)?;
         ensure!(
             metadata.uid() == unsafe { libc::getuid() } && metadata.mode() & 0o077 == 0,
@@ -104,7 +112,6 @@ impl Policy {
         );
         let bytes = io::read_bound(path, 65536)?;
         let mut value: Self = toml::from_str(std::str::from_utf8(&bytes)?)?;
-        value.validate()?;
         value.policy_sha256 = format!("{:x}", Sha256::digest(&bytes));
         Ok(value)
     }
@@ -713,7 +720,9 @@ fn migrate_one(
     runtime.volume()?;
     runtime.quiet(Some(&candidate.path))?;
     refresh(candidate, policy, false)?;
-    let (before, raw) = runtime.context(&candidate.path, &candidate.row.id)?;
+    let (before, raw) = runtime
+        .context(&candidate.path, &candidate.row.id)
+        .context("verifying original continuation before backup")?;
     ensure!(
         runtime.free(&policy.codex_home)?
             >= policy
@@ -743,7 +752,9 @@ fn migrate_one(
         write_journal(&journal_path, &journal)?;
         protections.check(&surfaces, SystemTime::now())?;
         index_files(&policy.codex_home)?;
-        runtime.native(&candidate.row.id, false)?;
+        runtime
+            .native(&candidate.row.id, false)
+            .context("planning native migration")?;
         runtime.volume()?;
         runtime.quiet(Some(&candidate.path))?;
         refresh(candidate, policy, false)?;
@@ -759,8 +770,12 @@ fn migrate_one(
         journal["free_before"] = json!(runtime.free(&policy.codex_home)?);
         write_journal(&journal_path, &journal)?;
         applying = true;
-        journal["native_report"] = runtime.native(&candidate.row.id, true)?;
-        let (after, _) = runtime.context(&candidate.path, &candidate.row.id)?;
+        journal["native_report"] = runtime
+            .native(&candidate.row.id, true)
+            .context("applying native migration")?;
+        let (after, _) = runtime
+            .context(&candidate.path, &candidate.row.id)
+            .context("verifying migrated continuation")?;
         ensure!(after == before, "continuation mismatch; recovery required");
         journal["after_context"] = json!(after);
         journal["after_sha256"] = json!(io::hash(&candidate.path, &mut || runtime.guard())?);
@@ -815,9 +830,15 @@ fn batch(policy: &Policy, apply: bool, runtime: &dyn Runtime, registry: &Path) -
         protections.check(&policy.surfaces(), SystemTime::now())?;
         let _lock = io::lock_file(&policy.journal_root.join("runner.lock"), false)?;
         pending_journals(&policy.journal_root)?;
-        runtime.quiet(None)?;
-        runtime.volume()?;
-        runtime.verify_binary()?;
+        runtime
+            .quiet(None)
+            .context("checking quiet Codex store before batch")?;
+        runtime
+            .volume()
+            .context("verifying external backup topology before batch")?;
+        runtime
+            .verify_binary()
+            .context("verifying native Codex binary before batch")?;
         for candidate in &plan.selected {
             runtime.guard()?;
             results.push(migrate_one(candidate, policy, runtime, &protections)?);

@@ -51,6 +51,15 @@ enum Command {
             help = "Apply the separately enabled migration policy; default is read-only"
         )]
         apply: bool,
+        #[arg(long, conflicts_with = "apply")]
+        preflight: bool,
+    },
+    /// Qualify native migration using fresh confined synthetic stores (macOS)
+    RehearseCodexMigration {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, value_name = "ABSENT_DIRECTORY")]
+        workspace: PathBuf,
     },
     /// Recover and natively register a verified original in a new isolated home (macOS)
     RecoverCodexMigration {
@@ -712,20 +721,50 @@ fn main() -> Result<()> {
     let roots = cli.root;
 
     match cli.command {
-        Command::CodexMigration { config, apply } => {
+        Command::CodexMigration {
+            config,
+            apply,
+            preflight,
+        } => {
             anyhow::ensure!(
                 repo.is_none() && roots.is_empty(),
                 "migration takes its own config; omit --repo/--root"
             );
             #[cfg(unix)]
+            {
+                let report = if preflight {
+                    worktree_gc::codex_migration::preflight(&config)?
+                } else {
+                    worktree_gc::codex_migration::run(&config, apply)?
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                anyhow::ensure!(
+                    !preflight || report["ready"] == true,
+                    "migration preflight checks failed; see JSON report"
+                );
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (config, apply, preflight);
+                anyhow::bail!("archived-child migration currently supports macOS");
+            }
+        }
+        Command::RehearseCodexMigration { config, workspace } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "rehearsal takes its own config; omit --repo/--root"
+            );
+            #[cfg(unix)]
             println!(
                 "{}",
-                serde_json::to_string_pretty(&worktree_gc::codex_migration::run(&config, apply)?)?
+                serde_json::to_string_pretty(&worktree_gc::codex_migration::rehearse(
+                    &config, &workspace
+                )?)?
             );
             #[cfg(not(unix))]
             {
-                let _ = (config, apply);
-                anyhow::bail!("archived-child migration currently supports macOS");
+                let _ = (config, workspace);
+                anyhow::bail!("migration rehearsal requires macOS");
             }
         }
         Command::RecoverCodexMigration {
@@ -1546,6 +1585,38 @@ helper_socket = "unused-helper.sock"
 
     #[test]
     fn archived_migration_is_explicit_and_separate_from_collection() {
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "codex-migration",
+            "--config",
+            "/policy",
+            "--preflight",
+            "--apply"
+        ])
+        .is_err());
+        assert!(matches!(
+            Cli::try_parse_from([
+                "worktree-gc",
+                "codex-migration",
+                "--config",
+                "/policy",
+                "--preflight"
+            ])
+            .unwrap()
+            .command,
+            Command::CodexMigration {
+                preflight: true,
+                apply: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "rehearse-codex-migration",
+            "--config",
+            "/policy"
+        ])
+        .is_err());
         let cli = Cli::try_parse_from([
             "worktree-gc",
             "codex-migration",

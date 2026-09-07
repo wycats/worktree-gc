@@ -1,11 +1,49 @@
 use super::*;
 use io::{Cancellation, OwnedProcess};
 use std::process::Command;
+mod rehearsal;
+pub use rehearsal::rehearse;
+
+struct RehearsalScope {
+    root: PathBuf,
+    external: PathBuf,
+    live: PathBuf,
+    registry: PathBuf,
+    root_id: (u64, u64),
+    external_id: (u64, u64),
+}
+impl RehearsalScope {
+    fn check(&self) -> Result<()> {
+        for (path, expected) in [
+            (&self.root, self.root_id),
+            (&self.external, self.external_id),
+        ] {
+            canonical(path, true)?;
+            let metadata = fs::metadata(path)?;
+            ensure!(
+                (metadata.dev(), metadata.ino()) == expected,
+                "rehearsal directory identity changed"
+            );
+        }
+        MigrationProtectionGuard::observe(
+            &self.registry,
+            &[self.root.clone(), self.external.clone()],
+            SystemTime::now(),
+        )?;
+        Ok(())
+    }
+    fn profile(&self) -> Result<String> {
+        self.check()?;
+        Ok(format!("(version 1)(allow default)(deny network*)(deny file-write* (require-not (require-any (subpath {}) (subpath {}))))(allow file-write* (literal \"/dev/null\"))(deny file-read* (subpath {}))", serde_json::to_string(&self.root)?, serde_json::to_string(&self.external)?, serde_json::to_string(&self.live)?))
+    }
+}
 
 pub(super) struct NativeRuntime<'a> {
     policy: &'a Policy,
     cancel: &'a Cancellation,
     deadline: Instant,
+    advisory: bool,
+    isolation: Option<&'a RehearsalScope>,
 }
 impl<'a> NativeRuntime<'a> {
     pub(super) fn new(policy: &'a Policy, cancel: &'a Cancellation) -> Self {
@@ -13,19 +51,139 @@ impl<'a> NativeRuntime<'a> {
             policy,
             cancel,
             deadline: Instant::now() + Duration::from_secs(policy.max_seconds),
+            advisory: false,
+            isolation: None,
         }
+    }
+    pub(super) fn for_preflight(policy: &'a Policy, cancel: &'a Cancellation) -> Self {
+        Self {
+            policy,
+            cancel,
+            deadline: Instant::now() + Duration::from_secs(120),
+            advisory: true,
+            isolation: None,
+        }
+    }
+    pub(super) fn active_codex_pids(&self) -> Result<Vec<u32>> {
+        let bytes = self.capture(Command::new("/bin/ps").args(["-axo", "pid=,comm="]))?;
+        active_codex_pids(std::str::from_utf8(&bytes)?)
+    }
+    pub(super) fn sandbox_probe(&self) -> Result<()> {
+        self.capture(Command::new("/usr/bin/sandbox-exec").args([
+            "-p",
+            "(version 1)(allow default)(deny network*)(deny file-write*)",
+            "/usr/bin/true",
+        ]))
+        .context("checking sandbox execution capability")?;
+        Ok(())
     }
     fn capture(&self, command: &mut Command) -> Result<Vec<u8>> {
         io::success(command, &mut |_| self.guard())
     }
     fn quiet_pids(&self, allowed: &[u32]) -> Result<()> {
+        if let Some(scope) = self.isolation {
+            scope.check()?;
+            for root in [&scope.root, &scope.external] {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let (status, bytes, stderr) =
+                    io::capture_with_stderr(&mut rehearsal_owner_command(root), &mut |_| {
+                        self.guard()?;
+                        ensure!(Instant::now() < deadline, "rehearsal ownership deadline");
+                        Ok(())
+                    })?;
+                validate_rehearsal_owners(
+                    status.code(),
+                    &bytes,
+                    &stderr,
+                    std::process::id(),
+                    allowed,
+                )?;
+            }
+            return Ok(());
+        }
         let bytes = self.capture(Command::new("/bin/ps").args(["-axo", "pid=,comm="]))?;
         validate_processes(std::str::from_utf8(&bytes)?, allowed)
     }
 }
 
+fn rehearsal_owner_command(root: &Path) -> Command {
+    let mut command = Command::new("/usr/sbin/lsof");
+    // -t suppresses warnings. Field output plus +w preserves warnings so
+    // traversal/access errors remain refusals alongside partial matches.
+    command.args(["-nP", "+w", "-F", "p", "+D"]).arg(root);
+    command
+}
+
+fn validate_rehearsal_owners(
+    status: Option<i32>,
+    bytes: &[u8],
+    stderr: &[u8],
+    current: u32,
+    allowed: &[u32],
+) -> Result<()> {
+    // macOS lsof +D expands all files into search arguments. Its documented
+    // status 1 includes closed/unmatched files, even when other matches exist.
+    // This interpretation is limited to freshly created rehearsal stores.
+    ensure!(
+        matches!(status, Some(0 | 1)) && stderr.is_empty(),
+        "rehearsal ownership subprocess lsof exit {status:?}; stderr: {}",
+        io::stderr_diagnostic(stderr)
+    );
+    let text = std::str::from_utf8(bytes).context("invalid rehearsal ownership PID encoding")?;
+    ensure!(
+        text.is_empty() || text.ends_with('\n'),
+        "unterminated rehearsal ownership record"
+    );
+    ensure!(
+        status != Some(0) || !text.is_empty(),
+        "empty successful rehearsal ownership evidence"
+    );
+    let mut awaiting_file = false;
+    let mut saw_pid = false;
+    for (index, line) in text.lines().enumerate() {
+        ensure!(index < 65536, "rehearsal ownership record bound");
+        if let Some(value) = line.strip_prefix('p') {
+            ensure!(!awaiting_file, "incomplete rehearsal process record");
+            ensure!(
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+                "invalid rehearsal ownership PID"
+            );
+            let pid: u32 = value.parse().context("invalid rehearsal ownership PID")?;
+            ensure!(pid > 0, "invalid zero rehearsal ownership PID");
+            ensure!(
+                pid == current || allowed.contains(&pid),
+                "foreign process {pid} owns rehearsal data"
+            );
+            saw_pid = true;
+            awaiting_file = true;
+        } else if let Some(value) = line.strip_prefix('f') {
+            ensure!(
+                saw_pid
+                    && ((!value.is_empty()
+                        && value.bytes().all(|byte| byte.is_ascii_digit())
+                        && value.parse::<u32>().is_ok())
+                        || ["cwd", "rtd", "txt", "mem"].contains(&value)),
+                "invalid rehearsal file record"
+            );
+            awaiting_file = false;
+        } else {
+            bail!("unknown rehearsal ownership record");
+        }
+    }
+    ensure!(!awaiting_file, "incomplete rehearsal process record");
+    Ok(())
+}
+
 pub(super) fn validate_processes(text: &str, allowed: &[u32]) -> Result<()> {
+    for pid in active_codex_pids(text)? {
+        ensure!(allowed.contains(&pid), "Codex store is active (PID {pid})");
+    }
+    Ok(())
+}
+
+fn active_codex_pids(text: &str) -> Result<Vec<u32>> {
     ensure!(!text.trim().is_empty(), "empty process evidence");
+    let mut pids = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         let split = line
@@ -37,13 +195,11 @@ pub(super) fn validate_processes(text: &str, allowed: &[u32]) -> Result<()> {
             .and_then(|s| s.to_str())
             .context("process executable")?
             .to_lowercase();
-        ensure!(
-            allowed.contains(&pid)
-                || !["codex", "chatgpt", "codex-app-server"].contains(&name.as_str()),
-            "Codex store is active (PID {pid})"
-        );
+        if ["codex", "chatgpt", "codex-app-server"].contains(&name.as_str()) {
+            pids.push(pid);
+        }
     }
-    Ok(())
+    Ok(pids)
 }
 
 fn plist_capture(
@@ -65,12 +221,70 @@ fn boolean(info: &plist::Value, key: &str) -> Option<bool> {
         .and_then(plist::Value::as_boolean)
 }
 fn disk_info(path: &Path, guard: &mut dyn FnMut() -> Result<()>) -> Result<plist::Value> {
+    guard()?;
+    let argument = if path.is_absolute() {
+        filesystem_mount(path)?
+    } else {
+        device(path.to_str().context("disk identifier encoding")?)?;
+        path.to_owned()
+    };
     plist_capture(
         Command::new("/usr/sbin/diskutil")
             .args(["info", "-plist"])
-            .arg(path),
+            .arg(argument),
         guard,
     )
+    .context("reading disk metadata")
+}
+
+/// diskutil accepts a device or mount point, not an arbitrary directory/file.
+/// Resolve through an open descriptor so nested backup files and APFS firmlinks
+/// use the kernel's filesystem identity, rather than lexical ancestor guesses.
+#[cfg(target_os = "macos")]
+fn filesystem_mount(path: &Path) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    io::canonical_prefixes(path)?;
+    let before = fs::symlink_metadata(path)?;
+    ensure!(
+        before.is_file() || before.is_dir(),
+        "unsupported filesystem probe path"
+    );
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let opened = file.metadata()?;
+    ensure!(
+        (before.dev(), before.ino()) == (opened.dev(), opened.ino()),
+        "filesystem probe identity changed"
+    );
+    let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fd is live and the output points to a correctly sized statfs.
+    let result = unsafe { libc::fstatfs(file.as_raw_fd(), info.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("resolving filesystem mount");
+    }
+    // SAFETY: successful fstatfs initialized the structure.
+    let info = unsafe { info.assume_init() };
+    let bytes: Vec<u8> = info.f_mntonname.iter().map(|c| *c as u8).collect();
+    let end = bytes
+        .iter()
+        .position(|b| *b == 0)
+        .context("unterminated mount point")?;
+    let mount = PathBuf::from(std::str::from_utf8(&bytes[..end])?);
+    canonical(&mount, true)?;
+    let after = fs::symlink_metadata(path)?;
+    ensure!(
+        (after.dev(), after.ino()) == (opened.dev(), opened.ino())
+            && fs::metadata(&mount)?.dev() == opened.dev(),
+        "filesystem mount identity changed"
+    );
+    Ok(mount)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn filesystem_mount(_path: &Path) -> Result<PathBuf> {
+    bail!("filesystem topology inspection requires macOS")
 }
 fn device(value: &str) -> Result<()> {
     ensure!(
@@ -268,6 +482,12 @@ impl Runtime for NativeRuntime<'_> {
     fn guard(&self) -> Result<()> {
         self.cancel.check()?;
         ensure!(Instant::now() < self.deadline, "batch time limit");
+        if let Some(scope) = self.isolation {
+            scope.check()?;
+        }
+        if self.advisory {
+            return Ok(());
+        }
         ensure!(
             io::free(&self.policy.codex_home)? >= self.policy.min_free_bytes,
             "Data free-space floor"
@@ -310,9 +530,9 @@ impl Runtime for NativeRuntime<'_> {
                 }
                 std::thread::sleep(Duration::from_millis(20));
             })();
-            let teardown = process.stop();
-            result?;
-            teardown?;
+            process
+                .finish(result)
+                .context("checking exact rollout ownership")?;
         }
         Ok(())
     }
@@ -325,14 +545,20 @@ impl Runtime for NativeRuntime<'_> {
             Command::new("/usr/bin/codesign")
                 .args(["--verify", "--strict"])
                 .arg(&self.policy.codex_binary),
-        )?;
+        )
+        .context("verifying native code signature")?;
         let mut command = Command::new(&self.policy.codex_binary);
         command
             .arg("--version")
             .env_clear()
             .env("PATH", "/usr/bin:/bin");
         ensure!(
-            String::from_utf8(self.capture(&mut command)?)?.trim() == NATIVE_VERSION,
+            String::from_utf8(
+                self.capture(&mut command)
+                    .context("reading native Codex version")?
+            )?
+            .trim()
+                == NATIVE_VERSION,
             "native version requires new compatibility proof"
         );
         Ok(())
@@ -341,14 +567,14 @@ impl Runtime for NativeRuntime<'_> {
         let before = identity(path)?;
         let mut parser = ContextParser::new(tid, self.policy.max_raw_bytes_per_task);
         if path.extension().is_some_and(|s| s == "zst") {
-            let status = io::stream(
+            io::stream_success(
                 Command::new(&self.policy.zstd_binary)
                     .args(["-dc", "--"])
                     .arg(path),
                 &mut |_| self.guard(),
                 &mut |block| parser.feed(block),
-            )?;
-            ensure!(status.success(), "decompression failed");
+            )
+            .context("decompressing continuation input")?;
         } else {
             let mut file = OpenOptions::new()
                 .read(true)
@@ -375,8 +601,12 @@ impl Runtime for NativeRuntime<'_> {
         self.quiet(None)?;
         index_files(&self.policy.codex_home)?;
         let mut command = Command::new("/usr/bin/sandbox-exec");
+        let profile = match self.isolation {
+            Some(scope) => scope.profile()?,
+            None => "(version 1)(allow default)(deny network*)".to_owned(),
+        };
         command
-            .args(["-p", "(version 1)(allow default)(deny network*)"])
+            .args(["-p", &profile])
             .arg(&self.policy.codex_binary)
             .args([
                 "migrate-rollouts",
@@ -406,6 +636,14 @@ impl Runtime for NativeRuntime<'_> {
             .env("CODEX_HOME", &self.policy.codex_home)
             .env("LANG", "en_US.UTF-8")
             .env("RUST_LOG", "error");
+        if let Some(scope) = self.isolation {
+            io::command_env(
+                &mut command,
+                &self.policy.codex_home,
+                &scope.root.join("user"),
+                &scope.root.join("tmp"),
+            );
+        }
         let mut last_probe = Instant::now() - Duration::from_secs(1);
         let bytes = io::success(&mut command, &mut |pid| {
             self.guard()?;
@@ -596,10 +834,9 @@ fn register_history(
             json!({"restored":restored,"history_turns":turns.len(),"history_sha256":digest,"native_registered":true}),
         )
     })();
-    let teardown = process.stop();
-    let result = operation?;
-    teardown?;
-    Ok(result)
+    process
+        .finish(operation)
+        .context("registering and verifying recovered native history")
 }
 
 pub(super) trait RecoveryRuntime {
@@ -806,6 +1043,95 @@ pub(super) fn recover(journal_path: &Path, destination: &Path) -> Result<Value> 
 #[cfg(test)]
 mod topology_tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rehearsal_lsof_command_preserves_matches_and_real_warnings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let _file = fs::File::create(root.join("held")).unwrap();
+        fs::File::create(root.join("closed")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut guard = |_| {
+            ensure!(Instant::now() < deadline, "test ownership deadline");
+            Ok(())
+        };
+        let (status, bytes, stderr) =
+            io::capture_with_stderr(&mut rehearsal_owner_command(&root), &mut guard).unwrap();
+        validate_rehearsal_owners(status.code(), &bytes, &stderr, std::process::id(), &[]).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(validate_rehearsal_owners(status.code(), &bytes, &stderr, u32::MAX, &[]).is_err());
+        let (status, bytes, stderr) = io::capture_with_stderr(
+            &mut rehearsal_owner_command(&root.join("missing")),
+            &mut guard,
+        )
+        .unwrap();
+        assert!(
+            !stderr.is_empty(),
+            "warning control must expose real traversal failures"
+        );
+        assert!(
+            validate_rehearsal_owners(status.code(), &bytes, &stderr, std::process::id(), &[])
+                .is_err()
+        );
+    }
+    #[test]
+    fn rehearsal_partial_search_matches_preserve_foreign_owner_refusals() {
+        for status in [0, 1] {
+            validate_rehearsal_owners(Some(status), b"p10\nf9\np20\nfcwd\n", b"", 10, &[20])
+                .unwrap();
+            assert!(validate_rehearsal_owners(Some(status), b"p30\nf9\n", b"", 10, &[20]).is_err());
+        }
+        validate_rehearsal_owners(Some(1), b"", b"", 10, &[]).unwrap();
+        for (status, output, stderr) in [
+            (Some(0), b"".as_slice(), b"".as_slice()),
+            (Some(1), b"10\n".as_slice(), b"warning\x1b\n".as_slice()),
+            (Some(2), b"10\n".as_slice(), b"".as_slice()),
+            (None, b"10\n".as_slice(), b"".as_slice()),
+            (Some(1), b"bad\n".as_slice(), b"".as_slice()),
+            (Some(1), b"\xff".as_slice(), b"".as_slice()),
+            (Some(1), b"0\n".as_slice(), b"".as_slice()),
+            (Some(1), b"p10\n".as_slice(), b"".as_slice()),
+            (Some(1), b"f9\n".as_slice(), b"".as_slice()),
+            (Some(1), b"p10\nfNOFD\n".as_slice(), b"".as_slice()),
+            (Some(1), b"p10\nf9".as_slice(), b"".as_slice()),
+            (Some(1), b"p+10\nf9\n".as_slice(), b"".as_slice()),
+            (Some(1), b"p10\nf+9\n".as_slice(), b"".as_slice()),
+            (Some(1), b"p-10\nf9\n".as_slice(), b"".as_slice()),
+            (Some(1), b"p10\nf-9\n".as_slice(), b"".as_slice()),
+        ] {
+            assert!(validate_rehearsal_owners(status, output, stderr, 10, &[]).is_err());
+        }
+        let error = validate_rehearsal_owners(Some(1), b"STDOUT_SECRET", b"warning\x1b\n", 10, &[])
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("lsof exit Some(1)") && text.contains("warning\\u{1b}\\n"));
+        assert!(!text.contains("STDOUT_SECRET"));
+        let command = rehearsal_owner_command(Path::new("/synthetic"));
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args, ["-nP", "+w", "-F", "p", "+D", "/synthetic"]);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nested_files_and_directories_resolve_to_the_kernel_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let file = nested.join("backup.jsonl");
+        fs::write(&file, b"synthetic").unwrap();
+        let mount = filesystem_mount(&nested).unwrap();
+        assert_ne!(mount, nested);
+        assert_eq!(filesystem_mount(&file).unwrap(), mount);
+        assert_eq!(
+            fs::metadata(&mount).unwrap().dev(),
+            fs::metadata(&file).unwrap().dev()
+        );
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&nested, &alias).unwrap();
+        assert!(filesystem_mount(&alias).is_err());
+        assert!(filesystem_mount(&alias.join("backup.jsonl")).is_err());
+        assert!(filesystem_mount(&root.join("missing")).is_err());
+    }
     fn value(xml: &str) -> plist::Value {
         plist::Value::from_reader_xml(xml.as_bytes()).unwrap()
     }
