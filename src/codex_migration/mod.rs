@@ -99,6 +99,11 @@ fn sha(value: &str) -> bool {
 }
 
 impl Policy {
+    fn native_headroom(&self, raw_bytes: u64) -> Result<u64> {
+        self.min_free_bytes
+            .checked_add(raw_bytes.checked_mul(2).context("raw headroom overflow")?)
+            .context("raw headroom overflow")
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let value = Self::parse(path)?;
         value.validate()?;
@@ -724,11 +729,7 @@ fn migrate_one(
         .context(&candidate.path, &candidate.row.id)
         .context("verifying original continuation before backup")?;
     ensure!(
-        runtime.free(&policy.codex_home)?
-            >= policy
-                .min_free_bytes
-                .checked_add(raw.checked_mul(2).context("raw headroom overflow")?)
-                .context("raw headroom overflow")?,
+        runtime.free(&policy.codex_home)? >= policy.native_headroom(raw)?,
         "insufficient native decompression/rewrite headroom"
     );
     ensure!(

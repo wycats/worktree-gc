@@ -36,6 +36,22 @@ impl RehearsalScope {
         self.check()?;
         Ok(format!("(version 1)(allow default)(deny network*)(deny file-write* (require-not (require-any (subpath {}) (subpath {}))))(allow file-write* (literal \"/dev/null\"))(deny file-read* (subpath {}))", serde_json::to_string(&self.root)?, serde_json::to_string(&self.external)?, serde_json::to_string(&self.live)?))
     }
+    fn command(&self, program: &Path, home: &Path) -> Result<Command> {
+        ensure!(
+            home.starts_with(&self.root),
+            "rehearsal command home escape"
+        );
+        canonical(home, true)?;
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command.args(["-p", &self.profile()?]).arg(program);
+        io::command_env(
+            &mut command,
+            home,
+            &self.root.join("user"),
+            &self.root.join("tmp"),
+        );
+        Ok(command)
+    }
 }
 
 pub(super) struct NativeRuntime<'a> {
@@ -633,10 +649,12 @@ impl Runtime for NativeRuntime<'_> {
         let before = identity(path)?;
         let mut parser = ContextParser::new(tid, self.policy.max_raw_bytes_per_task);
         if path.extension().is_some_and(|s| s == "zst") {
+            let mut command = match self.isolation {
+                Some(scope) => scope.command(&self.policy.zstd_binary, &self.policy.codex_home)?,
+                None => Command::new(&self.policy.zstd_binary),
+            };
             io::stream_success(
-                Command::new(&self.policy.zstd_binary)
-                    .args(["-dc", "--"])
-                    .arg(path),
+                command.args(["-dc", "--"]).arg(path),
                 &mut |_| self.guard(),
                 &mut |block| parser.feed(block),
             )

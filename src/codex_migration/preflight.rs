@@ -8,6 +8,23 @@ fn record(checks: &mut Vec<Value>, name: &str, result: Result<Value>) {
     });
 }
 
+pub(super) fn capacity_evidence(policy: &Policy, internal: u64, external: u64) -> Result<Value> {
+    // Preflight deliberately does not read/decompress rollouts. Reserve apply's
+    // largest permitted per-task scratch requirement; tasks run sequentially.
+    let required = policy.native_headroom(policy.max_raw_bytes_per_task)?;
+    ensure!(
+        internal >= required,
+        "Data below conservative migration scratch requirement: available {internal}, required {required}"
+    );
+    ensure!(
+        external >= policy.max_source_bytes.saturating_add(GIB),
+        "backup below batch capacity: {external}"
+    );
+    Ok(
+        json!({"internal_available_bytes":internal,"external_available_bytes":external,"required_internal_available_bytes":required,"scratch_reserve_bytes":required-policy.min_free_bytes,"scratch_basis":"configured maximum raw bytes per task; apply rechecks measured raw bytes"}),
+    )
+}
+
 pub fn preflight(config: &Path) -> Result<Value> {
     ensure!(
         cfg!(target_os = "macos"),
@@ -51,17 +68,7 @@ pub fn preflight(config: &Path) -> Result<Value> {
         (|| {
             let internal = io::free(&policy.codex_home)?;
             let external = io::free(&policy.backup_root)?;
-            ensure!(
-                internal >= policy.min_free_bytes,
-                "Data below configured capacity floor: {internal}"
-            );
-            ensure!(
-                external >= policy.max_source_bytes.saturating_add(GIB),
-                "backup below batch capacity: {external}"
-            );
-            Ok(
-                json!({"internal_available_bytes":internal,"external_available_bytes":external,"native_scratch":"rechecked after continuation measurement during apply"}),
-            )
+            capacity_evidence(&policy, internal, external)
         })(),
     );
     record(

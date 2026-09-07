@@ -968,6 +968,27 @@ fn preflight_protection_observation_never_creates_state() {
 }
 
 #[test]
+fn preflight_capacity_reserves_apply_scratch_without_reading_rollouts() {
+    let f = Fixture::new();
+    let required = f
+        .policy
+        .native_headroom(f.policy.max_raw_bytes_per_task)
+        .unwrap();
+    let external = f.policy.max_source_bytes + GIB;
+    // Removing the synthetic rollout makes any accidental content read fail.
+    fs::remove_file(&f.source).unwrap();
+    assert!(preflight::capacity_evidence(&f.policy, required - 1, external).is_err());
+    let evidence = preflight::capacity_evidence(&f.policy, required, external).unwrap();
+    assert_eq!(evidence["required_internal_available_bytes"], required);
+    assert_eq!(
+        evidence["scratch_reserve_bytes"],
+        2 * f.policy.max_raw_bytes_per_task
+    );
+    assert!(preflight::capacity_evidence(&f.policy, required, external - 1).is_err());
+    assert!(f.policy.native_headroom(u64::MAX).is_err());
+}
+
+#[test]
 fn child_output_limit_and_timeout_teardown() {
     let started = Instant::now();
     let mut output = std::process::Command::new("/usr/bin/yes");

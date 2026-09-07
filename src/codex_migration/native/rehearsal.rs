@@ -181,13 +181,15 @@ pub fn rehearse(config: &Path, workspace: &Path) -> Result<Value> {
             let child_path = if compressed {
                 let path = child_plain.with_extension("jsonl.zst");
                 io::success(
-                    Command::new(&policy.zstd_binary)
+                    scope
+                        .command(&policy.zstd_binary, &home)?
                         .args(["-q", "--rm"])
                         .arg(&child_plain)
                         .arg("-o")
                         .arg(&path),
                     &mut |_| guard(),
-                )?;
+                )
+                .context("compressing confined synthetic fixture")?;
                 path
             } else {
                 child_plain
@@ -381,6 +383,27 @@ mod tests {
                 && profile.contains("deny file-read*")
                 && profile.contains("deny file-write*")
         );
+        let command = scope
+            .command(Path::new("/configured/zstd"), &store)
+            .unwrap();
+        assert_eq!(command.get_program(), "/usr/bin/sandbox-exec");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(args, ["-p", &profile, "/configured/zstd"]);
+        assert_eq!(command.get_current_dir(), Some(store.join("tmp").as_path()));
+        let environment: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_str().unwrap(), value.unwrap().to_owned()))
+            .collect();
+        assert_eq!(environment["CODEX_HOME"], store.as_os_str());
+        assert_eq!(environment["HOME"], store.join("user").as_os_str());
+        assert_eq!(environment["TMPDIR"], store.join("tmp").as_os_str());
+        for name in ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] {
+            assert!(Path::new(&environment[name]).starts_with(store.join("tmp")));
+        }
+        assert!(scope.command(Path::new("/configured/zstd"), &root).is_err());
         fs::rename(&store, root.join("old")).unwrap();
         fs::create_dir(&store).unwrap();
         assert!(scope.check().is_err());
