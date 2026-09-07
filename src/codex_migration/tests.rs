@@ -153,6 +153,7 @@ impl Fixture {
             calls: RefCell::new(Vec::new()),
             free: 100 * GIB,
             raw_override: None,
+            decompressor_checks: std::cell::Cell::new(0),
         }
     }
     fn journal(&self) -> Value {
@@ -179,6 +180,7 @@ enum Effect {
     MetadataDrift,
     QuietFailure,
     VolumeFailure,
+    DecompressorFailure,
     BackupDrift,
     BackupReplacement,
     Interrupted,
@@ -191,6 +193,7 @@ struct FakeRuntime<'a> {
     calls: RefCell<Vec<(String, bool)>>,
     free: u64,
     raw_override: Option<u64>,
+    decompressor_checks: std::cell::Cell<usize>,
 }
 impl Runtime for FakeRuntime<'_> {
     fn guard(&self) -> Result<()> {
@@ -205,6 +208,15 @@ impl Runtime for FakeRuntime<'_> {
         Ok(())
     }
     fn verify_binary(&self) -> Result<()> {
+        Ok(())
+    }
+    fn verify_decompressor(&self) -> Result<()> {
+        self.decompressor_checks
+            .set(self.decompressor_checks.get() + 1);
+        ensure!(
+            self.effect != Effect::DecompressorFailure,
+            "decompressor drift"
+        );
         Ok(())
     }
     fn context(&self, path: &Path, tid: &str) -> Result<(Continuation, u64)> {
@@ -351,6 +363,67 @@ fn batch_native_backup_continuation_and_parent_parity() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn apply_rechecks_configured_decompressor_before_compressed_candidates() {
+    let f = Fixture::new();
+    let compressed = f.source.with_extension("jsonl.zst");
+    fs::rename(&f.source, &compressed).unwrap();
+    f.db()
+        .execute(
+            "UPDATE threads SET rollout_path=? WHERE id=?",
+            [compressed.to_str().unwrap(), CHILD],
+        )
+        .unwrap();
+    let mut rt = f.runtime();
+    rt.effect = Effect::DecompressorFailure;
+    f.run(false, &rt).unwrap();
+    assert_eq!(rt.decompressor_checks.get(), 0);
+    let before = fs::read(&compressed).unwrap();
+    let error = f.run(true, &rt).unwrap_err();
+    assert!(format!("{error:#}").contains("verifying configured zstd before batch"));
+    assert_eq!(rt.decompressor_checks.get(), 1);
+    assert!(rt.calls.borrow().is_empty());
+    assert_eq!(fs::read(&compressed).unwrap(), before);
+    assert_eq!(fs::read_dir(&f.policy.backup_root).unwrap().count(), 0);
+    assert!(fs::read_dir(&f.policy.journal_root)
+        .unwrap()
+        .all(|entry| entry.unwrap().file_name() == "runner.lock"));
+
+    let plain = Fixture::new();
+    let mut rt = plain.runtime();
+    rt.effect = Effect::DecompressorFailure;
+    plain.run(true, &rt).unwrap();
+    assert_eq!(rt.decompressor_checks.get(), 0);
+}
+
+#[test]
+fn destination_observation_is_readonly_and_unwritable_paths_block_apply() {
+    let f = Fixture::new();
+    for path in [&f.policy.journal_root, &f.policy.backup_root] {
+        io::writable_directory(path).unwrap();
+        assert_eq!(fs::read_dir(path).unwrap().count(), 0);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+        // Root may override ordinary mode bits. Test the actual effective-user
+        // denial where the OS enforces it; mount read-only is tested separately.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(io::writable_directory(path).is_err());
+            assert!(f.run(true, &f.runtime()).is_err());
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(fs::read_dir(path).unwrap().count(), 0);
+    }
+    let alias = f.root.join("destination-alias");
+    symlink(&f.policy.backup_root, &alias).unwrap();
+    assert!(io::writable_directory(&alias).is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn readonly_system_volume_is_not_a_writable_destination() {
+    let error = io::writable_directory(Path::new("/System")).unwrap_err();
+    assert!(format!("{error:#}").contains("filesystem is read-only"));
 }
 
 #[test]
@@ -942,6 +1015,50 @@ fn native_process_probe_allows_only_exact_owned_pid() {
     .is_err());
     assert!(native::validate_processes("", &[]).is_err());
     assert!(native::validate_processes("incomplete", &[]).is_err());
+}
+
+#[test]
+fn preflight_protection_observation_never_creates_state() {
+    let f = Fixture::new();
+    let registry = f.root.join("absent-state/protections.json");
+    MigrationProtectionGuard::observe(&registry, &f.policy.surfaces(), SystemTime::now()).unwrap();
+    assert!(!registry.parent().unwrap().exists());
+    f.protect(json!(f.policy.codex_home));
+    let before = fs::read(&f.registry).unwrap();
+    assert!(MigrationProtectionGuard::observe(
+        &f.registry,
+        &f.policy.surfaces(),
+        SystemTime::now()
+    )
+    .is_err());
+    assert_eq!(fs::read(&f.registry).unwrap(), before);
+    assert!(!f
+        .registry
+        .parent()
+        .unwrap()
+        .join("protections.lock")
+        .exists());
+}
+
+#[test]
+fn preflight_capacity_reserves_apply_scratch_without_reading_rollouts() {
+    let f = Fixture::new();
+    let required = f
+        .policy
+        .native_headroom(f.policy.max_raw_bytes_per_task)
+        .unwrap();
+    let external = f.policy.max_source_bytes + GIB;
+    // Removing the synthetic rollout makes any accidental content read fail.
+    fs::remove_file(&f.source).unwrap();
+    assert!(preflight::capacity_evidence(&f.policy, required - 1, external).is_err());
+    let evidence = preflight::capacity_evidence(&f.policy, required, external).unwrap();
+    assert_eq!(evidence["required_internal_available_bytes"], required);
+    assert_eq!(
+        evidence["scratch_reserve_bytes"],
+        2 * f.policy.max_raw_bytes_per_task
+    );
+    assert!(preflight::capacity_evidence(&f.policy, required, external - 1).is_err());
+    assert!(f.policy.native_headroom(u64::MAX).is_err());
 }
 
 #[test]

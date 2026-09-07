@@ -390,7 +390,7 @@ fn read_active_protections_inner(
 /// lock prevents lease edits; each native boundary rechecks canonical paths.
 #[cfg(unix)]
 pub(crate) struct MigrationProtectionGuard {
-    _lock: std::fs::File,
+    _lock: crate::codex_migration::io::FileLock,
     registry: PathBuf,
 }
 
@@ -410,16 +410,21 @@ impl MigrationProtectionGuard {
     }
 
     pub(crate) fn check(&self, paths: &[PathBuf], now: SystemTime) -> Result<()> {
+        Self::observe(&self.registry, paths, now)
+    }
+
+    /// Advisory only: reads without creating a lock or rewriting expired leases.
+    pub(crate) fn observe(registry: &Path, paths: &[PathBuf], now: SystemTime) -> Result<()> {
         use crate::codex_migration::io;
-        io::canonical_prefixes(&self.registry)?;
-        match std::fs::symlink_metadata(&self.registry) {
+        io::canonical_prefixes(registry)?;
+        match std::fs::symlink_metadata(registry) {
             Ok(_) => {
-                ensure_registry_bound(&self.registry)?;
+                ensure_registry_bound(registry)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let leases = read_active_protections_inner(&self.registry, now, false)?;
+        let leases = read_active_protections_inner(registry, now, false)?;
         for path in paths {
             io::canonical_prefixes(path)?;
             if let Some(lease) = protection_for_path(path, &leases) {

@@ -410,6 +410,24 @@ does not read rollout contents, create a backup/journal, or invoke migration.
 The second requires `enabled = true` and a quiet Codex store. Both are independent
 of the existing `scheduled` command; this change installs no scheduler.
 
+Use `codex-migration --config /absolute/policy.toml --preflight` for independent,
+timestamped JSON checks while Codex stays open. `awaiting_shutdown` is expected;
+any other failed check gives an unsuccessful exit. Preflight reads metadata,
+creates no lock/journal, and confers no execution authority. Apply rechecks all
+guards. Subprocess errors identify the executable and stage with an escaped,
+bounded stderr excerpt. Stderr can contain sensitive data; use `umask 077` when
+capturing reports.
+
+`rehearse-codex-migration --config /absolute/policy.toml --workspace /absolute/absent-workspace`
+explicitly creates plain and compressed synthetic stores (inputs at most 1 MiB
+each) and a unique external backup subdirectory. Shared production migration
+and recovery functions run with confined native writes, denied live-store reads
+and networking, and isolated configuration. Only these fresh synthetic stores
+receive the private concurrent-Codex capability; live apply's quiet guard is
+unchanged. The rehearsal is bounded to ten minutes, preserves evidence on
+failure, and tears down owned processes. Run it in a coordinated runtime slot.
+It does not install or schedule anything, or authorize live migration.
+
 The operator and its fixtures are implemented in Rust. The release artifact
 includes SQLite; it uses the configured `zstd` executable and macOS `diskutil`, `lsof`, `codesign`, and
 `sandbox-exec`. Native compatibility is currently proven for **Codex 0.153.4**;
