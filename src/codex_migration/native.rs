@@ -4,6 +4,93 @@ use std::process::Command;
 mod rehearsal;
 pub use rehearsal::rehearse;
 
+/// Qualify the production continuation reader on a verified external original.
+/// No index access, native Codex invocation, backup/journal creation or live apply.
+pub(super) fn benchmark(config: &Path, journal_path: &Path) -> Result<Value> {
+    ensure!(cfg!(target_os = "macos"), "benchmark requires macOS");
+    let policy = Policy::load(config)?;
+    let journal_bytes = io::read_bound(journal_path, OUTPUT_LIMIT)?;
+    let journal: Value = serde_json::from_slice(&journal_bytes)?;
+    let (backup, expected, tid) = benchmark_input(&policy, &journal)?;
+    let cancellation = Cancellation::install()?;
+    let mut runtime = NativeRuntime::for_preflight(&policy, &cancellation);
+    runtime.deadline = Instant::now() + Duration::from_secs(600);
+    runtime.enable_progress(true);
+    runtime.task(1, 1, &tid);
+    runtime.volume()?;
+    runtime.verify_zstd()?;
+    runtime.stage("verifying external backup hash");
+    let digest = io::hash(&backup, &mut || runtime.guard())?;
+    ensure!(
+        journal["backup_sha256"].as_str() == Some(&digest),
+        "backup hash mismatch"
+    );
+    ensure!(identity(&backup)? == expected, "backup identity drift");
+    // Deny writes/network and live-home reads for the decompressor. The host
+    // parser reads only the exact backup, never a live rollout or task index.
+    runtime.stage("benchmarking original continuation");
+    let started = Instant::now();
+    let mut parser = ContextParser::new(&tid, policy.max_raw_bytes_per_task);
+    let mut command = zstd_probe_command(&policy.zstd_binary, &policy.codex_home, None)?;
+    command.args(["--"]).arg(&backup);
+    io::stream_success(&mut command, &mut |_| runtime.guard(), &mut |block| {
+        parser.feed(block)?;
+        runtime.progress.bytes(block.len() as u64);
+        Ok(())
+    })?;
+    let (context, raw) = parser.finish()?;
+    let seconds = started.elapsed().as_secs_f64();
+    ensure!(
+        serde_json::to_value(&context)? == journal["before_context"],
+        "backup continuation mismatch"
+    );
+    ensure!(
+        identity(&backup)? == expected,
+        "backup changed during benchmark"
+    );
+    runtime.volume()?;
+    runtime.stage("benchmark verified");
+    Ok(
+        json!({"version":1,"mode":"benchmark","observed_at":now(),"thread_id":tid,"backup_identity":expected,"backup_sha256":digest,"raw_bytes":raw,"reader_seconds":seconds,"reader_mib_per_second":raw as f64 / 1048576.0 / seconds.max(0.001),"continuation_verified":true,"live_store_accessed":false}),
+    )
+}
+
+pub(super) fn benchmark_input(
+    policy: &Policy,
+    journal: &Value,
+) -> Result<(PathBuf, Identity, String)> {
+    ensure!(
+        journal["version"] == 1 && journal["phase"] == "verified",
+        "benchmark requires verified journal"
+    );
+    ensure!(
+        journal["backup_volume_uuid"].as_str() == Some(&policy.backup_volume_uuid),
+        "benchmark volume mismatch"
+    );
+    let backup = PathBuf::from(journal["backup"].as_str().context("backup path")?);
+    canonical(&backup, false)?;
+    ensure!(
+        backup.starts_with(&policy.backup_root) && !io::intersects(&backup, &policy.codex_home),
+        "benchmark input must be an external original"
+    );
+    let expected: Identity = serde_json::from_value(journal["backup_identity"].clone())?;
+    ensure!(identity(&backup)? == expected, "backup identity mismatch");
+    ensure!(
+        expected.bytes <= policy.max_source_bytes,
+        "benchmark source bound"
+    );
+    let tid = journal["candidate"]["row"]["id"]
+        .as_str()
+        .context("thread ID")?
+        .to_owned();
+    ensure!(uuid(&tid), "invalid benchmark thread ID");
+    ensure!(
+        backup.extension().is_some_and(|e| e == "zst"),
+        "benchmark requires compressed original"
+    );
+    Ok((backup, expected, tid))
+}
+
 struct RehearsalScope {
     root: PathBuf,
     external: PathBuf,
@@ -60,6 +147,7 @@ pub(super) struct NativeRuntime<'a> {
     deadline: Instant,
     advisory: bool,
     isolation: Option<&'a RehearsalScope>,
+    progress: progress::Progress,
 }
 impl<'a> NativeRuntime<'a> {
     pub(super) fn new(policy: &'a Policy, cancel: &'a Cancellation) -> Self {
@@ -69,6 +157,7 @@ impl<'a> NativeRuntime<'a> {
             deadline: Instant::now() + Duration::from_secs(policy.max_seconds),
             advisory: false,
             isolation: None,
+            progress: progress::Progress::new(false),
         }
     }
     pub(super) fn for_preflight(policy: &'a Policy, cancel: &'a Cancellation) -> Self {
@@ -78,7 +167,11 @@ impl<'a> NativeRuntime<'a> {
             deadline: Instant::now() + Duration::from_secs(120),
             advisory: true,
             isolation: None,
+            progress: progress::Progress::new(false),
         }
+    }
+    pub(super) fn enable_progress(&mut self, enabled: bool) {
+        self.progress = progress::Progress::new(enabled);
     }
     pub(super) fn active_codex_pids(&self) -> Result<Vec<u32>> {
         let bytes = self.capture(Command::new("/bin/ps").args(["-axo", "pid=,comm="]))?;
@@ -581,11 +674,18 @@ fn volume(
 }
 
 impl Runtime for NativeRuntime<'_> {
+    fn task(&self, index: usize, total: usize, id: &str) {
+        self.progress.task(index, total, id);
+    }
+    fn stage(&self, stage: &'static str) {
+        self.progress.stage(stage);
+    }
     fn verify_decompressor(&self) -> Result<()> {
         self.verify_zstd().map(|_| ())
     }
     fn guard(&self) -> Result<()> {
         self.cancel.check()?;
+        self.progress.tick();
         ensure!(Instant::now() < self.deadline, "batch time limit");
         if let Some(scope) = self.isolation {
             scope.check()?;
@@ -679,7 +779,11 @@ impl Runtime for NativeRuntime<'_> {
             io::stream_success(
                 command.args(["-dc", "--"]).arg(path),
                 &mut |_| self.guard(),
-                &mut |block| parser.feed(block),
+                &mut |block| {
+                    parser.feed(block)?;
+                    self.progress.bytes(block.len() as u64);
+                    Ok(())
+                },
             )
             .context("decompressing continuation input")?;
         } else {
@@ -695,6 +799,7 @@ impl Runtime for NativeRuntime<'_> {
                     break;
                 }
                 parser.feed(&block[..count])?;
+                self.progress.bytes(count as u64);
             }
         }
         ensure!(
@@ -947,6 +1052,7 @@ fn register_history(
 }
 
 pub(super) trait RecoveryRuntime {
+    fn stage(&self, _stage: &'static str) {}
     fn guard(&self) -> Result<()>;
     fn volume(&self, source: &Path, backup: &Path, uuid: &str) -> Result<()>;
     fn verify_binary(&self, binary: &Path, sha: &str) -> Result<()>;
@@ -959,10 +1065,15 @@ struct NativeRecovery<'a> {
     cancel: &'a Cancellation,
     deadline: Instant,
     parent: &'a Path,
+    progress: progress::Progress,
 }
 impl RecoveryRuntime for NativeRecovery<'_> {
+    fn stage(&self, stage: &'static str) {
+        self.progress.stage(stage);
+    }
     fn guard(&self) -> Result<()> {
         self.cancel.check()?;
+        self.progress.tick();
         ensure!(Instant::now() < self.deadline, "recovery deadline");
         ensure!(io::free(self.parent)? >= GIB, "recovery free-space floor");
         Ok(())
@@ -1039,6 +1150,7 @@ pub(super) fn recover_with(
         "recovery must be outside originals/live"
     );
     let mut guard = || runtime.guard();
+    runtime.stage("checking recovery prerequisites");
     let stage = parent.join(format!(".worktree-gc-recovery-{}", io::unique_id()?));
     let protections = MigrationProtectionGuard::acquire(registry)?;
     protections.check(&[destination.to_owned(), stage.clone()], SystemTime::now())?;
@@ -1062,6 +1174,7 @@ pub(super) fn recover_with(
         let archive = stage.join("archived_sessions");
         io::exclusive_dir(&archive)?;
         let restored = archive.join(backup.file_name().context("backup filename")?);
+        runtime.stage("copying and verifying recovery original");
         ensure!(
             io::copy_verified(&backup, &restored, &mut guard)? == expected,
             "restoration mismatch"
@@ -1075,6 +1188,7 @@ pub(super) fn recover_with(
         io::sync_dir(parent)?;
         published = true;
         protections.check(&[destination.to_owned(), stage.clone()], SystemTime::now())?;
+        runtime.stage("registering and reading recovered history");
         let mut result = runtime.register(&binary, destination, tid, &live)?;
         let native_path = PathBuf::from(result["restored"].as_str().context("restored path")?);
         ensure!(
@@ -1138,6 +1252,7 @@ pub(super) fn recover(journal_path: &Path, destination: &Path) -> Result<Value> 
         cancel: &cancellation,
         deadline: Instant::now() + Duration::from_secs(1800),
         parent: destination.parent().context("recovery parent")?,
+        progress: progress::Progress::new(true),
     };
     recover_with(
         &journal,

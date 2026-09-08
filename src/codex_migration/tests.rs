@@ -7,6 +7,49 @@ const PARENT: &str = "00000000-0000-4000-8000-000000000001";
 const CHILD: &str = "00000000-0000-4000-8000-000000000002";
 const OTHER: &str = "00000000-0000-4000-8000-000000000003";
 
+#[test]
+fn benchmark_accepts_only_exact_verified_external_originals() {
+    let f = Fixture::new();
+    let backup = f.policy.backup_root.join("original.jsonl.zst");
+    fs::write(&backup, b"synthetic").unwrap();
+    let mut journal = json!({"version":1,"phase":"verified","backup":backup,"backup_volume_uuid":f.policy.backup_volume_uuid,"backup_identity":identity(&backup).unwrap(),"candidate":{"row":{"id":CHILD}}});
+    assert!(native::benchmark_input(&f.policy, &journal).is_ok());
+    journal["phase"] = json!("applying");
+    assert!(native::benchmark_input(&f.policy, &journal).is_err());
+    journal["phase"] = json!("verified");
+    journal["backup"] = json!(f.source);
+    journal["backup_identity"] = json!(identity(&f.source).unwrap());
+    assert!(native::benchmark_input(&f.policy, &journal).is_err());
+    journal["backup"] = json!(backup);
+    journal["backup_identity"] = json!(identity(&backup).unwrap());
+    fs::write(&backup, b"drift").unwrap();
+    assert!(native::benchmark_input(&f.policy, &journal).is_err());
+}
+
+#[test]
+fn interrupted_batch_retains_verified_results_and_failed_candidate() {
+    let fixture = Fixture::new();
+    let path = fixture
+        .policy
+        .codex_home
+        .join(format!("archived_sessions/rollout-{OTHER}.jsonl"));
+    old_file(&path, &encode(&records(OTHER, "small")));
+    let mut other = row(OTHER, Some(PARENT));
+    other.rollout_path = path.to_str().unwrap().into();
+    Fixture::insert(&fixture.db(), &other);
+    let mut runtime = fixture.runtime();
+    runtime.effect = Effect::InterruptSecond;
+    let error = fixture.run(true, &runtime).unwrap_err();
+    let report = failure_report(&error).unwrap();
+    assert_eq!(report["completed"], false);
+    assert_eq!(report["failed_thread_id"], OTHER);
+    assert_eq!(report["results"].as_array().unwrap().len(), 1);
+    assert_eq!(report["results"][0]["phase"], "verified");
+    assert_eq!(report["results"][0]["thread_id"], CHILD);
+    assert!(format!("{error:#}").contains("operator interrupted second original"));
+    assert_eq!(fixture.journal()["phase"], "verified");
+}
+
 fn records(tid: &str, padding: &str) -> Vec<Value> {
     vec![
         json!({"type":"session_meta","payload":{"id":tid,"history_mode":"legacy"}}),
@@ -172,6 +215,7 @@ impl Fixture {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Effect {
+    InterruptSecond,
     Normal,
     NativeFailure,
     CorruptContinuation,
@@ -220,6 +264,10 @@ impl Runtime for FakeRuntime<'_> {
         Ok(())
     }
     fn context(&self, path: &Path, tid: &str) -> Result<(Continuation, u64)> {
+        ensure!(
+            self.effect != Effect::InterruptSecond || tid != OTHER,
+            "operator interrupted second original"
+        );
         let (context, raw) = proof(
             &fs::read(path)?,
             tid,
