@@ -2,6 +2,7 @@
 pub(crate) mod io;
 mod native;
 mod preflight;
+mod progress;
 pub use native::rehearse;
 pub use preflight::preflight;
 #[cfg(test)]
@@ -660,6 +661,8 @@ impl ContextParser {
 }
 
 trait Runtime {
+    fn task(&self, _index: usize, _total: usize, _id: &str) {}
+    fn stage(&self, _stage: &'static str) {}
     fn guard(&self) -> Result<()>;
     fn volume(&self) -> Result<()>;
     fn quiet(&self, path: Option<&Path>) -> Result<()>;
@@ -726,6 +729,7 @@ fn migrate_one(
     runtime.volume()?;
     runtime.quiet(Some(&candidate.path))?;
     refresh(candidate, policy, false)?;
+    runtime.stage("verifying original continuation");
     let (before, raw) = runtime
         .context(&candidate.path, &candidate.row.id)
         .context("verifying original continuation before backup")?;
@@ -746,6 +750,7 @@ fn migrate_one(
     write_journal(&journal_path, &journal)?;
     let mut applying = false;
     let operation: Result<()> = (|| {
+        runtime.stage("copying and verifying external original");
         let digest = io::copy_verified(&candidate.path, &backup, &mut || runtime.guard())?;
         let backup_identity = identity(&backup)?;
         journal["backup_sha256"] = json!(digest);
@@ -754,6 +759,7 @@ fn migrate_one(
         write_journal(&journal_path, &journal)?;
         protections.check(&surfaces, SystemTime::now())?;
         index_files(&policy.codex_home)?;
+        runtime.stage("planning native migration");
         runtime
             .native(&candidate.row.id, false)
             .context("planning native migration")?;
@@ -762,6 +768,7 @@ fn migrate_one(
         refresh(candidate, policy, false)?;
         protections.check(&surfaces, SystemTime::now())?;
         index_files(&policy.codex_home)?;
+        runtime.stage("revalidating backup and source hashes");
         ensure!(
             io::hash(&candidate.path, &mut || runtime.guard())? == digest
                 && identity(&backup)? == backup_identity
@@ -772,9 +779,11 @@ fn migrate_one(
         journal["free_before"] = json!(runtime.free(&policy.codex_home)?);
         write_journal(&journal_path, &journal)?;
         applying = true;
+        runtime.stage("applying native migration");
         journal["native_report"] = runtime
             .native(&candidate.row.id, true)
             .context("applying native migration")?;
+        runtime.stage("verifying migrated continuation");
         let (after, _) = runtime
             .context(&candidate.path, &candidate.row.id)
             .context("verifying migrated continuation")?;
@@ -788,6 +797,7 @@ fn migrate_one(
         // Revalidate the exact external original after native apply, immediately
         // before committing the verified outcome. A replacement with same bytes
         // still fails the inode/ctime identity check.
+        runtime.stage("verifying retained external original");
         ensure!(
             identity(&backup)? == backup_identity
                 && io::hash(&backup, &mut || runtime.guard())? == digest,
@@ -826,40 +836,77 @@ fn batch(policy: &Policy, apply: bool, runtime: &dyn Runtime, registry: &Path) -
     let (rows, edges) = index_snapshot(&policy.codex_home)?;
     let plan = plan(&rows, &edges, policy, now())?;
     let mut results = Vec::new();
-    if apply {
-        ensure!(policy.enabled, "migration policy is disabled");
-        io::writable_directory(&policy.journal_root).context("checking journal destination")?;
-        io::writable_directory(&policy.backup_root).context("checking backup destination")?;
-        let protections = MigrationProtectionGuard::acquire(registry)?;
-        protections.check(&policy.surfaces(), SystemTime::now())?;
-        let _lock = io::lock_file(&policy.journal_root.join("runner.lock"), false)?;
-        pending_journals(&policy.journal_root)?;
-        runtime
-            .quiet(None)
-            .context("checking quiet Codex store before batch")?;
-        runtime
-            .volume()
-            .context("verifying external backup topology before batch")?;
-        runtime
-            .verify_binary()
-            .context("verifying native Codex binary before batch")?;
-        if plan
-            .selected
-            .iter()
-            .any(|candidate| candidate.path.extension().is_some_and(|ext| ext == "zst"))
-        {
+    let mut failed_thread = None;
+    let outcome: Result<()> = (|| {
+        if apply {
+            runtime.stage("checking batch prerequisites");
+            ensure!(policy.enabled, "migration policy is disabled");
+            io::writable_directory(&policy.journal_root).context("checking journal destination")?;
+            io::writable_directory(&policy.backup_root).context("checking backup destination")?;
+            let protections = MigrationProtectionGuard::acquire(registry)?;
+            protections.check(&policy.surfaces(), SystemTime::now())?;
+            let _lock = io::lock_file(&policy.journal_root.join("runner.lock"), false)?;
+            pending_journals(&policy.journal_root)?;
             runtime
-                .verify_decompressor()
-                .context("verifying configured zstd before batch")?;
+                .quiet(None)
+                .context("checking quiet Codex store before batch")?;
+            runtime
+                .volume()
+                .context("verifying external backup topology before batch")?;
+            runtime
+                .verify_binary()
+                .context("verifying native Codex binary before batch")?;
+            if plan
+                .selected
+                .iter()
+                .any(|candidate| candidate.path.extension().is_some_and(|ext| ext == "zst"))
+            {
+                runtime
+                    .verify_decompressor()
+                    .context("verifying configured zstd before batch")?;
+            }
+            for (index, candidate) in plan.selected.iter().enumerate() {
+                failed_thread = Some(candidate.row.id.clone());
+                runtime.task(index + 1, plan.selected.len(), &candidate.row.id);
+                runtime.guard()?;
+                results.push(migrate_one(candidate, policy, runtime, &protections)?);
+                runtime.stage("verified; original retained and continuation matched");
+                failed_thread = None;
+            }
         }
-        for candidate in &plan.selected {
-            runtime.guard()?;
-            results.push(migrate_one(candidate, policy, runtime, &protections)?);
-        }
+        Ok(())
+    })();
+    let report = json!({"version":1,"mode":if apply {"apply"} else {"dry_run"},"observed_at":now(),"plan":plan,"results":results,"completed":outcome.is_ok(),"failed_thread_id":failed_thread});
+    if let Err(source) = outcome {
+        runtime.stage("stopped; completed tasks preserved in report and journals");
+        return Err(BatchFailure { report, source }.into());
     }
-    Ok(
-        json!({"version":1,"mode":if apply {"apply"} else {"dry_run"},"observed_at":now(),"plan":plan,"results":results}),
-    )
+    if apply {
+        runtime.stage("batch completed");
+    }
+    Ok(report)
+}
+
+#[derive(Debug)]
+struct BatchFailure {
+    report: Value,
+    source: anyhow::Error,
+}
+impl std::fmt::Display for BatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "migration batch stopped; completed tasks retained")
+    }
+}
+impl std::error::Error for BatchFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+/// Partial success is data even when the CLI must return a failing exit status.
+pub fn failure_report(error: &anyhow::Error) -> Option<&Value> {
+    error
+        .downcast_ref::<BatchFailure>()
+        .map(|failure| &failure.report)
 }
 
 pub fn run(config: &Path, apply: bool) -> Result<Value> {
@@ -869,7 +916,8 @@ pub fn run(config: &Path, apply: bool) -> Result<Value> {
     );
     let policy = Policy::load(config)?;
     let cancellation = io::Cancellation::install()?;
-    let runtime = native::NativeRuntime::new(&policy, &cancellation);
+    let mut runtime = native::NativeRuntime::new(&policy, &cancellation);
+    runtime.enable_progress(apply);
     batch(
         &policy,
         apply,
@@ -880,4 +928,8 @@ pub fn run(config: &Path, apply: bool) -> Result<Value> {
 
 pub fn recover(journal: &Path, destination: &Path) -> Result<Value> {
     native::recover(journal, destination)
+}
+
+pub fn benchmark(config: &Path, journal: &Path) -> Result<Value> {
+    native::benchmark(config, journal)
 }

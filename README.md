@@ -410,6 +410,43 @@ does not read rollout contents, create a backup/journal, or invoke migration.
 The second requires `enabled = true` and a quiet Codex store. Both are independent
 of the existing `scheduled` command; this change installs no scheduler.
 
+Apply emits content-free task/stage progress to stderr, with a one-second
+heartbeat during supervised I/O and decompressed bytes/rate during continuation
+reads. Each verified task is announced immediately. Stdout remains one JSON
+report; a failed/interrupted batch includes completed results, `completed: false`
+and `failed_thread_id`, while retaining a failing exit status. Startup failures
+before planning can still produce only stderr. Durable per-task journals remain
+the recovery authority if a process is forcibly killed before printing a report.
+
+Keep progress visible in the external Terminal. For a separately approved run
+with fresh output paths, Bash can retain it as well:
+
+```bash
+umask 077
+set -o pipefail
+worktree-gc codex-migration --config /absolute/policy.toml --apply \
+  2> >(tee /absolute/fresh-progress.log >&2) > /absolute/fresh-result.json
+```
+
+Before reserving a shutdown window, benchmark a representative **retained
+external original**, using its verified journal while Codex remains open:
+
+```sh
+worktree-gc benchmark-codex-migration --config /absolute/policy.toml \
+  --journal /absolute/verified-journal.json
+```
+
+This read-only, ten-minute-bounded command verifies the backup identity, hash,
+external volume and original continuation using the production parser and
+streaming implementation. It reads no live rollout/index and invokes no native
+Codex migration. Its JSON reports decompressed bytes, reader duration and
+throughput. Use those measurements alongside observed backup/native/recovery
+times to state an estimated shutdown duration; a configured timeout is an upper
+bound, not an ETA. Small synthetic rehearsals qualify correctness separately
+from representative throughput. Following partial success, prepare an exact
+remaining-candidate packet rather than rerunning a policy that could select new
+tasks to replace the already migrated ones.
+
 Use `codex-migration --config /absolute/policy.toml --preflight` for independent,
 timestamped JSON checks while Codex stays open. `awaiting_shutdown` is expected;
 any other failed check gives an unsuccessful exit. Preflight reads metadata,

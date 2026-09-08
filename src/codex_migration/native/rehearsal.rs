@@ -124,6 +124,7 @@ pub fn rehearse(config: &Path, workspace: &Path) -> Result<Value> {
         deadline,
         advisory: false,
         isolation: None,
+        progress: progress::Progress::new(true),
     };
     verifier
         .volume()
@@ -236,6 +237,7 @@ pub fn rehearse(config: &Path, workspace: &Path) -> Result<Value> {
                 deadline,
                 advisory: false,
                 isolation: Some(&scope),
+                progress: progress::Progress::new(true),
             };
             let result = batch(&synthetic, true, &runtime, &registry)
                 .context("rehearsing shared migration batch")?;
@@ -254,6 +256,7 @@ pub fn rehearse(config: &Path, workspace: &Path) -> Result<Value> {
             let destination = workspace.join(format!("{label}-recovered"));
             let recovery = Recovery {
                 native: NativeRecovery {
+                    progress: progress::Progress::new(true),
                     cancel: &cancel,
                     deadline,
                     parent: workspace,

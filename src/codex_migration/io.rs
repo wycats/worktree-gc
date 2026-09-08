@@ -423,44 +423,94 @@ impl OwnedProcess {
         consume: &mut dyn FnMut(&[u8]) -> Result<()>,
     ) -> Result<Option<ExitStatus>> {
         let mut block = [0; 65536];
-        if !self.stderr_eof {
-            match self
-                .child
-                .stderr
-                .as_mut()
-                .context("stderr")?
-                .read(&mut block)
-            {
-                Ok(0) => self.stderr_eof = true,
-                Ok(count) => {
-                    ensure!(
-                        self.stderr.len() + count <= OUTPUT_LIMIT,
-                        "child stderr cap"
-                    );
-                    self.stderr.extend_from_slice(&block[..count]);
+        // Bound each drain turn so callers can check cancellation/deadlines.
+        // Service both pipes every round: a busy stdout must not starve stderr.
+        for _ in 0..32 {
+            let mut progressed = false;
+            if !self.stderr_eof {
+                match self
+                    .child
+                    .stderr
+                    .as_mut()
+                    .context("stderr")?
+                    .read(&mut block)
+                {
+                    Ok(0) => {
+                        self.stderr_eof = true;
+                        progressed = true;
+                    }
+                    Ok(count) => {
+                        progressed = true;
+                        ensure!(
+                            self.stderr.len() + count <= OUTPUT_LIMIT,
+                            "child stderr cap"
+                        );
+                        self.stderr.extend_from_slice(&block[..count]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
             }
-        }
-        if !self.stdout_eof {
-            match self
-                .child
-                .stdout
-                .as_mut()
-                .context("stdout")?
-                .read(&mut block)
-            {
-                Ok(0) => self.stdout_eof = true,
-                Ok(count) => consume(&block[..count])?,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
+            if !self.stdout_eof {
+                match self
+                    .child
+                    .stdout
+                    .as_mut()
+                    .context("stdout")?
+                    .read(&mut block)
+                {
+                    Ok(0) => {
+                        self.stdout_eof = true;
+                        progressed = true;
+                    }
+                    Ok(count) => {
+                        consume(&block[..count])?;
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !progressed {
+                break;
             }
         }
         if self.stderr_eof && self.stdout_eof {
             return Ok(self.child.try_wait()?);
         }
         Ok(None)
+    }
+    pub fn wait_ready(&self) -> Result<()> {
+        let mut fds = Vec::with_capacity(2);
+        if !self.stdout_eof {
+            fds.push(libc::pollfd {
+                fd: self.child.stdout.as_ref().context("stdout")?.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        if !self.stderr_eof {
+            fds.push(libc::pollfd {
+                fd: self.child.stderr.as_ref().context("stderr")?.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        // Ready data (or EOF) returns immediately. Ten milliseconds is a maximum
+        // idle wait, not a per-buffer delay. With both pipes closed this also
+        // bounds waiting for the process to exit without spinning.
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 10) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+        ensure!(
+            fds.iter().all(|fd| fd.revents & libc::POLLNVAL == 0),
+            "invalid subprocess pipe"
+        );
+        Ok(())
     }
     pub fn stop(&mut self) -> Result<()> {
         if self.stopped {
@@ -529,7 +579,7 @@ fn stream_with_stderr(
         if let Some(status) = process.poll(consume)? {
             break Ok(status);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        process.wait_ready()?;
     })();
     let status = process.finish(result)?;
     Ok((status, std::mem::take(&mut process.stderr)))
@@ -667,6 +717,67 @@ pub fn absent(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod diagnostic_tests {
+    #[test]
+    fn large_stream_is_not_throttled_by_poll_intervals() {
+        let start = std::time::Instant::now();
+        let mut bytes = 0;
+        super::stream_success(
+            std::process::Command::new("/bin/dd").args(["if=/dev/zero", "bs=1048576", "count=128"]),
+            &mut |_| {
+                anyhow::ensure!(start.elapsed().as_secs() < 15, "stream test deadline");
+                Ok(())
+            },
+            &mut |block| {
+                bytes += block.len();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, 128 * 1024 * 1024);
+        // The previous 64KiB/10ms implementation requires at least20.48s.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn busy_stream_returns_to_cancellation_guard_and_reaps_child() {
+        let observed = std::cell::Cell::new(0usize);
+        let mut previous = 0usize;
+        let mut pid = 0;
+        let error = super::stream_success(
+            std::process::Command::new("/bin/dd").args(["if=/dev/zero", "bs=1048576", "count=128"]),
+            &mut |child| {
+                pid = child;
+                let now = observed.get();
+                assert!(now - previous <= 32 * 65536);
+                previous = now;
+                anyhow::ensure!(now < 4 * 1024 * 1024, "fixture cancellation");
+                Ok(())
+            },
+            &mut |block| {
+                observed.set(observed.get() + block.len());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("fixture cancellation"));
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+
+    #[test]
+    fn stdout_and_stderr_are_drained_fairly() {
+        let mut bytes = 0;
+        let (status, stderr) = super::stream_with_stderr(
+            std::process::Command::new("/bin/sh").args(["-c", "dd if=/dev/zero bs=65536 count=8 >&2 2>/dev/null & dd if=/dev/zero bs=65536 count=128 2>/dev/null; wait"]),
+            &mut |_| Ok(()), &mut |block| { bytes += block.len(); Ok(()) },
+        ).unwrap();
+        assert!(status.success());
+        assert_eq!(bytes, 128 * 65536);
+        assert_eq!(stderr.len(), 8 * 65536);
+    }
     use super::*;
     #[test]
     fn lock_scope_releases_while_an_inherited_description_remains_open() {

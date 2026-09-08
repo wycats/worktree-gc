@@ -42,6 +42,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Measure continuation-reader throughput on one verified external original (read-only)
+    BenchmarkCodexMigration {
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        journal: PathBuf,
+    },
     /// Plan or run an opt-in bounded batch of native archived-child migrations (macOS)
     CodexMigration {
         #[arg(long, value_name = "PATH")]
@@ -721,6 +728,24 @@ fn main() -> Result<()> {
     let roots = cli.root;
 
     match cli.command {
+        Command::BenchmarkCodexMigration { config, journal } => {
+            anyhow::ensure!(
+                repo.is_none() && roots.is_empty(),
+                "benchmark takes its own config and journal"
+            );
+            #[cfg(unix)]
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&worktree_gc::codex_migration::benchmark(
+                    &config, &journal
+                )?)?
+            );
+            #[cfg(not(unix))]
+            {
+                let _ = (config, journal);
+                anyhow::bail!("migration benchmark requires macOS");
+            }
+        }
         Command::CodexMigration {
             config,
             apply,
@@ -735,7 +760,17 @@ fn main() -> Result<()> {
                 let report = if preflight {
                     worktree_gc::codex_migration::preflight(&config)?
                 } else {
-                    worktree_gc::codex_migration::run(&config, apply)?
+                    match worktree_gc::codex_migration::run(&config, apply) {
+                        Ok(report) => report,
+                        Err(error) => {
+                            if let Some(report) =
+                                worktree_gc::codex_migration::failure_report(&error)
+                            {
+                                println!("{}", serde_json::to_string_pretty(report)?);
+                            }
+                            return Err(error);
+                        }
+                    }
                 };
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 anyhow::ensure!(
@@ -1585,6 +1620,29 @@ helper_socket = "unused-helper.sock"
 
     #[test]
     fn archived_migration_is_explicit_and_separate_from_collection() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "worktree-gc",
+                "benchmark-codex-migration",
+                "--config",
+                "/policy",
+                "--journal",
+                "/journal"
+            ])
+            .unwrap()
+            .command,
+            Command::BenchmarkCodexMigration { .. }
+        ));
+        assert!(Cli::try_parse_from([
+            "worktree-gc",
+            "benchmark-codex-migration",
+            "--config",
+            "/policy",
+            "--journal",
+            "/journal",
+            "--apply"
+        ])
+        .is_err());
         assert!(Cli::try_parse_from([
             "worktree-gc",
             "codex-migration",
