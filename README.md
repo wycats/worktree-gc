@@ -529,6 +529,27 @@ isolated home. First-party app-server startup registers the original; exact
 read/unarchive/read calls must return nonempty identical history before success.
 Networking is denied and native writes are confined to that isolated home.
 It preserves the live store, including any later turns, and sends no model turn.
+By default, recovery uses the exact native executable and SHA-256 recorded in
+the original journal. After a Codex upgrade, an explicitly approved replacement
+can be selected for isolated recovery:
+
+```sh
+worktree-gc recover-codex-migration \
+  --journal /absolute/journal-root/ENTRY.json \
+  --destination /absolute/new-isolated-codex-home \
+  --recovery-codex-binary /absolute/verified/codex \
+  --recovery-codex-sha256 APPROVED_SHA256
+```
+
+Both replacement options are required together. The replacement must pass the
+same signature, exact-hash and supported-version checks, including fresh
+verification around native registration. Original-byte verification and
+read/unarchive/read history parity remain required. The JSON result records the
+journal digest, original native identity, selected recovery identity and explicit
+override. The journal, external original and live migration policy stay unchanged.
+A successful isolated recovery qualifies that original with that executable;
+qualification of additional native versions remains a separate code-and-test change.
+
 Recovery's native history response is bounded at 256 MiB and each RPC at four
 minutes within a thirty-minute recovery deadline. Larger responses fail with
 the external original preserved; this limit does not establish recovery

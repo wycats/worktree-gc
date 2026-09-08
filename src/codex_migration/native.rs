@@ -1114,6 +1114,16 @@ pub(super) fn recover_with(
     registry: &Path,
     runtime: &dyn RecoveryRuntime,
 ) -> Result<Value> {
+    recover_with_binary(journal, destination, registry, runtime, None)
+}
+
+pub(super) fn recover_with_binary(
+    journal: &Value,
+    destination: &Path,
+    registry: &Path,
+    runtime: &dyn RecoveryRuntime,
+    replacement: Option<&RecoveryBinary>,
+) -> Result<Value> {
     ensure!(
         journal.get("version") == Some(&json!(1)),
         "unsupported journal version"
@@ -1133,14 +1143,27 @@ pub(super) fn recover_with(
         .and_then(Value::as_str)
         .context("journal task ID")?;
     ensure!(uuid(tid), "invalid journal task ID");
-    let binary = PathBuf::from(
+    let journal_binary = PathBuf::from(
         journal
             .get("codex_binary")
             .and_then(Value::as_str)
             .unwrap_or(DEFAULT_CODEX),
     );
-    let binary_sha = text("codex_sha256")?;
-    ensure!(sha(binary_sha), "invalid native digest");
+    let journal_binary_sha = text("codex_sha256")?;
+    ensure!(sha(journal_binary_sha), "invalid journal native digest");
+    let (binary, binary_sha) = replacement
+        .map(|value| (value.path.as_path(), value.sha256.as_str()))
+        .unwrap_or((&journal_binary, journal_binary_sha));
+    ensure!(sha(binary_sha), "invalid recovery native digest");
+    if replacement.is_some() {
+        canonical(binary, false)?;
+        ensure!(
+            !io::intersects(binary, &live)
+                && !io::intersects(binary, &backup)
+                && !io::intersects(binary, destination),
+            "recovery executable must be outside live, backup and destination paths"
+        );
+    }
     let volume_uuid = text("backup_volume_uuid")?;
     let parent = destination.parent().context("recovery parent")?;
     canonical(parent, true)?;
@@ -1155,6 +1178,8 @@ pub(super) fn recover_with(
     let protections = MigrationProtectionGuard::acquire(registry)?;
     protections.check(&[destination.to_owned(), stage.clone()], SystemTime::now())?;
     runtime.volume(parent, &backup, volume_uuid)?;
+    runtime.verify_binary(binary, binary_sha)
+        .context("verifying selected recovery executable; a replacement requires both --recovery-codex-binary and --recovery-codex-sha256")?;
     let original_identity = identity(&backup)?;
     ensure!(
         io::hash(&backup, &mut guard)? == expected,
@@ -1164,7 +1189,6 @@ pub(super) fn recover_with(
         runtime.free(parent)? >= original_identity.bytes + GIB,
         "recovery capacity"
     );
-    runtime.verify_binary(&binary, binary_sha)?;
     // Stage beside the requested home. Failure preserves diagnostic evidence
     // here, with the requested destination still absent and therefore retryable.
     io::exclusive_dir(&stage)?;
@@ -1189,7 +1213,9 @@ pub(super) fn recover_with(
         published = true;
         protections.check(&[destination.to_owned(), stage.clone()], SystemTime::now())?;
         runtime.stage("registering and reading recovered history");
-        let mut result = runtime.register(&binary, destination, tid, &live)?;
+        runtime.verify_binary(binary, binary_sha)?;
+        let mut result = runtime.register(binary, destination, tid, &live)?;
+        runtime.verify_binary(binary, binary_sha)?;
         let native_path = PathBuf::from(result["restored"].as_str().context("restored path")?);
         ensure!(
             io::hash(&native_path, &mut guard)? == expected,
@@ -1216,6 +1242,11 @@ pub(super) fn recover_with(
         result["isolated_codex_home"] = json!(destination);
         result["sha256"] = json!(expected);
         result["live_store_unchanged"] = json!(true);
+        result["journal_native_binary"] =
+            json!({"path":journal_binary,"sha256":journal_binary_sha});
+        result["recovery_native_binary"] = json!({"path":binary,"sha256":binary_sha});
+        result["explicit_binary_override"] = json!(replacement.is_some());
+        result["required_native_version"] = json!(NATIVE_VERSION);
         Ok(result)
     })();
     if operation.is_err() && published {
@@ -1237,7 +1268,11 @@ pub(super) fn recover_with(
     })
 }
 
-pub(super) fn recover(journal_path: &Path, destination: &Path) -> Result<Value> {
+pub(super) fn recover(
+    journal_path: &Path,
+    destination: &Path,
+    replacement: Option<&RecoveryBinary>,
+) -> Result<Value> {
     ensure!(
         cfg!(target_os = "macos"),
         "native recovery currently supports macOS"
@@ -1246,7 +1281,8 @@ pub(super) fn recover(journal_path: &Path, destination: &Path) -> Result<Value> 
         !io::intersects(destination, journal_path),
         "recovery overlaps journal"
     );
-    let journal: Value = serde_json::from_slice(&io::read_bound(journal_path, OUTPUT_LIMIT)?)?;
+    let journal_bytes = io::read_bound(journal_path, OUTPUT_LIMIT)?;
+    let journal: Value = serde_json::from_slice(&journal_bytes)?;
     let cancellation = Cancellation::install()?;
     let runtime = NativeRecovery {
         cancel: &cancellation,
@@ -1254,12 +1290,15 @@ pub(super) fn recover(journal_path: &Path, destination: &Path) -> Result<Value> 
         parent: destination.parent().context("recovery parent")?,
         progress: progress::Progress::new(true),
     };
-    recover_with(
+    let mut report = recover_with_binary(
         &journal,
         destination,
         &crate::protection::protection_registry_path()?,
         &runtime,
-    )
+        replacement,
+    )?;
+    report["journal_sha256"] = json!(format!("{:x}", Sha256::digest(&journal_bytes)));
+    Ok(report)
 }
 
 #[cfg(test)]

@@ -926,8 +926,24 @@ pub fn run(config: &Path, apply: bool) -> Result<Value> {
     )
 }
 
+/// An explicitly approved native executable for isolated original recovery.
+/// The journal remains the immutable record of the migration's executable.
+#[derive(Clone, Debug, Serialize)]
+pub struct RecoveryBinary {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
 pub fn recover(journal: &Path, destination: &Path) -> Result<Value> {
-    native::recover(journal, destination)
+    recover_using(journal, destination, None)
+}
+
+pub fn recover_using(
+    journal: &Path,
+    destination: &Path,
+    replacement: Option<&RecoveryBinary>,
+) -> Result<Value> {
+    native::recover(journal, destination, replacement)
 }
 
 pub fn benchmark(config: &Path, journal: &Path) -> Result<Value> {

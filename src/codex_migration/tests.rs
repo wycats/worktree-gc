@@ -1238,6 +1238,9 @@ struct FakeRecovery {
     fail_register: bool,
     empty_history: bool,
     calls: RefCell<Vec<PathBuf>>,
+    expected_binary: Option<(PathBuf, String)>,
+    verifications: RefCell<Vec<(PathBuf, String)>>,
+    drift_after_register: bool,
 }
 impl native::RecoveryRuntime for FakeRecovery {
     fn guard(&self) -> Result<()> {
@@ -1246,13 +1249,29 @@ impl native::RecoveryRuntime for FakeRecovery {
     fn volume(&self, _: &Path, _: &Path, _: &str) -> Result<()> {
         Ok(())
     }
-    fn verify_binary(&self, _: &Path, _: &str) -> Result<()> {
+    fn verify_binary(&self, binary: &Path, sha: &str) -> Result<()> {
+        self.verifications
+            .borrow_mut()
+            .push((binary.to_owned(), sha.to_owned()));
+        if let Some(expected) = &self.expected_binary {
+            ensure!(
+                &(binary.to_owned(), sha.to_owned()) == expected,
+                "native binary identity changed"
+            );
+        }
+        ensure!(
+            !self.drift_after_register || self.calls.borrow().is_empty(),
+            "native binary drift after registration"
+        );
         Ok(())
     }
     fn free(&self, _: &Path) -> Result<u64> {
         Ok(100 * GIB)
     }
-    fn register(&self, _: &Path, home: &Path, tid: &str, _: &Path) -> Result<Value> {
+    fn register(&self, binary: &Path, home: &Path, tid: &str, _: &Path) -> Result<Value> {
+        if let Some((expected, _)) = &self.expected_binary {
+            ensure!(binary == expected, "registration must use selected binary");
+        }
         assert!(
             !home.join("state_5.sqlite").exists(),
             "native registration must start with absent index"
@@ -1389,6 +1408,139 @@ fn recovery_requires_nonempty_native_history_before_success() {
     let destination = f.root.join("recovered");
     assert!(native::recover_with(&f.journal(), &destination, &f.registry, &runtime).is_err());
     assert!(!destination.exists());
+}
+
+#[test]
+fn recovery_override_preserves_journal_and_records_both_native_identities() {
+    let f = Fixture::new();
+    f.run(true, &f.runtime()).unwrap();
+    let journal = f.journal();
+    let journal_before = serde_json::to_vec(&journal).unwrap();
+    let live_before = fs::read(&f.source).unwrap();
+    let replacement = RecoveryBinary {
+        path: f.root.join("replacement-codex"),
+        sha256: "a".repeat(64),
+    };
+    fs::write(&replacement.path, "synthetic executable").unwrap();
+    let runtime = FakeRecovery {
+        expected_binary: Some((replacement.path.clone(), replacement.sha256.clone())),
+        ..Default::default()
+    };
+    let destination = f.root.join("recovered");
+    // The unchanged default still enforces the journal's executable identity.
+    assert!(native::recover_with(&journal, &destination, &f.registry, &runtime).is_err());
+    assert!(!destination.exists());
+    assert!(runtime.calls.borrow().is_empty());
+    runtime.verifications.borrow_mut().clear();
+    let report = native::recover_with_binary(
+        &journal,
+        &destination,
+        &f.registry,
+        &runtime,
+        Some(&replacement),
+    )
+    .unwrap();
+    assert_eq!(report["explicit_binary_override"], true);
+    assert_eq!(
+        report["journal_native_binary"]["sha256"],
+        journal["codex_sha256"]
+    );
+    assert_eq!(
+        report["recovery_native_binary"]["sha256"],
+        replacement.sha256
+    );
+    assert_eq!(
+        report["recovery_native_binary"]["path"],
+        json!(replacement.path)
+    );
+    assert_eq!(runtime.verifications.borrow().len(), 3);
+    assert_eq!(serde_json::to_vec(&journal).unwrap(), journal_before);
+    assert_eq!(fs::read(&f.source).unwrap(), live_before);
+    assert_eq!(report["history_turns"], 1);
+}
+
+#[test]
+fn recovery_override_rejects_invalid_digest_alias_and_live_store_path() {
+    let f = Fixture::new();
+    f.run(true, &f.runtime()).unwrap();
+    let journal = f.journal();
+    let destination = f.root.join("recovered");
+    let binary = f.root.join("replacement-codex");
+    fs::write(&binary, "synthetic executable").unwrap();
+    let alias = f.root.join("alias-codex");
+    std::os::unix::fs::symlink(&binary, &alias).unwrap();
+    let live_binary = f.policy.codex_home.join("codex");
+    fs::write(&live_binary, "synthetic executable").unwrap();
+    for replacement in [
+        RecoveryBinary {
+            path: binary,
+            sha256: "invalid".into(),
+        },
+        RecoveryBinary {
+            path: alias,
+            sha256: "a".repeat(64),
+        },
+        RecoveryBinary {
+            path: live_binary,
+            sha256: "a".repeat(64),
+        },
+    ] {
+        let runtime = FakeRecovery::default();
+        assert!(native::recover_with_binary(
+            &journal,
+            &destination,
+            &f.registry,
+            &runtime,
+            Some(&replacement)
+        )
+        .is_err());
+        assert!(!destination.exists());
+        assert!(runtime.calls.borrow().is_empty());
+    }
+}
+
+#[test]
+fn recovery_override_refuses_wrong_pin_and_post_registration_drift() {
+    let f = Fixture::new();
+    f.run(true, &f.runtime()).unwrap();
+    let journal = f.journal();
+    let replacement = RecoveryBinary {
+        path: f.root.join("replacement-codex"),
+        sha256: "a".repeat(64),
+    };
+    fs::write(&replacement.path, "synthetic executable").unwrap();
+    let destination = f.root.join("recovered");
+    let wrong_pin = FakeRecovery {
+        expected_binary: Some((replacement.path.clone(), "b".repeat(64))),
+        ..Default::default()
+    };
+    assert!(native::recover_with_binary(
+        &journal,
+        &destination,
+        &f.registry,
+        &wrong_pin,
+        Some(&replacement)
+    )
+    .is_err());
+    assert!(wrong_pin.calls.borrow().is_empty());
+    assert!(!destination.exists());
+    let drifting = FakeRecovery {
+        expected_binary: Some((replacement.path.clone(), replacement.sha256.clone())),
+        drift_after_register: true,
+        ..Default::default()
+    };
+    let error = native::recover_with_binary(
+        &journal,
+        &destination,
+        &f.registry,
+        &drifting,
+        Some(&replacement),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("native binary drift after registration"));
+    assert!(!destination.exists());
+    assert_eq!(drifting.calls.borrow().len(), 1);
+    assert!(Path::new(journal["backup"].as_str().unwrap()).exists());
 }
 #[test]
 fn wal_writer_fixture_child() {

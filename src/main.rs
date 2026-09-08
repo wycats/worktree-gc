@@ -74,6 +74,12 @@ enum Command {
         journal: PathBuf,
         #[arg(long, value_name = "ABSENT_DIRECTORY")]
         destination: PathBuf,
+        /// Explicitly approved replacement executable for isolated recovery
+        #[arg(long, requires = "recovery_codex_sha256", value_name = "PATH")]
+        recovery_codex_binary: Option<PathBuf>,
+        /// Exact SHA-256 of the approved replacement; journal remains unchanged
+        #[arg(long, requires = "recovery_codex_binary", value_name = "SHA256")]
+        recovery_codex_sha256: Option<String>,
     },
     /// Measure files or directories with bounded, clone-aware accounting
     Inventory {
@@ -805,6 +811,8 @@ fn main() -> Result<()> {
         Command::RecoverCodexMigration {
             journal,
             destination,
+            recovery_codex_binary,
+            recovery_codex_sha256,
         } => {
             anyhow::ensure!(
                 repo.is_none() && roots.is_empty(),
@@ -813,14 +821,25 @@ fn main() -> Result<()> {
             #[cfg(unix)]
             println!(
                 "{}",
-                serde_json::to_string_pretty(&worktree_gc::codex_migration::recover(
+                serde_json::to_string_pretty(&worktree_gc::codex_migration::recover_using(
                     &journal,
-                    &destination
+                    &destination,
+                    recovery_codex_binary
+                        .zip(recovery_codex_sha256)
+                        .map(|(path, sha256)| {
+                            worktree_gc::codex_migration::RecoveryBinary { path, sha256 }
+                        })
+                        .as_ref()
                 )?)?
             );
             #[cfg(not(unix))]
             {
-                let _ = (journal, destination);
+                let _ = (
+                    journal,
+                    destination,
+                    recovery_codex_binary,
+                    recovery_codex_sha256,
+                );
                 anyhow::bail!("archived-child migration currently supports macOS");
             }
         }
@@ -1697,6 +1716,40 @@ helper_socket = "unused-helper.sock"
             "/entry.json",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn recovery_binary_override_requires_both_explicit_pins() {
+        let base = [
+            "worktree-gc",
+            "recover-codex-migration",
+            "--journal",
+            "/journal.json",
+            "--destination",
+            "/absent",
+        ];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for extra in [
+            vec!["--recovery-codex-binary", "/codex"],
+            vec!["--recovery-codex-sha256", "digest"],
+        ] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(extra)).is_err());
+        }
+        let cli = Cli::try_parse_from(base.into_iter().chain([
+            "--recovery-codex-binary",
+            "/codex",
+            "--recovery-codex-sha256",
+            "digest",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RecoverCodexMigration {
+                recovery_codex_binary: Some(_),
+                recovery_codex_sha256: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
